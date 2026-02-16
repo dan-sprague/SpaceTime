@@ -211,15 +211,29 @@ function render(cam::Camera, spacetime::Schwarzschild, background; disc::Accreti
 end
 
 """
-    smooth_raytrace(spacetime::T, p::Photon, tspan::Tuple{Float64,Float64}) where T <: AbstractSpacetime
+    WorldLine
 
-Performs a ray trace through the spacetime with a smooth solution output. The function sets up an ODE problem for the given photon state and spacetime, solves it using a high-accuracy method, and then interpolates the solution onto a regular time grid for smoother visualization. The resulting smoothed solution is returned as an array of state vectors corresponding to the specified time points.
+Wraps the result of a ray trace as a sequence of 8-component state vectors
+(t, r, θ, ϕ, pₜ, pᵣ, pθ, pϕ) sampled at corresponding coordinate times.
 """
-function smooth_raytrace(spacetime::T, p::Photon, tspan::Tuple{Float64,Float64}) where T <: AbstractSpacetime
-    prob = ODEProblem(spacetime, p.μ, tspan)
-    sol = solve(prob, Tsit5(), reltol=1e-6, abstol=1e-6)
-    t_smooth = range(tspan[1], tspan[2], length=1000)
+struct WorldLine
+    t::Vector{Float64}
+    μ::Vector{SVector{8, Float64}}
+end
+
+"""
+    raytrace(spacetime, photon; tspan=(0.0, 500.0), npoints=1000)
+
+Trace a photon through `spacetime` and return a `WorldLine`.
+"""
+function raytrace(spacetime::AbstractSpacetime, photon::Photon;
+                  tspan::Tuple{Float64,Float64}=(0.0, 500.0), npoints::Int=1000)
+    cb = ContinuousCallback(boundary_condition, horizon_affect!)
+    prob = ODEProblem(spacetime, photon.μ, tspan, (spacetime, nothing))
+    sol = solve(prob, Tsit5(), callback=cb, reltol=1e-6, abstol=1e-6)
+    t_end = sol.t[end]
+    t_smooth = range(tspan[1], t_end, length=npoints)
     sol_smooth = sol(t_smooth)
-    sol_smooth
+    WorldLine(collect(t_smooth), collect(sol_smooth.u))
 end
 

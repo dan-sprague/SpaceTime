@@ -76,9 +76,14 @@ function disc_affect_doppler!(integrator)
         R_outer = disc.outer_radius / (2M)
         density = clamp((R_outer - R) / (R_outer - R_inner), 0, 1)
         #density = (R_inner / R)^1.05
-        disc_opacity = iscotaper * outertaper * density^0.33
+        disc_opacity = iscotaper * outertaper * density^disc.density_falloff
 
         integrator.p[2].acc_color += local_color * (integrator.p[2].alpha * disc_opacity)
         integrator.p[2].alpha *= (1.0 - disc_opacity)
     end
 end
+
+const cb_set = CallbackSet(
+    ContinuousCallback(boundary_condition, horizon_affect!),
+    ContinuousCallback(disc_condition, disc_affect_doppler!)
+)

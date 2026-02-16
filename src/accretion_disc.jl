@@ -6,10 +6,11 @@ struct AccretionDisc
     inner_radius::Float64
     outer_radius::Float64
     blackbody::Blackbody
+    density_falloff::Float64
 end
 
-AccretionDisc(; inner_radius=3.0, outer_radius=20.0, blackbody=Blackbody()) =
-    AccretionDisc(inner_radius, outer_radius, blackbody)
+AccretionDisc(; inner_radius=3.0, outer_radius=20.0, blackbody=Blackbody(), density_falloff=0.0) =
+    AccretionDisc(inner_radius, outer_radius, blackbody, density_falloff)
 
 """
     get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime, disc::AccretionDisc)
