@@ -1,6 +1,23 @@
-function get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime)
+"""
+    AccretionDisc(inner_radius, outer_radius, blackbody)
+Represents an accretion disc around a black hole, defined by its inner and outer radii and a blackbody emission profile. The `inner_radius` and `outer_radius` parameters specify the radial extent of the disc, while the `blackbody` parameter is an instance of the `Blackbody` struct that defines the temperature profile and emission characteristics of the disc.
+"""
+struct AccretionDisc
+    inner_radius::Float64
+    outer_radius::Float64
+    blackbody::Blackbody
+end
+
+AccretionDisc(; inner_radius=3.0, outer_radius=20.0, blackbody=Blackbody()) =
+    AccretionDisc(inner_radius, outer_radius, blackbody)
+
+"""
+    get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime, disc::AccretionDisc)
+Calculates the observed color of the accretion disc at a given radius `r`, position `pos`, and photon momentum `p_cartesian`, taking into account Doppler and gravitational redshift effects. The function uses the properties of the black hole spacetime `bh` and the accretion disc `disc` to compute the local temperature and intensity of the emitted radiation, and returns the resulting color as an RGB value along with the observed temperature.
+"""
+function get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime, disc::AccretionDisc)
     M = bh.M
-    R = r / (2M)      
+    R = r / (2M)
     Rsqr = R^2
 
     T_emit = exp(10.034259 - 0.375 * log(Rsqr))
@@ -24,7 +41,7 @@ function get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime)
 
     final_intensity = intensity_val * 100.0
 
-    c = wb_blackbody_color_fast(T_obs)
+    c = wb_blackbody_color_fast(T_obs, disc.blackbody)
     color = RGBf(final_intensity * c[1], final_intensity * c[2], final_intensity * c[3])
     return color, T_obs
 end

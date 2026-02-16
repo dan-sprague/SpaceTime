@@ -1,16 +1,25 @@
-function airy_disk(x)
+"""
+    airy_disc(x)
+
+The Airy disc function, which describes the diffraction pattern of a point light source. It is defined as (2 * J1(x) / x)^2, where J1 is the first-order Bessel function of the first kind.
+"""
+function airy_disc(x)
     (2 * besselj1(x) / x)^2
 end
 
-const AIRY_SPECTRUM = SVector(1.0, 0.86, 0.61)  # approximate R,G,B wavelength
+const AIRY_SPECTRUM = SVector(1.0, 0.86, 0.61)  # approximate R,G,B wavelength from starless python package https://github.com/rantonels/starless/blob/master/bloom.py
 
+"""
+    generate_kernel(scale, size)
+Generates a 2D convolution kernel based on the Airy disc function for each color channel. The `scale` parameter controls the size of the Airy disc for each channel, and `size` determines the radius of the kernel.
+"""
 function generate_kernel(scale, size)
     coords = -size:size
     kernel = zeros(2size+1, 2size+1, 3)
     for (j, cy) in enumerate(coords), (i, cx) in enumerate(coords)
         r = sqrt(cx^2 + cy^2) + 1e-6
         for c in 1:3
-            kernel[i, j, c] = airy_disk(r / scale[c])
+            kernel[i, j, c] = airy_disc(r / scale[c])
         end
     end
     for c in 1:3
@@ -19,6 +28,11 @@ function generate_kernel(scale, size)
     kernel
 end
 
+"""
+    airy_convolve(image, radius; kernel_radius=25)
+
+Applies an Airy disc convolution to the input image. The `radius` parameter controls the size of the Airy disc, and `kernel_radius` determines the radius of the convolution kernel.
+"""
 function airy_convolve(image::Matrix{<:RGB}, radius; kernel_radius=25)
     scale = radius .* AIRY_SPECTRUM
     kernel = generate_kernel(scale, kernel_radius)
@@ -34,6 +48,10 @@ function airy_convolve(image::Matrix{<:RGB}, radius; kernel_radius=25)
     RGBf.(r_out, g_out, b_out)
 end
 
+"""
+    postprocess(image, fov_factor; airy_radius=0.5, gain=0.37, glare_intensity=0.1)
+Applies post-processing effects to the rendered image, including an Airy disc convolution for bright spots and a glare effect. The `fov_factor` can be used to adjust the intensity of the effects based on the field of view.
+"""
 function postprocess(image::Matrix{RGBf}, fov_factor; airy_radius=0.5, gain=0.37, glare_intensity=0.1)
     w, h = size(image)
     img = image .* gain

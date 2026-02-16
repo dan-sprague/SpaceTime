@@ -1,3 +1,8 @@
+"""
+    Photon
+
+Represents a photon in the spacetime, encapsulating its position and momentum as an 8-component state vector. The first four components represent the coordinates (t, r, θ, ϕ), while the last four components represent the corresponding momenta (pt, pr, pθ, pϕ). The `Photon` struct provides constructors for initializing the state vector from either a single 8-component vector or separate position and momentum vectors.
+"""
 struct Photon
     μ::SVector{8, Float64}  # (t, r, θ, ϕ, pt, pr, pθ, pϕ)
 
@@ -5,6 +10,11 @@ struct Photon
     Photon(q::SVector{4, Float64}, p::SVector{4, Float64}) = new(vcat(q, p))
 end
 
+"""
+    Camera(pos, target, up, fov_factor)
+
+Represents a camera in the spacetime, defined by its position `pos`, the point it is looking at `target`, an up vector `up` to define the orientation, and a field of view factor `fov_factor` that controls the width of the viewing frustum. The constructor calculates the forward, right, and local up vectors based on the input parameters to establish the camera's coordinate system.
+"""
 struct Camera
     pos::SVector{3, Float64}
     fwd::SVector{3, Float64}
@@ -20,13 +30,26 @@ struct Camera
     end
 end
 
+"""
+    RayDat
+    
+A mutable struct to hold metadata for each ray during the integration process. It contains the accumulated color (`acc_color`), the alpha value for blending (`alpha`), and the minimum radius encountered along the ray's path (`r_min`). This struct is used to store intermediate results and state information as the photon is traced through the spacetime and interacts with various elements such as the accretion disc and the background.
 
+"""
 mutable struct RayData
     acc_color::RGBf
     alpha::Float64
     r_min::Float64
 end
 
+
+
+"""
+
+    get_ray_direction(cam::Camera, u, v)
+
+Calculates the direction of a ray in world coordinates based on the camera's orientation and the normalized screen coordinates `u` and `v`. The function constructs a local direction vector in the camera's coordinate system and then transforms it into world coordinates using the camera's right, up, and forward vectors. The resulting direction vector is normalized to ensure it has a unit length.
+"""
 function get_ray_direction(cam::Camera, u, v)
     dir_local = SVector{3}(u * cam.fov_factor, v * cam.fov_factor, 1.0)
 
@@ -40,6 +63,11 @@ function get_ray_direction(cam::Camera, u, v)
 end
 
 
+"""
+    init_photon(cam::Camera, spacetime::AbstractSpacetime, u, v)
+Initializes a photon's state vector based on the camera's position and orientation, as well as the normalized screen coordinates `u` and `v`. The function calculates the initial position of the photon in spherical coordinates (t, r, θ, ϕ) and computes the corresponding momentum components (pt, pr, pθ, pϕ) using the inverse metric of the spacetime. The resulting state vector is returned as an instance of the `Photon` struct, ready to be used for ray tracing through the spacetime.
+
+"""
 function init_photon(cam::Camera, spacetime::AbstractSpacetime, u, v)
     d = get_ray_direction(cam, u, v)
     dx, dy, dz = d
@@ -69,6 +97,12 @@ function init_photon(cam::Camera, spacetime::AbstractSpacetime, u, v)
     return vcat(q0, SVector(pt, pr, pθ, pϕ))
 end
 
+"""
+    sample_background(img, θ, ϕ)
+
+Samples the background image `img` based on the spherical coordinates `θ` and `ϕ`. The function converts the spherical coordinates into normalized texture coordinates `u` and `v`, which are then used to index into the background image. The resulting color is returned as an RGB value, allowing the ray tracer to incorporate the background into the final rendered image based on the photon's trajectory and interactions with the spacetime and accretion disc.
+
+"""
 function sample_background(img, θ, ϕ)
     v = clamp(θ / π, 0.0, 1.0)
     u = clamp(mod2pi(ϕ) / (2π), 0.0, 1.0)
@@ -80,6 +114,12 @@ function sample_background(img, θ, ϕ)
     return img[px, py]
 end
 
+"""
+    render_no_doppler(cam::Camera, spacetime::AbstractSpacetime; width=200, height=100)
+
+Renders an image of the spacetime without considering Doppler effects. The function initializes a 2D array to hold the pixel values and sets up ODE integrators for each thread to trace photons through the spacetime. For each pixel, it calculates the initial state of the photon based on the camera's position and orientation, and then integrates its trajectory until it either hits the black hole or escapes to infinity. The resulting image is a grayscale representation of the spacetime, where pixels corresponding to rays that hit the black hole are set to black, and others are colored based on their final azimuthal angle.
+
+"""
 function render_no_doppler(cam::Camera, spacetime::AbstractSpacetime; width=200, height=100)
     image = zeros(Float64, width, height)
     tspan = (0.0, 500.0)
@@ -121,14 +161,20 @@ function render_no_doppler(cam::Camera, spacetime::AbstractSpacetime; width=200,
     image
 end
 
-function render(cam::Camera, spacetime::Schwarzschild, background; width=400, height=200)
+"""
+    render(cam::Camera, spacetime::T, background; disc::AccretionDisc=AccretionDisc(), width=400, height=200)
+
+Renders an image of the spacetime with Doppler effects and an accretion disc. The function initializes a 2D array to hold the pixel values and sets up ODE integrators for each thread to trace photons through the spacetime. For each pixel, it calculates the initial state of the photon based on the camera's position and orientation, and then integrates its trajectory while accounting for interactions with the accretion disc and the background. The resulting image is a color representation of the spacetime, where pixels are colored based on their interactions with the disc and background, as well as their final positions.
+
+"""
+function render(cam::Camera, spacetime::Schwarzschild, background; disc::AccretionDisc=AccretionDisc(), width=400, height=200)
     image = zeros(RGBf, width, height)
     tspan = (0.0, 500.0)
 
     maxtid = Threads.maxthreadid()
     thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf) for _ in 1:maxtid]
     μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0)
-    base_prob = ODEProblem(spacetime, μ0_dummy, tspan, (spacetime, thread_metas[1]))
+    base_prob = ODEProblem(spacetime, μ0_dummy, tspan, (spacetime, thread_metas[1], disc))
     thread_integrators = [init(base_prob, Tsit5(), callback=cb_set,
                                dense=false, save_everystep=false,
                                reltol=1e-6, abstol=1e-6) for _ in 1:maxtid]
@@ -145,7 +191,7 @@ function render(cam::Camera, spacetime::Schwarzschild, background; width=400, he
             meta.acc_color = RGBf(0,0,0)
             meta.alpha = 1.0
             meta.r_min = Inf
-            integrator.p = (spacetime, meta)
+            integrator.p = (spacetime, meta, disc)
             reinit!(integrator, μ0)
             solve!(integrator)
 
@@ -164,6 +210,11 @@ function render(cam::Camera, spacetime::Schwarzschild, background; width=400, he
     image
 end
 
+"""
+    smooth_raytrace(spacetime::T, p::Photon, tspan::Tuple{Float64,Float64}) where T <: AbstractSpacetime
+
+Performs a ray trace through the spacetime with a smooth solution output. The function sets up an ODE problem for the given photon state and spacetime, solves it using a high-accuracy method, and then interpolates the solution onto a regular time grid for smoother visualization. The resulting smoothed solution is returned as an array of state vectors corresponding to the specified time points.
+"""
 function smooth_raytrace(spacetime::T, p::Photon, tspan::Tuple{Float64,Float64}) where T <: AbstractSpacetime
     prob = ODEProblem(spacetime, p.μ, tspan)
     sol = solve(prob, Tsit5(), reltol=1e-6, abstol=1e-6)

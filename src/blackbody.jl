@@ -1,9 +1,17 @@
+"""
+    _cie_gauss(λ, μ, σ1, σ2)
+Helper function to compute a Gaussian value for the CIE color matching functions. The function takes a wavelength `λ`, a mean `μ`, and two standard deviations `σ1` and `σ2` that determine the width of the Gaussian on either side of the mean. It returns the computed Gaussian value based on the input parameters.
+"""
 function _cie_gauss(λ, μ, σ1, σ2)
     σ = λ < μ ? σ1 : σ2
     exp(-0.5 * ((λ - μ) / σ)^2)
 end
 
-# Blackbody temperature → normalized linear sRGB chromaticity
+"""
+    blackbody_rgb(T)
+
+Computes the RGB color of a blackbody at temperature `T`. The function integrates the spectral radiance over the visible spectrum using the CIE color matching functions and converts the result to linear sRGB. The output is a normalized RGB vector representing the color of the blackbody.
+"""
 function blackbody_rgb(T)
     X, Y, Z = 0.0, 0.0, 0.0
     for λ in 380.0:5.0:780.0
@@ -26,16 +34,47 @@ function blackbody_rgb(T)
     SVector(r/m, g/m, b/m)
 end
 
+"""
+    Blackbody(; wb_temperature=6500.0, table_min=500.0, table_max=30000.0, table_size=1024)
 
-function wb_blackbody_color(T)
-    c = blackbody_rgb(max(T, 1.0))
-    SVector(c[1] * WB_GAINS[1], c[2] * WB_GAINS[2], c[3] * WB_GAINS[3])
+Represents a blackbody emission profile with a specified temperature and precomputed color lookup table. The `wb_temperature` parameter sets the reference temperature for white balancing, while `table_min`, `table_max`, and `table_size` define the range and resolution of the precomputed color table for efficient color retrieval during rendering. The struct contains the reference temperature, table parameters, and the precomputed color table itself, which can be used to quickly obtain the RGB color corresponding to any given temperature within the specified range.
+"""
+struct Blackbody
+    wb_temperature::Float64
+    table_min::Float64
+    table_max::Float64
+    table_size::Int
+    wb_gains::SVector{3, Float64}
+    table::Vector{SVector{3, Float64}}
 end
 
+function Blackbody(; wb_temperature=6500.0, table_min=500.0, table_max=30000.0, table_size=1024)
+    wb_ref = blackbody_rgb(wb_temperature)
+    wb_gains = SVector(1.0 / wb_ref[1], 1.0 / wb_ref[2], 1.0 / wb_ref[3])
+    table = Vector{SVector{3, Float64}}(undef, table_size)
+    for (i, T) in enumerate(range(table_min, table_max, length=table_size))
+        c = blackbody_rgb(max(T, 1.0))
+        table[i] = SVector(c[1] * wb_gains[1], c[2] * wb_gains[2], c[3] * wb_gains[3])
+    end
+    Blackbody(wb_temperature, table_min, table_max, table_size, wb_gains, table)
+end
 
-function wb_blackbody_color_fast(T)
-    T_clamped = clamp(T, BB_TABLE_MIN, BB_TABLE_MAX)
-    frac = (T_clamped - BB_TABLE_MIN) / (BB_TABLE_MAX - BB_TABLE_MIN)
-    idx = clamp(round(Int, frac * (BB_TABLE_SIZE - 1)) + 1, 1, BB_TABLE_SIZE)
-    BB_TABLE[idx]
+"""
+    wb_blackbody_color(T, bb::Blackbody)
+Calculates the white-balanced RGB color for a given temperature `T` using the provided `Blackbody` struct. The function retrieves the precomputed color from the blackbody's color table based on the input temperature, applying the appropriate white balance gains to ensure accurate color representation. The output is an RGB vector representing the color corresponding to the specified temperature, adjusted for white balance according to the reference temperature defined in the `Blackbody` struct.
+"""
+function wb_blackbody_color(T, bb::Blackbody)
+    c = blackbody_rgb(max(T, 1.0))
+    SVector(c[1] * bb.wb_gains[1], c[2] * bb.wb_gains[2], c[3] * bb.wb_gains[3])
+end
+
+"""
+    wb_blackbody_color_fast(T, bb::Blackbody)
+A fast version of the `wb_blackbody_color` function that retrieves the white-balanced RGB color for a given temperature `T` using the precomputed color table in the `Blackbody` struct. The function clamps the input temperature to the range defined by the blackbody's table parameters, calculates the corresponding index in the color table, and returns the precomputed color without performing the full blackbody calculation. This approach allows for efficient color retrieval while still providing accurate results based on the precomputed values in the blackbody's color table.
+"""
+function wb_blackbody_color_fast(T, bb::Blackbody)
+    T_clamped = clamp(T, bb.table_min, bb.table_max)
+    frac = (T_clamped - bb.table_min) / (bb.table_max - bb.table_min)
+    idx = clamp(round(Int, frac * (bb.table_size - 1)) + 1, 1, bb.table_size)
+    bb.table[idx]
 end

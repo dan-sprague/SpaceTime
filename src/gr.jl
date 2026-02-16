@@ -1,11 +1,19 @@
 abstract type AbstractSpacetime end
 
-
+"""
+    Schwarzschild(M)
+Represents a Schwarzschild black hole with mass `M`.
+"""
 struct Schwarzschild <: AbstractSpacetime
     M::Float64
 end
 
 
+"""
+    Schwarzchild Geodesic Equations of Motion
+
+Defines the equations of motion for a photon in the Schwarzschild spacetime. The input `μ` is an 8-component state vector containing position and momentum information, `p` is a tuple containing the black hole and metadata, and `t` is the time parameter. The function returns the derivatives of the state vector according to the geodesic equations.
+"""
 function (bh::Schwarzschild)(μ::SVector{8,T},p,t) where T
     bh, meta = p
     
@@ -40,11 +48,19 @@ function (bh::Schwarzschild)(μ::SVector{8,T},p,t) where T
     return SVector{8, T}(dt, dr, dθ, dϕ, 0.0, dpr, dpθ, 0.0)
 end
 
+"""
+    Kerr(M, a)
+Represents a Kerr black hole with mass `M` and spin parameter `a`. The Kerr
+"""
 struct Kerr <: AbstractSpacetime
     M::Float64
     a::Float64
 end
 
+"""
+    Schwarzschild Metric Inverse
+Calculates the inverse of the Schwarzschild metric at a given position `q`. The input `q` is a 4-component vector containing the coordinates (t, r, θ, ϕ). The function returns a 4x4 matrix representing the inverse metric components.
+"""
 function metric_inverse(bh::Schwarzschild, q::SVector{4,T}) where T
     r = q[2]
     θ = q[3]
@@ -69,6 +85,10 @@ function metric_inverse(bh::Kerr, q::SVector{4,T}) where T
     @error "Kerr metric not implemented yet"
 end
 
+""" 
+    hamiltonian(μ, bh)
+Calculates the Hamiltonian for a photon in the given spacetime. The input `μ` is an 8-component state vector containing position and momentum information, and `bh` is the black hole spacetime. The function returns the value of the Hamiltonian, which should be zero for a photon following a geodesic.
+"""
 function hamiltonian(μ::SVector{8,T}, bh::AbstractSpacetime) where T
     q = μ[SVector{4}(1,2,3,4)]
     p = μ[SVector{4}(5,6,7,8)]
