@@ -159,4 +159,3 @@ function render(cam::Camera, bh::BlackHole, background; width=400, height=200)
     image
 end
 
-
