@@ -26,9 +26,6 @@ function blackbody_rgb(T)
     SVector(r/m, g/m, b/m)
 end
 
-# White balance gains: 6500K blackbody → (1, 1, 1)
-const _WB_REF = blackbody_rgb(6500.0)
-const WB_GAINS = SVector(1.0 / _WB_REF[1], 1.0 / _WB_REF[2], 1.0 / _WB_REF[3])
 
 function wb_blackbody_color(T)
     c = blackbody_rgb(max(T, 1.0))
@@ -36,3 +33,9 @@ function wb_blackbody_color(T)
 end
 
 
+function wb_blackbody_color_fast(T)
+    T_clamped = clamp(T, BB_TABLE_MIN, BB_TABLE_MAX)
+    frac = (T_clamped - BB_TABLE_MIN) / (BB_TABLE_MAX - BB_TABLE_MIN)
+    idx = clamp(round(Int, frac * (BB_TABLE_SIZE - 1)) + 1, 1, BB_TABLE_SIZE)
+    BB_TABLE[idx]
+end

@@ -1,4 +1,3 @@
-
 function boundary_condition(μ,t,integrator)
     r = μ[2]
 
@@ -40,7 +39,6 @@ function disk_affect_doppler!(integrator)
     e_θ = SVector(cos(θ)*cos(ϕ), cos(θ)*sin(ϕ), -sin(θ))
     e_ϕ = SVector(-sin(ϕ), cos(ϕ), 0.0)
 
-    # Cartesian velocity direction (radial component needs g^{rr} = (r-2M)/r factor)
     v_r = (r - 2M) / r * pr
     p_cartesian = v_r * e_r + (pθ/r) * e_θ + (pϕ/(r*sin(θ))) * e_ϕ
     pos_cartesian = SVector(r*sin(θ)*cos(ϕ), r*sin(θ)*sin(ϕ), r*cos(θ))
@@ -48,7 +46,6 @@ function disk_affect_doppler!(integrator)
     if DISK_INNER_RADIUS < r < DISK_OUTER_RADIUS
         local_color, T_obs = get_disc_color_doppler(r, pos_cartesian, p_cartesian, bh)
 
-        # Python opacity: iscotaper * outertaper
         R = r / (2M)
         R_inner = DISK_INNER_RADIUS / (2M)
         iscotaper = clamp((R^2 - R_inner^2) * 0.3, 0.0, 1.0)
@@ -56,7 +53,7 @@ function disk_affect_doppler!(integrator)
         R_outer = DISK_OUTER_RADIUS / (2M)
         density = clamp((R_outer - R) / (R_outer - R_inner), 0, 1)
         #density = (R_inner / R)^1.05
-        disc_opacity = iscotaper * outertaper * sqrt(density)
+        disc_opacity = iscotaper * outertaper * density^0.33
 
         integrator.p[2].acc_color += local_color * (integrator.p[2].alpha * disc_opacity)
         integrator.p[2].alpha *= (1.0 - disc_opacity)

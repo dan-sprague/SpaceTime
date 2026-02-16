@@ -24,7 +24,7 @@ function get_disc_color_doppler(r, pos, p_cartesian, bh::BlackHole)
 
     final_intensity = intensity_val * 100.0
 
-    c = wb_blackbody_color(T_obs)
+    c = wb_blackbody_color_fast(T_obs)
     color = RGBf(final_intensity * c[1], final_intensity * c[2], final_intensity * c[3])
     return color, T_obs
 end

@@ -58,8 +58,8 @@ function postprocess(image::Matrix{RGBf}, fov_factor; airy_radius=0.5, gain=0.37
                                max(0, c.b - threshold)), img)
 
     glow = zeros(RGBf, w, h)
-    scales = [0.005, 0.02, 0.05, 0.1] 
-    weights = [0.5, 0.15, 0.1, 0.25]  
+    scales = [0.005, 0.02, 0.05, 0.1]
+    weights = [0.5, 0.15, 0.1, 0.25]  # How much each scale contributes
     
     for (s, weight) in zip(scales, weights)
         sigma = w * s
@@ -69,7 +69,6 @@ function postprocess(image::Matrix{RGBf}, fov_factor; airy_radius=0.5, gain=0.37
     img_combined = img .+ glow
     γ = 1.6
     img_combined = map(c -> RGBf(c.r^γ, c.g^γ, c.b^γ), img_combined)
-
     map(c -> RGB{Float32}(
         clamp(c.r, 0.0, Inf) / (1.0 + max(0.0, c.r)), 
         clamp(c.g, 0.0, Inf) / (1.0 + max(0.0, c.g)), 

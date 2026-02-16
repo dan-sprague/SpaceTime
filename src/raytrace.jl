@@ -32,6 +32,7 @@ function get_ray_direction(cam::Camera, u, v)
     return dir_world
 end
 
+
 function init_photon(cam::Camera, bh::BlackHole, u, v)
     d = get_ray_direction(cam, u, v)
     dx, dy, dz = d
@@ -74,57 +75,79 @@ function sample_background(img, θ, ϕ)
     return img[px, py]
 end
 
-function render_no_doppler(cam::Camera, bh::BlackHole;width = 200,height = 100)
-    image = zeros(Float64,width,height)
-
-    tspan = (0.0,500.0)
+function render_no_doppler(cam::Camera, bh::BlackHole; width=200, height=100)
+    image = zeros(Float64, width, height)
+    tspan = (0.0, 500.0)
     cb = ContinuousCallback(boundary_condition, horizon_affect!)
-    meta = RayData(RGBf(0.0,0.0,0.0),1.0,Inf)
-    Threads.@threads for i in 1:width
+
+    maxtid = Threads.maxthreadid()
+    thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf) for _ in 1:maxtid]
+    μ0_dummy = init_photon(cam, bh, 0.0, 0.0)
+    base_prob = ODEProblem(equations_of_motion, μ0_dummy, tspan, (bh, thread_metas[1]))
+    thread_integrators = [init(base_prob, Tsit5(), callback=cb,
+                               save_everystep=false, dense=false,
+                               reltol=1e-6, abstol=1e-6) for _ in 1:maxtid]
+
+    Threads.@threads :static for i in 1:width
+        tid = Threads.threadid()
+        integrator = thread_integrators[tid]
+        meta = thread_metas[tid]
         for j in 1:height
             u = (i - width/2) / (width / 2)
             v = (j - height/2) / (height / 2)
+            μ0 = init_photon(cam, bh, u, v)
 
-            μ0 = init_photon(cam, bh, u, v)            
-            problem = ODEProblem(equations_of_motion, μ0, tspan, (bh, meta))
-            cb = ContinuousCallback(boundary_condition, horizon_affect!)
-            sol = solve(problem, Tsit5(), callback=cb, save_everystep=false,
-            reltol=1e-6, abstol=1e-6,dense = false)
+            meta.acc_color = RGBf(0,0,0)
+            meta.alpha = 1.0
+            meta.r_min = Inf
+            integrator.p = (bh, meta)
+            reinit!(integrator, μ0)
+            solve!(integrator)
 
-            final_r = sol.u[end][2]
+            final_r = integrator.sol.u[end][2]
             if final_r < 2.1 * bh.M
                 image[i, j] = 0.0
             else
-                final_ϕ = sol.u[end][4]
-                image[i,j] = 0.5 + 0.5 * sin(10 * final_ϕ)
+                final_ϕ = integrator.sol.u[end][4]
+                image[i, j] = 0.5 + 0.5 * sin(10 * final_ϕ)
             end
         end
     end
-    image 
+    image
 end
 
-function render(cam::Camera, bh::BlackHole,background; width=400, height=200)
+function render(cam::Camera, bh::BlackHole, background; width=400, height=200)
     image = zeros(RGBf, width, height)
     tspan = (0.0, 500.0)
-    
-    Threads.@threads for i in 1:width
+
+    maxtid = Threads.maxthreadid()
+    thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf) for _ in 1:maxtid]
+    μ0_dummy = init_photon(cam, bh, 0.0, 0.0)
+    base_prob = ODEProblem(equations_of_motion, μ0_dummy, tspan, (bh, thread_metas[1]))
+    thread_integrators = [init(base_prob, Tsit5(), callback=cb_set,
+                               dense=false, save_everystep=false,
+                               reltol=1e-6, abstol=1e-6) for _ in 1:maxtid]
+
+    Threads.@threads :static for i in 1:width
+        tid = Threads.threadid()
+        integrator = thread_integrators[tid]
+        meta = thread_metas[tid]
         for j in 1:height
-            meta = RayData(RGBf(0,0,0), 1.0, Inf)
-            
             u = (i - width/2) / (height/2)
             v = (j - height/2) / (height/2)
             μ0 = init_photon(cam, bh, u, v)
-            
-            prob = ODEProblem(equations_of_motion, μ0, tspan, (bh, meta))
-            
-            sol = solve(prob, Tsit5(), callback=cb_set, 
-            dense=false, save_everystep=false, 
-            reltol=1e-6, abstol=1e-6)
 
-            final_r = sol.u[end][2]
-            final_θ = sol.u[end][3]
-            final_ϕ = sol.u[end][4]
-            
+            meta.acc_color = RGBf(0,0,0)
+            meta.alpha = 1.0
+            meta.r_min = Inf
+            integrator.p = (bh, meta)
+            reinit!(integrator, μ0)
+            solve!(integrator)
+
+            final_r = integrator.sol.u[end][2]
+            final_θ = integrator.sol.u[end][3]
+            final_ϕ = integrator.sol.u[end][4]
+
             if final_r < 2.1 * bh.M
                 image[i, j] = meta.acc_color
             else
@@ -133,7 +156,7 @@ function render(cam::Camera, bh::BlackHole,background; width=400, height=200)
             end
         end
     end
-    image 
+    image
 end
 
 
