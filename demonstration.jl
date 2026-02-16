@@ -61,12 +61,12 @@ bg = fill(RGBf(0, 0, 0), 3840, 2160)
 img = render(cam2, bh, bg; disc=disc2, width=3840, height=2160) 
 post_img = postprocess(img;
     gain=1.0,
-    exposure=2.0,
+    exposure=1.5,
     gamma = 0.08,
-    bloom_strength=1.5,
-    threshold=0.5,
-    bloom_radius=20.0,
-    bloom_power=0.95,
+    bloom_strength=1.0,
+    threshold=0.4,
+    bloom_radius=10.0,
+    bloom_power=1.0,
     streak_strength=0.8,
     streak_length=0.2,
     streak_width=5,
