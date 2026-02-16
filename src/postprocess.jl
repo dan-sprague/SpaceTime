@@ -1,37 +1,23 @@
-  function veiling_flare(image::Matrix{<:RGB}; intensity=0.1)
-    n = length(image)
-    sum_r = 0.0
-    sum_g = 0.0
-    sum_b = 0.0
-    for c in image
-        sum_r += c.r
-        sum_g += c.g
-        sum_b += c.b
-    end
-    veil = RGBf(sum_r / n, sum_g / n, sum_b / n) * intensity
-    image .+ Ref(veil)
+function airy_disk(x)
+    (2 * besselj1(x) / x)^2
 end
-                                                                                
-  function airy_disk(x)
-      (2 * besselj1(x) / x)^2
-  end
 
-  const AIRY_SPECTRUM = SVector(1.0, 0.86, 0.61)  # approximate R,G,B wavelength
+const AIRY_SPECTRUM = SVector(1.0, 0.86, 0.61)  # approximate R,G,B wavelength
 
-  function generate_kernel(scale, size)
-      coords = -size:size
-      kernel = zeros(2size+1, 2size+1, 3)
-      for (j, cy) in enumerate(coords), (i, cx) in enumerate(coords)
-          r = sqrt(cx^2 + cy^2) + 1e-6
-          for c in 1:3
-              kernel[i, j, c] = airy_disk(r / scale[c])
-          end
-      end
-      for c in 1:3
-          kernel[:, :, c] ./= sum(@view kernel[:, :, c])
-      end
-      kernel
-  end
+function generate_kernel(scale, size)
+    coords = -size:size
+    kernel = zeros(2size+1, 2size+1, 3)
+    for (j, cy) in enumerate(coords), (i, cx) in enumerate(coords)
+        r = sqrt(cx^2 + cy^2) + 1e-6
+        for c in 1:3
+            kernel[i, j, c] = airy_disk(r / scale[c])
+        end
+    end
+    for c in 1:3
+        kernel[:, :, c] ./= sum(@view kernel[:, :, c])
+    end
+    kernel
+end
 
 function airy_convolve(image::Matrix{<:RGB}, radius; kernel_radius=25)
     scale = radius .* AIRY_SPECTRUM
@@ -54,13 +40,13 @@ function postprocess(image::Matrix{RGBf}, fov_factor; airy_radius=0.5, gain=0.37
 
     threshold = 0.5
     bright_pass = map(c -> RGBf(max(0, c.r - threshold), 
-                               max(0, c.g - threshold), 
-                               max(0, c.b - threshold)), img)
+                                max(0, c.g - threshold), 
+                                max(0, c.b - threshold)), img)
 
     glow = zeros(RGBf, w, h)
     scales = [0.005, 0.02, 0.05, 0.1]
     weights = [0.5, 0.15, 0.1, 0.25]  # How much each scale contributes
-    
+
     for (s, weight) in zip(scales, weights)
         sigma = w * s
         glow .+= imfilter(bright_pass, Kernel.gaussian(sigma)) .* (weight * glare_intensity)

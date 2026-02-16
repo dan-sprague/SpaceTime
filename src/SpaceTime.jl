@@ -21,5 +21,11 @@ const BB_TABLE_MAX = 30000.0
 const BB_TABLE_SIZE = 1024
 const BB_TABLE = [wb_blackbody_color(T) for T in range(BB_TABLE_MIN, BB_TABLE_MAX, length=BB_TABLE_SIZE)]
 
+export AbstractSpacetime, Schwarzschild, Kerr, metric_inverse, hamiltonian
+export Photon, Camera, RayData, init_photon, render_no_doppler, render, smooth_raytrace
+export sample_background, get_ray_direction
+export visualize_solution, trace_fan, compare_hamiltonian_drift
+export postprocess, airy_convolve
+export get_disc_color_doppler
 
 end # module SpaceTime

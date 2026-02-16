@@ -1,4 +1,4 @@
-function get_disc_color_doppler(r, pos, p_cartesian, bh::BlackHole)
+function get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime)
     M = bh.M
     R = r / (2M)      
     Rsqr = R^2
