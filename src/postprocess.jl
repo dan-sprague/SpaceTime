@@ -154,7 +154,8 @@ function postprocess(image::Matrix{RGBf};
                      n_spikes=4,
                      angles=nothing,
                      tonemap=:aces,
-                     tonemap_hue_preserve=0.75)
+                     tonemap_hue_preserve=0.75,
+                     contrast=0.0)
     w, h = size(image)
 
     # 1. Gain + exposure
@@ -225,7 +226,77 @@ function postprocess(image::Matrix{RGBf};
         final_b = final_b .^ inv_gamma
     end
 
+    # 8. Contrast: blend toward (positive) or away from (negative) a
+    # smoothstep S-curve in display space. Monotonic for contrast ∈ [-1, 1].
+    if contrast != 0.0
+        c = clamp(contrast, -1.0, 1.0)
+        scurve(x) = (xc = clamp(x, 0.0, 1.0); xc + c * (xc * xc * (3.0 - 2.0 * xc) - xc))
+        final_r = scurve.(final_r)
+        final_g = scurve.(final_g)
+        final_b = scurve.(final_b)
+    end
+
     RGBf.(Float32.(final_r), Float32.(final_g), Float32.(final_b))
+end
+
+"""
+    auto_balance!(image::Matrix{RGBf}; clip=0.001, midtone=0.45, max_gamma=2.2)
+
+Photoshop-style "Auto Tone" (Enhance Per Channel Contrast): for each channel,
+find the levels that clip `clip` (0.1% by default) of pixels at each end of
+the histogram and stretch the channel across [0, 1] — which maximises
+contrast *and* removes colour casts, since each channel is stretched
+independently. Then a midtone pass: a single gamma nudges the median
+luminance toward `midtone` (clamped to ±`max_gamma`), the equivalent of
+Photoshop's automatic midtone slider. Apply as the last step of the photo
+pipeline, on display-space values.
+"""
+function auto_balance!(image::Matrix{RGBf}; clip::Real=0.001,
+                       midtone::Real=0.45, max_gamma::Real=2.2)
+    n = length(image)
+    n == 0 && return image
+    stride = max(1, n ÷ 200_000)
+    idxs = 1:stride:n
+
+    lows = zeros(Float64, 3)
+    highs = ones(Float64, 3)
+    for (ch, getter) in enumerate((c -> c.r, c -> c.g, c -> c.b))
+        vals = Float64[clamp(getter(image[k]), 0.0f0, 1.0f0) for k in idxs]
+        sort!(vals)
+        m = length(vals)
+        lo = vals[clamp(round(Int, clip * m) + 1, 1, m)]
+        hi = vals[clamp(m - round(Int, clip * m), 1, m)]
+        if hi - lo > 1e-4
+            lows[ch] = lo
+            highs[ch] = hi
+        end
+    end
+
+    inv_r = 1.0 / (highs[1] - lows[1])
+    inv_g = 1.0 / (highs[2] - lows[2])
+    inv_b = 1.0 / (highs[3] - lows[3])
+    for k in eachindex(image)
+        c = image[k]
+        image[k] = RGBf(clamp((c.r - lows[1]) * inv_r, 0.0, 1.0),
+                        clamp((c.g - lows[2]) * inv_g, 0.0, 1.0),
+                        clamp((c.b - lows[3]) * inv_b, 0.0, 1.0))
+    end
+
+    # Midtone: median luminance -> `midtone` via a single gamma.
+    lums = Float64[0.2126 * image[k].r + 0.7152 * image[k].g +
+                   0.0722 * image[k].b for k in idxs]
+    sort!(lums)
+    med = clamp(lums[max(length(lums) ÷ 2, 1)], 1e-4, 1.0 - 1e-4)
+    γ = clamp(log(midtone) / log(med), 1.0 / max_gamma, max_gamma)
+    if !isapprox(γ, 1.0; atol=0.02)
+        for k in eachindex(image)
+            c = image[k]
+            image[k] = RGBf(clamp(c.r, 0.0f0, 1.0f0)^γ,
+                            clamp(c.g, 0.0f0, 1.0f0)^γ,
+                            clamp(c.b, 0.0f0, 1.0f0)^γ)
+        end
+    end
+    return image
 end
 
 # -----------------------------------------------------------------------------

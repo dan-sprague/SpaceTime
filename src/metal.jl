@@ -127,37 +127,31 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    schwarzschild_rhs_mtl(q_r, q_theta, p_t, p_r, p_theta, p_phi, M)
+    ks_rhs_mtl(x, y, z, px, py, pz, p_t, M)
 
-Float32 Schwarzschild geodesic RHS for the Metal kernel.
+Float32 geodesic RHS in **Cartesian Kerr–Schild coordinates**. The metric is
+`g = η + f l⊗l` with `f = 2M/r` and `l = (1, x/r, y/r, z/r)`, giving the
+Hamiltonian `H = ½(−p_t² + |p|² − f ℓ²)` with `ℓ = −p_t + (x·p)/r`. Unlike
+the spherical chart this is regular at the poles **and** at the horizon —
+no `1/sin²θ`, no `1/(r−2M)` — and contains no trigonometry. `p_t` is
+conserved. Returns `(dx, dy, dz, dpx, dpy, dpz)`.
 """
-function schwarzschild_rhs_mtl(q_r, q_theta, p_t, p_r, p_theta, p_phi, M)
-    # Clamp sinθ away from the coordinate singularity at the poles: rays
-    # crossing near θ=0/π would otherwise blow up to Inf/NaN in Float32 and
-    # trap the kernel. The clamp slightly mis-deflects rays inside a ~0.06°
-    # cone around the axis — invisible next to the pole artifacts it prevents.
-    sin_t = max(sin(q_theta), 1.0f-3)
-    cos_t = cos(q_theta)
-    s2 = sin_t * sin_t
-    r2 = q_r * q_r
-    inv_r2 = 1.0f0 / r2
-    inv_r3 = inv_r2 / q_r
-    delta = q_r - 2.0f0 * M
+function ks_rhs_mtl(x, y, z, px, py, pz, p_t, M)
+    r2 = x * x + y * y + z * z
+    inv_r = 1.0f0 / sqrt(r2)
+    f = 2.0f0 * M * inv_r
+    κ = (x * px + y * py + z * pz) * inv_r
+    ℓ = -p_t + κ
+    c1 = f * ℓ * inv_r                                  # fℓ/r
+    c2 = f * ℓ * (0.5f0 * ℓ + κ) * inv_r * inv_r        # f(ℓ²/2 + ℓκ)/r²
 
-    dq_t = -(q_r / delta) * p_t
-    dq_r = (delta / q_r) * p_r
-    dq_theta = inv_r2 * p_theta
-    dq_phi = (inv_r2 / s2) * p_phi
-
-    dp_r = -0.5f0 * (
-        (2.0f0 * M / (delta * delta)) * p_t * p_t +
-        (2.0f0 * M * inv_r2) * p_r * p_r +
-        (-2.0f0 * inv_r3) * p_theta * p_theta +
-        (-2.0f0 * inv_r3 / s2) * p_phi * p_phi
-    )
-    dp_theta = -0.5f0 * ((-2.0f0 * cos_t / (r2 * s2 * sin_t)) * p_phi * p_phi)
-
-    return dq_t, dq_r, dq_theta, dq_phi, 0.0f0, dp_r, dp_theta, 0.0f0
+    dx = px - c1 * x
+    dy = py - c1 * y
+    dz = pz - c1 * z
+    dpx = c1 * px - c2 * x
+    dpy = c1 * py - c2 * y
+    dpz = c1 * pz - c2 * z
+    return dx, dy, dz, dpx, dpy, dpz
 end
 
 """
@@ -260,25 +254,27 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    trace_kernel_mtl!(out, bg, bb_lut, cam_params, spacetime_params, disc_params,
-                      width, height, nmax, dt, jitter_u, jitter_v, weight,
-                      row0, rows)
+    trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
+                      spacetime_params, disc_params, width, height, nmax, dt,
+                      jitter_u, jitter_v, weight, row0, rows, ::Val{VOL})
 
-Metal compute kernel: one thread per pixel of the current row tile.
-`cam_params` is a 13-element Float32 vector
-`[pos(3); fwd(3); right(3); up(3); fov_factor]`.  `spacetime_params` is a
-3-element vector `[M; r_horizon; r_escape]`.  `disc_params` is a 6-element
-vector `[inner_radius; outer_radius; density_falloff; table_min; table_max;
-table_size]`; when the radii describe a valid annulus the kernel composites a
-semi-transparent Doppler-shaded disc (the Float32 twin of
-`disc_affect_doppler!`), colouring crossings from the white-balanced blackbody
-LUT `bb_lut` of shape `(3, table_size)`.
+Metal compute kernel: one thread per pixel of the current row tile, tracing
+geodesics in **Cartesian Kerr–Schild coordinates** (see `ks_rhs_mtl`) — free
+of the polar and horizon coordinate singularities of the spherical chart, so
+flythroughs never hit pole artifacts. `cam_params` is a 13-element Float32
+vector `[pos(3); fwd(3); right(3); up(3); fov_factor]`. `spacetime_params`
+is `[M; r_horizon; r_escape]`. `disc_params` is `[inner_radius; outer_radius;
+density_falloff; table_min; table_max; table_size]`; when the radii describe
+a valid annulus the kernel composites a semi-transparent Doppler-shaded disc,
+colouring crossings from the white-balanced blackbody LUT `bb_lut` of shape
+`(3, table_size)`. When `VOL` the volumetric disc grid replaces the thin
+plane (see `sample_volume_mtl`).
 
 `jitter_u`/`jitter_v` are the subpixel sample offsets in `[0, 1)`; the sample
 is **accumulated** into `out` scaled by `weight`, so the host must zero `out`
-before the first pass and the weights of all passes should sum to 1.  `row0`
-and `rows` select a horizontal tile (`row0` rows skipped, `rows` rendered) so
-large frames can be split across several short dispatches.
+before the first pass and the weights of all passes should sum to 1. `row0`
+and `rows` select a horizontal tile so large frames can be split across
+several short dispatches.
 """
 function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                            spacetime_params, disc_params, width, height,
@@ -300,7 +296,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     r_escape = spacetime_params[3]
 
     # Unpack camera basis.
-    px = cam_params[1];  py = cam_params[2];  pz = cam_params[3]
+    cx = cam_params[1];  cy = cam_params[2];  cz = cam_params[3]
     fx = cam_params[4];  fy = cam_params[5];  fz = cam_params[6]
     rx = cam_params[7];  ry = cam_params[8];  rz = cam_params[9]
     ux = cam_params[10]; uy = cam_params[11]; uz = cam_params[12]
@@ -314,50 +310,25 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     # Ray direction in world space.
     dx_local = u * fov
     dy_local = v * fov
-    dz_local = 1.0f0
-
-    dx = rx * dx_local + ux * dy_local + fx * dz_local
-    dy = ry * dx_local + uy * dy_local + fy * dz_local
-    dz = rz * dx_local + uz * dy_local + fz * dz_local
+    dx = rx * dx_local + ux * dy_local + fx
+    dy = ry * dx_local + uy * dy_local + fy
+    dz = rz * dx_local + uz * dy_local + fz
     len = sqrt(dx * dx + dy * dy + dz * dz)
     dx /= len; dy /= len; dz /= len
 
-    # Convert position to spherical coordinates.
-    r = sqrt(px * px + py * py + pz * pz)
-    theta = acos(pz / r)
-    phi = atan(py, px)
+    # Kerr–Schild null-ray initialisation (closed form): choose p⃗ = d̂ + β x̂
+    # so the coordinate velocity at the camera is exactly d̂; the null
+    # condition then gives p_t² = 1 − f(1 − κ²).
+    x = cx; y = cy; z = cz
+    r = sqrt(x * x + y * y + z * z)
+    f = 2.0f0 * M / r
+    κd = (x * dx + y * dy + z * dz) / r
+    p_t = -sqrt(max(1.0f0 - f * (1.0f0 - κd * κd), 1.0f-6))
+    β = f * (κd - p_t) / max(1.0f0 - f, 1.0f-4)
+    px = dx + β * x / r
+    py = dy + β * y / r
+    pz = dz + β * z / r
 
-    sin_t = sin(theta)
-    cos_t = cos(theta)
-    sin_p = sin(phi)
-    cos_p = cos(phi)
-
-    # Project direction onto spherical basis.
-    vr = dx * sin_t * cos_p + dy * sin_t * sin_p + dz * cos_t
-    vtheta = (dx * cos_t * cos_p + dy * cos_t * sin_p - dz * sin_t) / r
-    vphi = (-dx * sin_p + dy * cos_p) / (r * sin_t)
-
-    # Inverse metric components and initial momenta.
-    delta = r - 2.0f0 * M
-    g_inv_rr = delta / r
-    g_inv_theta = 1.0f0 / (r * r)
-    g_inv_phi = 1.0f0 / (r * r * sin_t * sin_t)
-    g_inv_tt = -r / delta
-
-    p_r = vr / g_inv_rr
-    p_theta = vtheta / g_inv_theta
-    p_phi = vphi / g_inv_phi
-
-    spatial = g_inv_rr * p_r * p_r + g_inv_theta * p_theta * p_theta +
-              g_inv_phi * p_phi * p_phi
-    p_t = -sqrt(abs(spatial / g_inv_tt))
-
-    # State variables.
-    q_r = r
-    q_theta = theta
-    q_phi = phi
-
-    half_pi = Float32(pi) / 2.0f0
     disc_inner = disc_params[1]
     disc_outer = disc_params[2]
     disc_falloff = disc_params[3]
@@ -371,15 +342,13 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     vol_zmax = vol_params[3]
     vol_emis = vol_params[7]
     vol_opac = vol_params[8]
-    # Bounding-sphere radius² of the volume grid: steps outside skip all
-    # volume work, including the per-sample trig.
     vol_s_out = exp(vol_params[2])
     vol_rb2 = vol_s_out * vol_s_out + vol_zmax * vol_zmax
     disc_plane = disc_enabled && !VOL
 
-    # Accumulated disc colour and remaining transmittance (alpha compositing,
-    # mirroring RayData in the CPU path). Rays are NOT terminated at disc
-    # crossings so lensed secondary images composite correctly.
+    # Accumulated disc colour and remaining transmittance (alpha
+    # compositing). Rays are NOT terminated at disc crossings so lensed
+    # secondary images composite correctly.
     acc_r = 0.0f0
     acc_g = 0.0f0
     acc_b = 0.0f0
@@ -388,192 +357,157 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     # Fixed-step RK4 integration.
     hit_horizon = false
     for stepi in 1:nmax
-        if q_r < r_horizon
+        r2 = x * x + y * y + z * z
+        r = sqrt(r2)
+        if r < r_horizon
             hit_horizon = true
             break
         end
-        if q_r > r_escape
+        if r > r_escape
             break   # ray escaped: background will be sampled below
         end
 
-        theta_prev = q_theta
-        r_prev = q_r
-        phi_prev = q_phi
-        p_r_prev = p_r
-        p_theta_prev = p_theta
+        xp = x; yp = y; zp = z
+        pxp = px; pyp = py; pzp = pz
 
-        k1 = schwarzschild_rhs_mtl(q_r, q_theta, p_t, p_r, p_theta, p_phi, M)
+        k1 = ks_rhs_mtl(x, y, z, px, py, pz, p_t, M)
 
         # Volumetric disc: sample the density grid and accumulate
         # Doppler-shaded emission/absorption. Sampled every 2nd step (with
         # doubled path weight) — gas structure is much coarser than the
-        # integration step, and the stride buys ~40% frame time.
-        if VOL && alpha > 0.003f0 && stepi % 2 == 0 &&
-           q_r * q_r < vol_rb2
-            sθv = sin(q_theta)
-            cθv = cos(q_theta)
-            zv = q_r * cθv
-            if abs(zv) < vol_zmax
-                s_cyl = q_r * sθv
-                ρ = sample_volume_mtl(vol, vol_params, s_cyl, q_phi, zv)
-                if ρ > 1.0f-4
-                    ds = 2.0f0 * dt *
-                         sqrt(k1[2] * k1[2] + (q_r * k1[3]) * (q_r * k1[3]) +
-                              (q_r * sθv * k1[4]) * (q_r * sθv * k1[4]))
-                    sp = sin(q_phi)
-                    cp = cos(q_phi)
-                    v_r = (q_r - 2.0f0 * M) / q_r * p_r
-                    vth = p_theta / q_r
-                    vph = p_phi / (q_r * max(sθv, 1.0f-6))
-                    pcx = v_r * sθv * cp + vth * cθv * cp - vph * sp
-                    pcy = v_r * sθv * sp + vth * cθv * sp + vph * cp
-                    pcz = v_r * cθv - vth * sθv
-                    plen = max(sqrt(pcx * pcx + pcy * pcy + pcz * pcz), 1.0f-20)
+        # integration step.
+        if VOL && alpha > 0.003f0 && stepi % 2 == 0 && r2 < vol_rb2
+            if abs(z) < vol_zmax
+                s_cyl = sqrt(x * x + y * y)
+                if s_cyl > 1.0f-6
+                    φv = atan(y, x)
+                    ρ = sample_volume_mtl(vol, vol_params, s_cyl, φv, z)
+                    if ρ > 1.0f-4
+                        vlen = max(sqrt(k1[1] * k1[1] + k1[2] * k1[2] +
+                                        k1[3] * k1[3]), 1.0f-20)
+                        ds = 2.0f0 * dt * vlen
 
-                    R = s_cyl / (2.0f0 * M)
-                    T_emit = exp(10.034259f0 - 0.375f0 * log(max(R * R, 1.0f-6)))
-                    v_mag = clamp(0.70710678f0 / sqrt(max(R - 1.0f0, 0.1f0)),
-                                  0.0f0, 0.999f0)
-                    vdotn = v_mag * (-sp * pcx + cp * pcy) / plen
-                    gam = 1.0f0 / sqrt(1.0f0 - clamp(v_mag * v_mag, 0.0f0, 0.99f0))
-                    Rs = q_r / (2.0f0 * M)
-                    opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(Rs, 1.0f0), 0.01f0))
-                    opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
-                    T_obs = T_emit / opz
-                    inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
+                        R = s_cyl / (2.0f0 * M)
+                        T_emit = exp(10.034259f0 - 0.375f0 * log(max(R * R, 1.0f-6)))
+                        v_mag = clamp(0.70710678f0 / sqrt(max(R - 1.0f0, 0.1f0)),
+                                      0.0f0, 0.999f0)
+                        # Keplerian flow ϕ̂ = (−y, x, 0)/s against the photon
+                        # coordinate velocity k1[1:3].
+                        vdotn = v_mag * (-y * k1[1] + x * k1[2]) / (s_cyl * vlen)
+                        gam = 1.0f0 / sqrt(1.0f0 - clamp(v_mag * v_mag, 0.0f0, 0.99f0))
+                        Rs = r / (2.0f0 * M)
+                        opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(Rs, 1.0f0), 0.01f0))
+                        opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
+                        T_obs = T_emit / opz
+                        inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
 
-                    frac = (clamp(T_obs, lut_tmin, lut_tmax) - lut_tmin) /
-                           (lut_tmax - lut_tmin)
-                    li = clamp(unsafe_trunc(Int32, frac * (lut_size - 1.0f0) + 0.5f0) +
-                               Int32(1), Int32(1), unsafe_trunc(Int32, lut_size))
-                    col_r = bb_lut[1, li]
-                    col_g = bb_lut[2, li]
-                    col_b = bb_lut[3, li]
+                        frac = (clamp(T_obs, lut_tmin, lut_tmax) - lut_tmin) /
+                               (lut_tmax - lut_tmin)
+                        li = clamp(unsafe_trunc(Int32, frac * (lut_size - 1.0f0) + 0.5f0) +
+                                   Int32(1), Int32(1), unsafe_trunc(Int32, lut_size))
+                        col_r = bb_lut[1, li]
+                        col_g = bb_lut[2, li]
+                        col_b = bb_lut[3, li]
 
-                    tau = vol_opac * ρ * ds
-                    a = 1.0f0 - exp(-tau)
-                    w = alpha * a * inten * vol_emis
-                    acc_r += w * col_r
-                    acc_g += w * col_g
-                    acc_b += w * col_b
-                    alpha *= (1.0f0 - a)
-                    if alpha < 0.003f0
-                        break   # transmittance exhausted: nothing behind matters
+                        tau = vol_opac * ρ * ds
+                        a = 1.0f0 - exp(-tau)
+                        w = alpha * a * inten * vol_emis
+                        acc_r += w * col_r
+                        acc_g += w * col_g
+                        acc_b += w * col_b
+                        alpha *= (1.0f0 - a)
+                        if alpha < 0.003f0
+                            break   # transmittance exhausted
+                        end
                     end
                 end
             end
         end
 
-        k2 = schwarzschild_rhs_mtl(
-            q_r + 0.5f0 * dt * k1[2],
-            q_theta + 0.5f0 * dt * k1[3],
-            p_t + 0.5f0 * dt * k1[5],
-            p_r + 0.5f0 * dt * k1[6],
-            p_theta + 0.5f0 * dt * k1[7],
-            p_phi + 0.5f0 * dt * k1[8],
-            M)
-        k3 = schwarzschild_rhs_mtl(
-            q_r + 0.5f0 * dt * k2[2],
-            q_theta + 0.5f0 * dt * k2[3],
-            p_t + 0.5f0 * dt * k2[5],
-            p_r + 0.5f0 * dt * k2[6],
-            p_theta + 0.5f0 * dt * k2[7],
-            p_phi + 0.5f0 * dt * k2[8],
-            M)
-        k4 = schwarzschild_rhs_mtl(
-            q_r + dt * k3[2],
-            q_theta + dt * k3[3],
-            p_t + dt * k3[5],
-            p_r + dt * k3[6],
-            p_theta + dt * k3[7],
-            p_phi + dt * k3[8],
-            M)
+        k2 = ks_rhs_mtl(
+            x + 0.5f0 * dt * k1[1], y + 0.5f0 * dt * k1[2], z + 0.5f0 * dt * k1[3],
+            px + 0.5f0 * dt * k1[4], py + 0.5f0 * dt * k1[5], pz + 0.5f0 * dt * k1[6],
+            p_t, M)
+        k3 = ks_rhs_mtl(
+            x + 0.5f0 * dt * k2[1], y + 0.5f0 * dt * k2[2], z + 0.5f0 * dt * k2[3],
+            px + 0.5f0 * dt * k2[4], py + 0.5f0 * dt * k2[5], pz + 0.5f0 * dt * k2[6],
+            p_t, M)
+        k4 = ks_rhs_mtl(
+            x + dt * k3[1], y + dt * k3[2], z + dt * k3[3],
+            px + dt * k3[4], py + dt * k3[5], pz + dt * k3[6],
+            p_t, M)
 
-        q_r     += (dt / 6.0f0) * (k1[2] + 2.0f0 * k2[2] + 2.0f0 * k3[2] + k4[2])
-        q_theta += (dt / 6.0f0) * (k1[3] + 2.0f0 * k2[3] + 2.0f0 * k3[3] + k4[3])
-        q_phi   += (dt / 6.0f0) * (k1[4] + 2.0f0 * k2[4] + 2.0f0 * k3[4] + k4[4])
-        p_t     += (dt / 6.0f0) * (k1[5] + 2.0f0 * k2[5] + 2.0f0 * k3[5] + k4[5])
-        p_r     += (dt / 6.0f0) * (k1[6] + 2.0f0 * k2[6] + 2.0f0 * k3[6] + k4[6])
-        p_theta += (dt / 6.0f0) * (k1[7] + 2.0f0 * k2[7] + 2.0f0 * k3[7] + k4[7])
-        p_phi   += (dt / 6.0f0) * (k1[8] + 2.0f0 * k2[8] + 2.0f0 * k3[8] + k4[8])
+        x  += (dt / 6.0f0) * (k1[1] + 2.0f0 * k2[1] + 2.0f0 * k3[1] + k4[1])
+        y  += (dt / 6.0f0) * (k1[2] + 2.0f0 * k2[2] + 2.0f0 * k3[2] + k4[2])
+        z  += (dt / 6.0f0) * (k1[3] + 2.0f0 * k2[3] + 2.0f0 * k3[3] + k4[3])
+        px += (dt / 6.0f0) * (k1[4] + 2.0f0 * k2[4] + 2.0f0 * k3[4] + k4[4])
+        py += (dt / 6.0f0) * (k1[5] + 2.0f0 * k2[5] + 2.0f0 * k3[5] + k4[5])
+        pz += (dt / 6.0f0) * (k1[6] + 2.0f0 * k2[6] + 2.0f0 * k3[6] + k4[6])
 
-        # A ray that still went non-finite (pole graze, horizon skim) can
-        # never satisfy the exit tests and would reach the background sampler
-        # as NaN, trapping the kernel. Paint it black and stop.
-        if !(q_r == q_r) || !(q_theta == q_theta) || !(p_r == p_r)
+        # A non-finite ray can never satisfy the exit tests and would reach
+        # the background sampler as NaN, trapping the kernel. Paint it black
+        # and stop. (KS coordinates make this far rarer than the spherical
+        # chart ever did.)
+        if !(x == x) || !(z == z) || !(px == px)
             hit_horizon = true
             break
         end
 
-        if disc_plane && alpha > 0.001f0
-            if (theta_prev - half_pi) * (q_theta - half_pi) < 0.0f0
-                # Locate the θ = π/2 crossing by linear interpolation across
-                # the step (the cheap stand-in for the CPU path's continuous
-                # event root-finding; removes radius banding on the disc).
-                frac = (half_pi - theta_prev) / (q_theta - theta_prev)
-                r_hit = r_prev + frac * (q_r - r_prev)
-                phi_hit = phi_prev + frac * (q_phi - phi_prev)
-                pr_hit = p_r_prev + frac * (p_r - p_r_prev)
-                ptheta_hit = p_theta_prev + frac * (p_theta - p_theta_prev)
-                if disc_inner < r_hit && r_hit < disc_outer
-                    # Doppler-shaded semi-transparent crossing, evaluated at
-                    # the interpolated state with θ = π/2 (sinθ = 1, cosθ = 0).
-                    sp = sin(phi_hit)
-                    cp = cos(phi_hit)
+        # Thin-plane disc: equatorial (z = 0) crossing, located by linear
+        # interpolation across the step.
+        if disc_plane && alpha > 0.001f0 && zp * z < 0.0f0
+            cf = zp / (zp - z)
+            xh = xp + cf * (x - xp)
+            yh = yp + cf * (y - yp)
+            s = sqrt(xh * xh + yh * yh)
+            if disc_inner < s && s < disc_outer
+                pxh = pxp + cf * (px - pxp)
+                pyh = pyp + cf * (py - pyp)
+                pzh = pzp + cf * (pz - pzp)
+                # Photon coordinate velocity at the crossing (z = 0 ⇒ r = s).
+                fh = 2.0f0 * M / s
+                κh = (xh * pxh + yh * pyh) / s
+                ℓh = -p_t + κh
+                c1h = fh * ℓh / s
+                vx = pxh - c1h * xh
+                vy = pyh - c1h * yh
+                vz = pzh
+                plen = max(sqrt(vx * vx + vy * vy + vz * vz), 1.0f-20)
 
-                    # Photon momentum in Cartesian coordinates.
-                    v_r = (r_hit - 2.0f0 * M) / r_hit * pr_hit
-                    pcx = v_r * cp - (p_phi / r_hit) * sp
-                    pcy = v_r * sp + (p_phi / r_hit) * cp
-                    pcz = -(ptheta_hit / r_hit)
-                    plen = sqrt(pcx * pcx + pcy * pcy + pcz * pcz)
+                R = s / (2.0f0 * M)
+                T_emit = exp(10.034259f0 - 0.375f0 * log(R * R))
+                v_mag = clamp(0.70710678f0 / sqrt(max(R - 1.0f0, 0.1f0)),
+                              0.0f0, 0.999f0)
+                vdotn = v_mag * (-yh * vx + xh * vy) / (s * plen)
+                gam = 1.0f0 / sqrt(1.0f0 - clamp(v_mag * v_mag, 0.0f0, 0.99f0))
+                opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(R, 1.0f0), 0.01f0))
+                opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
+                T_obs = T_emit / opz
+                inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
 
-                    R = r_hit / (2.0f0 * M)
-                    T_emit = exp(10.034259f0 - 0.375f0 * log(R * R))
+                frac = (clamp(T_obs, lut_tmin, lut_tmax) - lut_tmin) /
+                       (lut_tmax - lut_tmin)
+                li = clamp(unsafe_trunc(Int32, frac * (lut_size - 1.0f0) + 0.5f0) +
+                           Int32(1), Int32(1), unsafe_trunc(Int32, lut_size))
+                col_r = bb_lut[1, li]
+                col_g = bb_lut[2, li]
+                col_b = bb_lut[3, li]
 
-                    # Keplerian orbital speed; disc velocity = v_mag * ϕ̂.
-                    v_mag = clamp(0.70710678f0 / sqrt(max(R - 1.0f0, 0.1f0)),
-                                  0.0f0, 0.999f0)
-                    vdotn = v_mag * (-sp * pcx + cp * pcy) / plen
-                    v_sqr = clamp(v_mag * v_mag, 0.0f0, 0.99f0)
-                    gamma = 1.0f0 / sqrt(1.0f0 - v_sqr)
-                    opz_grav = 1.0f0 /
-                        sqrt(max(1.0f0 - 1.0f0 / max(R, 1.0f0), 0.01f0))
-                    opz = max(gamma * (1.0f0 + vdotn) * opz_grav, 0.1f0)
-                    T_obs = T_emit / opz
+                R_in = disc_inner / (2.0f0 * M)
+                R_out = disc_outer / (2.0f0 * M)
+                iscotaper = clamp((R * R - R_in * R_in) * 0.3f0, 0.0f0, 1.0f0)
+                outertaper = clamp(T_emit / 1000.0f0, 0.0f0, 1.0f0)
+                density = clamp((R_out - R) / (R_out - R_in), 0.0f0, 1.0f0)
+                dpow = density <= 1.0f-6 ?
+                    (disc_falloff > 0.0f0 ? 0.0f0 : 1.0f0) :
+                    exp(disc_falloff * log(density))
+                opacity = iscotaper * outertaper * dpow
 
-                    # Planck intensity (exp overflow → Inf → intensity 0,
-                    # matching the negligible Float64 values).
-                    inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
-
-                    # White-balanced blackbody colour from the LUT.
-                    frac = (clamp(T_obs, lut_tmin, lut_tmax) - lut_tmin) /
-                           (lut_tmax - lut_tmin)
-                    li = clamp(unsafe_trunc(Int32, frac * (lut_size - 1.0f0) + 0.5f0) +
-                               Int32(1), Int32(1), unsafe_trunc(Int32, lut_size))
-                    col_r = bb_lut[1, li]
-                    col_g = bb_lut[2, li]
-                    col_b = bb_lut[3, li]
-
-                    # Opacity taper: ISCO fade-in, intrinsic-temperature outer
-                    # fade, and radial density falloff (x^y via exp/log —
-                    # Float32 pow is unreliable in Metal kernels).
-                    R_in = disc_inner / (2.0f0 * M)
-                    R_out = disc_outer / (2.0f0 * M)
-                    iscotaper = clamp((R * R - R_in * R_in) * 0.3f0, 0.0f0, 1.0f0)
-                    outertaper = clamp(T_emit / 1000.0f0, 0.0f0, 1.0f0)
-                    density = clamp((R_out - R) / (R_out - R_in), 0.0f0, 1.0f0)
-                    dpow = density <= 1.0f-6 ?
-                        (disc_falloff > 0.0f0 ? 0.0f0 : 1.0f0) :
-                        exp(disc_falloff * log(density))
-                    opacity = iscotaper * outertaper * dpow
-
-                    w = alpha * opacity * inten
-                    acc_r += w * col_r
-                    acc_g += w * col_g
-                    acc_b += w * col_b
-                    alpha *= (1.0f0 - opacity)
-                end
+                w = alpha * opacity * inten
+                acc_r += w * col_r
+                acc_g += w * col_g
+                acc_b += w * col_b
+                alpha *= (1.0f0 - opacity)
             end
         end
     end
@@ -586,9 +520,12 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
         out[2, i, j] += weight * acc_g
         out[3, i, j] += weight * acc_b
     else
-        # Escaped rays (and any that ran out of steps) show the background sky
-        # attenuated by any disc crossings along the way.
-        r_col, g_col, b_col = sample_background_mtl(bg, q_theta, q_phi, W, H)
+        # Escaped rays (and any that ran out of steps) show the background
+        # sky attenuated by any disc gas along the way.
+        rf = max(sqrt(x * x + y * y + z * z), 1.0f-6)
+        θbg = acos(clamp(z / rf, -1.0f0, 1.0f0))
+        φbg = atan(y, x)
+        r_col, g_col, b_col = sample_background_mtl(bg, θbg, φbg, W, H)
         out[1, i, j] += weight * (acc_r + alpha * r_col)
         out[2, i, j] += weight * (acc_g + alpha * g_col)
         out[3, i, j] += weight * (acc_b + alpha * b_col)

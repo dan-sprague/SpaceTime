@@ -32,65 +32,70 @@ PreviewSettings(; width=160, height=120, dt=0.1, nmax=1000, r_escape_factor=2.0)
     PreviewSettings(width, height, dt, nmax, r_escape_factor)
 
 """
-    schwarzschild_rhs(μ, M)
+    ks_rhs(μ, p_t, M)
 
-Specialised Schwarzschild geodesic RHS for the preview renderer.  This is the
-same physics as `(bh::Schwarzschild)(μ, p, t)` but without the parameter-tuple
-overhead, so it inlines cleanly into a fixed-step integrator.
+Geodesic RHS in Cartesian Kerr–Schild coordinates for the preview renderer —
+the CPU twin of `ks_rhs_mtl` (see that docstring for the derivation). State
+is `(x, y, z, px, py, pz)`; the conserved `p_t` is carried separately.
+Regular at both the poles and the horizon.
 """
-function schwarzschild_rhs(μ::SVector{8,T}, M::T) where T
-    r = μ[2]
-    θ = μ[3]
-    pt, pr, pθ, pϕ = μ[5], μ[6], μ[7], μ[8]
-
-    # Same pole guard as the Metal kernel (see schwarzschild_rhs_mtl).
-    sinθ, cosθ = max(sin(θ), T(1e-3)), cos(θ)
-    r2 = r * r
-    inv_r2 = one(T) / r2
-    inv_r3 = inv_r2 / r
-    delta = r - 2M
-
-    dt = -(r / delta) * pt
-    dr = (delta / r) * pr
-    dθ = inv_r2 * pθ
-    dϕ = (inv_r2 / sinθ^2) * pϕ
-
-    dpr = -T(0.5) * (
-        (2M / delta^2) * pt^2 +
-        (2M * inv_r2) * pr^2 +
-        (-2 * inv_r3) * pθ^2 +
-        (-2 * inv_r3 / sinθ^2) * pϕ^2
-    )
-
-    dpθ = -T(0.5) * ((-2 * cosθ / (r2 * sinθ^3)) * pϕ^2)
-
-    return SVector{8,T}(dt, dr, dθ, dϕ, zero(T), dpr, dpθ, zero(T))
+function ks_rhs(μ::SVector{6,T}, p_t::T, M::T) where T
+    x, y, z, px, py, pz = μ
+    r2 = x * x + y * y + z * z
+    inv_r = one(T) / sqrt(r2)
+    f = 2M * inv_r
+    κ = (x * px + y * py + z * pz) * inv_r
+    ℓ = -p_t + κ
+    c1 = f * ℓ * inv_r
+    c2 = f * ℓ * (T(0.5) * ℓ + κ) * inv_r * inv_r
+    return SVector{6,T}(px - c1 * x, py - c1 * y, pz - c1 * z,
+                        c1 * px - c2 * x, c1 * py - c2 * y, c1 * pz - c2 * z)
 end
 
 """
-    rk4_step_preview(μ, M, dt)
+    rk4_step_preview(μ, p_t, M, dt)
 
-One fixed-step RK4 update for the preview integrator.
+One fixed-step RK4 update for the Kerr–Schild preview integrator.
 """
-function rk4_step_preview(μ::SVector{8,T}, M::T, dt::T) where T
+function rk4_step_preview(μ::SVector{6,T}, p_t::T, M::T, dt::T) where T
     half_dt = T(0.5) * dt
-    k1 = schwarzschild_rhs(μ, M)
-    k2 = schwarzschild_rhs(μ + half_dt * k1, M)
-    k3 = schwarzschild_rhs(μ + half_dt * k2, M)
-    k4 = schwarzschild_rhs(μ + dt * k3, M)
+    k1 = ks_rhs(μ, p_t, M)
+    k2 = ks_rhs(μ + half_dt * k1, p_t, M)
+    k3 = ks_rhs(μ + half_dt * k2, p_t, M)
+    k4 = ks_rhs(μ + dt * k3, p_t, M)
     return μ + (dt / T(6)) * (k1 + 2k2 + 2k3 + k4)
+end
+
+"""
+    ks_init_photon(origin, direction, M) -> (μ::SVector{6}, p_t)
+
+Null-ray initialisation in Kerr–Schild coordinates: chooses the covariant
+momentum so the coordinate velocity at `origin` is exactly the unit
+`direction` (closed form; the null condition gives `p_t² = 1 − f(1 − κ²)`).
+"""
+function ks_init_photon(origin::SVector{3,Float64},
+                        direction::SVector{3,Float64}, M::Float64)
+    r = norm(origin)
+    f = 2M / r
+    κd = dot(origin, direction) / r
+    p_t = -sqrt(max(1.0 - f * (1.0 - κd^2), 1e-12))
+    β = f * (κd - p_t) / max(1.0 - f, 1e-6)
+    p = direction + (β / r) * origin
+    return vcat(origin, p), p_t
 end
 
 """
     render_preview(cam::Camera, spacetime::Schwarzschild, background;
                    settings::PreviewSettings=PreviewSettings())
 
-Render a fast preview image.  Uses a fixed-step RK4 integrator and samples the
-background when a ray escapes.  Rays captured by the horizon are black.
+Render a fast preview image. Uses a fixed-step RK4 integrator in Cartesian
+Kerr–Schild coordinates (no polar or horizon coordinate singularities) and
+samples the background when a ray escapes. Rays captured by the horizon are
+black.
 
-This is intentionally lower fidelity than `render`: no Doppler disc, no adaptive
-stepping, and pinhole optics only.  It is the kernel to port to Metal for a GPU
-viewfinder.
+This is intentionally lower fidelity than `render`: simple disc colouring, no
+adaptive stepping, and pinhole optics only. It is the CPU twin of the Metal
+kernel `trace_kernel_mtl!`.
 """
 function render_preview(cam::Camera, spacetime::Schwarzschild, background;
                         settings::PreviewSettings=PreviewSettings(),
@@ -104,40 +109,47 @@ function render_preview(cam::Camera, spacetime::Schwarzschild, background;
     # Dynamic step cap, kept in sync with render_preview_mtl: rays must be able
     # to reach the escape radius even from distant cameras.
     nmax = min(max(settings.nmax, ceil(Int, 3.0 * r_escape / dt)), 20_000)
-    half_pi = π / 2.0
 
     Threads.@threads :static for i in 1:width
         for j in 1:height
             u, v = sensor_coordinate(i, j, width, height)
-            μ = init_photon(cam, spacetime, u, v)
+            origin, direction = get_ray(cam, u, v)
+            μ, p_t = ks_init_photon(origin, direction, M)
             hit = false
-            θ_prev = μ[3]
             for _ in 1:nmax
-                r = μ[2]
-                θ = μ[3]
+                r = sqrt(μ[1]^2 + μ[2]^2 + μ[3]^2)
                 if r < r_horizon || r > r_escape
+                    hit = r < r_horizon
+                    if r > r_escape
+                        θ = acos(clamp(μ[3] / r, -1.0, 1.0))
+                        ϕ = atan(μ[2], μ[1])
+                        image[i, j] = sample_background(background, θ, ϕ)
+                        hit = true
+                    end
+                    break
+                end
+                z_prev = μ[3]
+                μ = rk4_step_preview(μ, p_t, M, dt)
+                # Non-finite ray: paint black, matching the kernel bail-out.
+                if !(μ[1] == μ[1]) || !(μ[3] == μ[3])
                     hit = true
                     break
                 end
-                # Simple equatorial-plane disc crossing check.
-                if !isnothing(disc) && ((θ_prev - half_pi) * (θ - half_pi) < 0.0)
-                    if disc.inner_radius < r < disc.outer_radius
-                        image[i, j] = _preview_disc_color(r, disc)
+                # Equatorial (z = 0) disc crossing.
+                if !isnothing(disc) && z_prev * μ[3] < 0.0
+                    s = sqrt(μ[1]^2 + μ[2]^2)
+                    if disc.inner_radius < s < disc.outer_radius
+                        image[i, j] = _preview_disc_color(s, disc)
                         hit = true
                         break
                     end
                 end
-                μ = rk4_step_preview(μ, M, dt)
-                θ_prev = θ
-                # Non-finite ray (pole graze / horizon skim): paint black,
-                # matching the Metal kernel's bail-out.
-                if !(μ[2] == μ[2]) || !(μ[3] == μ[3])
-                    hit = true
-                    break
-                end
             end
             if !hit
-                image[i, j] = sample_background(background, μ[3], μ[4])
+                # Ran out of steps: sample the sky at the last position.
+                r = max(sqrt(μ[1]^2 + μ[2]^2 + μ[3]^2), 1e-12)
+                θ = acos(clamp(μ[3] / r, -1.0, 1.0))
+                image[i, j] = sample_background(background, θ, atan(μ[2], μ[1]))
             end
         end
     end
@@ -708,6 +720,7 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
         (label = "Streak width", range = 0.5:0.5:5.0, format = "{:.1f}", startvalue = 1.5),
         (label = "Star spikes", range = 2:1:8, format = "{:.0f}", startvalue = 4),
         (label = "Color preserve", range = 0.0:0.05:1.0, format = "{:.2f}", startvalue = 0.75),
+        (label = "Contrast", range = -1.0:0.05:1.0, format = "{:.2f}", startvalue = 0.0),
         tellwidth = false, tellheight = true
     )
     rowgap!(post_col, 6)
@@ -745,6 +758,8 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
     Label(sensor_grid[9, 1], "Micro streaks"; halign=:left)
     micro_streaks_count_slider = Slider(sensor_grid[9, 2]; range=0:1:20,
                                         startvalue=0, tellwidth=false)
+    Label(sensor_grid[10, 1], "Auto balance"; halign=:left)
+    auto_balance_toggle = Toggle(sensor_grid[10, 2]; active=false)
     colsize!(sensor_grid, 1, GLMakie.Auto())
     colsize!(sensor_grid, 2, GLMakie.Relative(0.55))
     rowgap!(sensor_grid, 4)
@@ -820,7 +835,7 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
         thinlens_toggle.active[] = true
         for (sl, val) in zip(post_sg.sliders,
                              (1.0, 1.2, 0.2, 1.0, 0.5, 10.0, 1.5,
-                              2.0, 0.1, 1.0, 4.0, 0.75))
+                              2.0, 0.1, 1.0, 4.0, 0.75, 0.0))
             set_close_to!(sl, val)
         end
         set_close_to!(iso_slider, 400.0)
@@ -906,6 +921,8 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
         streak_width = post_sliders[10].value[]
         n_spikes = Int(round(post_sliders[11].value[]))
         hue_preserve = post_sliders[12].value[]
+        contrast = post_sliders[13].value[]
+        do_auto_balance = auto_balance_toggle.active[]
         iso = iso_slider.value[]
         read_noise = read_noise_slider.value[]
         dust_density = dust_density_slider.value[]
@@ -948,7 +965,8 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
                                   streak_length=streak_length,
                                   streak_width=streak_width,
                                   n_spikes=n_spikes, tonemap=tonemap,
-                                  tonemap_hue_preserve=hue_preserve)
+                                  tonemap_hue_preserve=hue_preserve,
+                                  contrast=contrast)
                 if lens_dust_count > 0
                     apply_lens_dust!(img; lens_dust=LensDust(count=lens_dust_count))
                 end
@@ -960,6 +978,7 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
                                saturation=saturation_val)
                 apply_vignette!(img; strength=0.3)
                 apply_lens_distortion!(img; k1=-0.02)
+                do_auto_balance && auto_balance!(img)
                 img = map(clamp01nan, img)
                 # The render buffer is [width, height]; rotate so the saved
                 # file has the same orientation as the on-screen preview.

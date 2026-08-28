@@ -38,7 +38,8 @@ export MetalPreviewContext, render_preview_mtl, render_draft_mtl,
        set_volume_enabled!
 export yaw, pitch, roll, truck, pedestal, dolly, offset_camera, @gimbal
 export visualize_solution, trace_fan, compare_hamiltonian_drift, shadow_radius
-export postprocess, airy_convolve, generate_psf, fft_convolve, aces_tonemap
+export postprocess, airy_convolve, generate_psf, fft_convolve, aces_tonemap,
+       auto_balance!
 export apply_vignette!, apply_lens_distortion!
 export SensorSettings, apply_iso_gain!, add_sensor_noise!, clip!, sensor_expose!
 export get_disc_color_doppler
