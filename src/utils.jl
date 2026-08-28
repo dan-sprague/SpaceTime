@@ -1,8 +1,8 @@
-function compare_hamiltonian_drift(cam::Camera, spacetime::AbstractSpacetime)
+function compare_hamiltonian_drift(cam::AbstractCamera, spacetime::AbstractSpacetime)
     u, v = 0.05, 0.05
     μ0 = init_photon(cam, spacetime, u, v)
     tspan = (0.0, 500.0)
-    meta = RayData(RGBf(0.0,0.0,0.0),1.0,Inf)
+    meta = RayData(RGBf(0.0,0.0,0.0),1.0,Inf,0.0)
 
     prob_sym = ODEProblem(spacetime, μ0, tspan, (spacetime, meta))
     sol_sym = solve(prob_sym, Vern9(), reltol=1e-8, abstol=1e-8)
@@ -99,7 +99,7 @@ Critical screen-space radius below which rays are captured by the black hole.
 For Schwarzschild, the critical impact parameter is b_c = 3√3 M, which maps
 to a screen coordinate of tan(arcsin(b_c / r_cam)) / fov_factor.
 """
-function shadow_radius(cam::Camera, spacetime::Schwarzschild)
+function shadow_radius(cam::AbstractCamera, spacetime::Schwarzschild)
     r_cam = norm(cam.pos)
     b_c = 3sqrt(3) * spacetime.M
     sin_α = b_c / r_cam
@@ -107,15 +107,16 @@ function shadow_radius(cam::Camera, spacetime::Schwarzschild)
     tan(asin(sin_α)) / cam.fov_factor
 end
 
-function trace_fan(cam::Camera, spacetime::Schwarzschild;
+function trace_fan(cam::AbstractCamera, spacetime::Schwarzschild;
                    u_range=range(-1.0, 1.0, length=10),
                    v_range=range(-0.5, 0.5, length=10),
-                   tspan=(0.0, 1000.0))
+                   tspan=(0.0, 1000.0),
+                   solver=Tsit5())
     u_crit = shadow_radius(cam, spacetime)
     rays = WorldLine[]
     for u in u_range, v in v_range
         sqrt(u^2 + v^2) < u_crit && continue
-        push!(rays, raytrace(spacetime, Photon(init_photon(cam, spacetime, u, v)); tspan))
+        push!(rays, raytrace(spacetime, Photon(init_photon(cam, spacetime, u, v)); tspan, solver))
     end
     rays
 end

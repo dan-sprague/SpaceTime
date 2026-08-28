@@ -1,56 +1,10 @@
-"""
-    airy_disc(x)
-
-The Airy disc function, which describes the diffraction pattern of a point light source. It is defined as (2 * J1(x) / x)^2, where J1 is the first-order Bessel function of the first kind.
-"""
-function airy_disc(x)
-    (2 * besselj1(x) / x)^2
-end
-
-const AIRY_SPECTRUM = SVector(1.0, 0.86, 0.61)  # approximate R,G,B wavelength from starless python package https://github.com/rantonels/starless/blob/master/bloom.py
-
-"""
-    generate_kernel(scale, size)
-Generates a 2D convolution kernel based on the Airy disc function for each color channel. The `scale` parameter controls the size of the Airy disc for each channel, and `size` determines the radius of the kernel.
-"""
-function generate_kernel(scale, size)
-    coords = -size:size
-    kernel = zeros(2size+1, 2size+1, 3)
-    for (j, cy) in enumerate(coords), (i, cx) in enumerate(coords)
-        r = sqrt(cx^2 + cy^2) + 1e-6
-        for c in 1:3
-            kernel[i, j, c] = airy_disc(r / scale[c])
-        end
-    end
-    for c in 1:3
-        kernel[:, :, c] ./= sum(@view kernel[:, :, c])
-    end
-    kernel
-end
-
-"""
-    airy_convolve(image, radius; kernel_radius=25)
-
-Applies an Airy disc convolution to the input image. The `radius` parameter controls the size of the Airy disc, and `kernel_radius` determines the radius of the convolution kernel.
-"""
-function airy_convolve(image::Matrix{<:RGB}, radius; kernel_radius=25)
-    scale = radius .* AIRY_SPECTRUM
-    kernel = generate_kernel(scale, kernel_radius)
-
-    r_ch = Float64.(getfield.(image, :r))
-    g_ch = Float64.(getfield.(image, :g))
-    b_ch = Float64.(getfield.(image, :b))
-
-    r_out = imfilter(r_ch, centered(kernel[:,:,1]), "symmetric")
-    g_out = imfilter(g_ch, centered(kernel[:,:,2]), "symmetric")
-    b_out = imfilter(b_ch, centered(kernel[:,:,3]), "symmetric")
-
-    RGBf.(r_out, g_out, b_out)
-end
-
 # ---------------------------------------------------------------------------
 # FFT-based bloom + star streak post-processing
 # ---------------------------------------------------------------------------
+
+# Chromatic scaling for bloom kernel per channel (R, G, B).
+# Approximates diffraction: blue diffracts tighter, red wider.
+const AIRY_SPECTRUM = SVector(1.0, 0.85, 0.7)
 
 """
     fft_convolve(image_ch::Matrix{Float64}, kernel::Matrix{Float64})
@@ -170,7 +124,7 @@ function aces_tonemap(x)
 end
 
 """
-    postprocess(image; gain=0.37, exposure=0.0, gamma=1.0,
+    postprocess(image; gain=1.0, exposure=0.0, gamma=2.2,
                 bloom_strength=0.6, threshold=0.5,
                 bloom_radius=15.0, bloom_power=1.5,
                 streak_strength=0.3, streak_length=0.4, streak_width=1.5,
@@ -187,9 +141,9 @@ Pipeline (all operations in HDR linear space):
 6. Gamma correction (x^(1/gamma); 1.0 = linear, 2.2 = sRGB-like)
 """
 function postprocess(image::Matrix{RGBf};
-                     gain=0.37,
+                     gain=1.0,
                      exposure=0.0,
-                     gamma=1.0,
+                     gamma=2.2,
                      bloom_strength=0.6,
                      threshold=0.5,
                      bloom_radius=15.0,
@@ -199,7 +153,8 @@ function postprocess(image::Matrix{RGBf};
                      streak_width=1.5,
                      n_spikes=4,
                      angles=nothing,
-                     tonemap=:aces)
+                     tonemap=:aces,
+                     tonemap_hue_preserve=0.75)
     w, h = size(image)
 
     # 1. Gain + exposure
@@ -235,15 +190,31 @@ function postprocess(image::Matrix{RGBf};
     final_g = g_ch .+ bloom_g
     final_b = b_ch .+ bloom_b
 
-    # 6. Tonemap
-    if tonemap == :aces
-        final_r = aces_tonemap.(final_r)
-        final_g = aces_tonemap.(final_g)
-        final_b = aces_tonemap.(final_b)
-    elseif tonemap == :reinhard
-        final_r = final_r ./ (1.0 .+ final_r)
-        final_g = final_g ./ (1.0 .+ final_g)
-        final_b = final_b ./ (1.0 .+ final_b)
+    # 6. Tonemap. Per-channel filmic curves desaturate highlights (all three
+    # channels converge to 1), so blend with a hue-preserving variant that
+    # tonemaps luminance only and rescales the RGB triple by the ratio.
+    # `tonemap_hue_preserve` = 0 gives the classic per-channel look, 1 keeps
+    # hue/saturation fully at the cost of harsher-looking extreme highlights.
+    if tonemap == :aces || tonemap == :reinhard
+        tm = tonemap == :aces ? aces_tonemap : (x -> x / (1.0 + x))
+        pc_r = tm.(final_r)
+        pc_g = tm.(final_g)
+        pc_b = tm.(final_b)
+        k = clamp(tonemap_hue_preserve, 0.0, 1.0)
+        if k > 0.0
+            Y = 0.2126 .* final_r .+ 0.7152 .* final_g .+ 0.0722 .* final_b
+            s = tm.(Y) ./ max.(Y, 1.0e-8)
+            hp_r = clamp.(final_r .* s, 0.0, 1.0)
+            hp_g = clamp.(final_g .* s, 0.0, 1.0)
+            hp_b = clamp.(final_b .* s, 0.0, 1.0)
+            final_r = (1.0 - k) .* pc_r .+ k .* hp_r
+            final_g = (1.0 - k) .* pc_g .+ k .* hp_g
+            final_b = (1.0 - k) .* pc_b .+ k .* hp_b
+        else
+            final_r = pc_r
+            final_g = pc_g
+            final_b = pc_b
+        end
     end
 
     # 7. Gamma
@@ -257,31 +228,77 @@ function postprocess(image::Matrix{RGBf};
     RGBf.(Float32.(final_r), Float32.(final_g), Float32.(final_b))
 end
 
-# Keep old signature for backwards compatibility
-function postprocess(image::Matrix{RGBf}, fov_factor; airy_radius=0.5, gain=0.37, glare_intensity=0.1)
+# -----------------------------------------------------------------------------
+# Lens / camera-body post-processing effects
+# -----------------------------------------------------------------------------
+
+"""
+    apply_vignette!(image; strength=0.4, radius=1.0, falloff=1.5)
+
+Apply natural vignetting in-place. Light falloff follows
+`(1 - strength * (r / radius)^falloff)` clipped to [0, 1].
+"""
+function apply_vignette!(image::Matrix{RGBf}; strength::Real=0.4, radius::Real=1.0, falloff::Real=1.5)
     w, h = size(image)
-    img = image .* gain
-
-    threshold = 0.5
-    bright_pass = map(c -> RGBf(max(0, c.r - threshold),
-                                max(0, c.g - threshold),
-                                max(0, c.b - threshold)), img)
-
-    glow = zeros(RGBf, w, h)
-    scales = [0.005, 0.02, 0.05, 0.1]
-    weights = [0.5, 0.15, 0.1, 0.25]
-
-    for (s, weight) in zip(scales, weights)
-        sigma = w * s
-        glow .+= imfilter(bright_pass, Kernel.gaussian(sigma)) .* (weight * glare_intensity)
+    cx, cy = (w + 1) / 2.0, (h + 1) / 2.0
+    r_max = sqrt(cx^2 + cy^2) * radius
+    for j in 1:h, i in 1:w
+        r = sqrt((i - cx)^2 + (j - cy)^2)
+        factor = clamp(1.0 - strength * (r / r_max)^falloff, 0.0, 1.0)
+        image[i, j] = image[i, j] * factor
     end
+    return image
+end
 
-    img_combined = img .+ glow
-    γ = 1.6
-    img_combined = map(c -> RGBf(c.r^γ, c.g^γ, c.b^γ), img_combined)
-    map(c -> RGB{Float32}(
-        clamp(c.r, 0.0, Inf) / (1.0 + max(0.0, c.r)),
-        clamp(c.g, 0.0, Inf) / (1.0 + max(0.0, c.g)),
-        clamp(c.b, 0.0, Inf) / (1.0 + max(0.0, c.b))
-    ), img_combined)
+function apply_vignette!(image::Matrix{Float64}; strength::Real=0.4, radius::Real=1.0, falloff::Real=1.5)
+    w, h = size(image)
+    cx, cy = (w + 1) / 2.0, (h + 1) / 2.0
+    r_max = sqrt(cx^2 + cy^2) * radius
+    for j in 1:h, i in 1:w
+        r = sqrt((i - cx)^2 + (j - cy)^2)
+        factor = clamp(1.0 - strength * (r / r_max)^falloff, 0.0, 1.0)
+        image[i, j] *= factor
+    end
+    return image
+end
+
+"""
+    apply_lens_distortion!(image; k1=-0.05, k2=0.0)
+
+Apply radial barrel/pincushion distortion in-place using a simple polynomial
+model. `k1 < 0` gives barrel distortion; `k1 > 0` gives pincushion.
+"""
+function apply_lens_distortion!(image::Matrix{T}; k1::Real=-0.05, k2::Real=0.0) where T
+    w, h = size(image)
+    cx, cy = (w + 1) / 2.0, (h + 1) / 2.0
+    r_max = sqrt(cx^2 + cy^2)
+    out = similar(image)
+
+    for j in 1:h, i in 1:w
+        x = (i - cx) / r_max
+        y = (j - cy) / r_max
+        r2 = x^2 + y^2
+        radial = 1.0 + k1 * r2 + k2 * r2^2
+
+        xs = clamp(cx + x * radial * r_max, 1.0, w)
+        ys = clamp(cy + y * radial * r_max, 1.0, h)
+
+        x0 = floor(Int, xs)
+        y0 = floor(Int, ys)
+        x1 = min(x0 + 1, w)
+        y1 = min(y0 + 1, h)
+        fx = xs - x0
+        fy = ys - y0
+
+        c00 = image[x0, y0]
+        c10 = image[x1, y0]
+        c01 = image[x0, y1]
+        c11 = image[x1, y1]
+        out[i, j] = c00 * (1 - fx) * (1 - fy) +
+                    c10 * fx * (1 - fy) +
+                    c01 * (1 - fx) * fy +
+                    c11 * fx * fy
+    end
+    image .= out
+    return image
 end

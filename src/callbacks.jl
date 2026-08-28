@@ -1,12 +1,10 @@
 """
-    boundary_condition(μ,t,integrator)
-Defines a boundary condition for the ODE solver that checks if the photon has crossed the event horizon or has traveled too far away. The function returns a value that changes sign when the photon crosses these boundaries, allowing the ODE solver to trigger an event.
-"""
-function boundary_condition(μ,t,integrator)
-    r = μ[2]
+    make_boundary_condition(r_max)
 
-    return (r - 2.00001) * (100.0 - r)
-end
+Returns a boundary condition closure that terminates integration when the photon
+crosses the event horizon (r ≈ 2M) or escapes beyond `r_max`.
+"""
+make_boundary_condition(r_max) = (μ, t, integrator) -> (μ[2] - 2.00001) * (r_max - μ[2])
 
 """
     horizon_affect!(integrator)
@@ -72,7 +70,10 @@ function disc_affect_doppler!(integrator)
         R = r / (2M)
         R_inner = disc.inner_radius / (2M)
         iscotaper = clamp((R^2 - R_inner^2) * 0.3, 0.0, 1.0)
-        outertaper = clamp(T_obs / 1000.0, 0.0, 1.0)
+        # Use intrinsic T_emit for opacity taper so the disc stays visible
+        # on the Doppler-receding side (Doppler still affects color/brightness)
+        T_emit = exp(10.034259 - 0.375 * log(R^2))
+        outertaper = clamp(T_emit / 1000.0, 0.0, 1.0)
         R_outer = disc.outer_radius / (2M)
         density = clamp((R_outer - R) / (R_outer - R_inner), 0, 1)
         #density = (R_inner / R)^1.05
@@ -83,7 +84,17 @@ function disc_affect_doppler!(integrator)
     end
 end
 
-const cb_set = CallbackSet(
-    ContinuousCallback(boundary_condition, horizon_affect!),
-    ContinuousCallback(disc_condition, disc_affect_doppler!)
-)
+"""
+    make_cb_set(r_max)
+
+Build the full callback set (boundary + disc Doppler) for a given outer radius.
+"""
+make_cb_set(r_max, disc::Union{AccretionDisc,Nothing}=nothing) =
+    if isnothing(disc)
+        ContinuousCallback(make_boundary_condition(r_max), horizon_affect!)
+    else
+        CallbackSet(
+            ContinuousCallback(make_boundary_condition(r_max), horizon_affect!),
+            ContinuousCallback(disc_condition, disc_affect_doppler!)
+        )
+    end
