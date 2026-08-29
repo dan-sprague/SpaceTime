@@ -127,6 +127,14 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
 
     Threads.@spawn begin
         done = 0
+        # Per-resolution ping-pong buffers. Reusing them removes the ~8 MB of
+        # per-frame garbage that caused GC stutter at flight frame rates; two
+        # images alternate so the GL texture upload never races the next
+        # frame's write.
+        BufT = Tuple{Array{Float32,3},Matrix{RGBf},Matrix{RGBf}}
+        bufs = Dict{Tuple{Int,Int},BufT}()
+        flip = false
+        min_period = 1 / 40   # rendering faster than this only floods thread 1
         try
             while true
                 take!(wakeup)
@@ -138,7 +146,14 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     end
                     t0 = time()
                     img = try
-                        render_preview_mtl(ctx_now, cam_now, spacetime)
+                        host, ia, ib = get!(bufs, (ctx_now.width, ctx_now.height)) do
+                            (Array{Float32,3}(undef, 3, ctx_now.width, ctx_now.height),
+                             Matrix{RGBf}(undef, ctx_now.width, ctx_now.height),
+                             Matrix{RGBf}(undef, ctx_now.width, ctx_now.height))
+                        end
+                        flip = !flip
+                        render_preview_mtl!(flip ? ia : ib, host, ctx_now,
+                                            cam_now, spacetime)
                     catch e
                         e isa InvalidStateException && rethrow()
                         @error "Flythrough frame failed" exception=(e, catch_backtrace())
@@ -151,6 +166,8 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                         end
                         put!(img_chan, (img, time() - t0, norm(cam_now.pos)))
                     end
+                    elapsed = time() - t0
+                    elapsed < min_period && sleep(min_period - elapsed)
                 end
             end
         catch e
@@ -288,8 +305,11 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     request_render()
 
     # Keyboard fly loop (thread 1, 30 Hz): moves while keys are held and the
-    # mouse is over the view, rendering only when something changed.
+    # mouse is over the view, rendering only when something changed. The
+    # try/catch keeps a transient error (e.g. during window teardown) from
+    # silently killing the loop.
     @async while events(fig.scene).window_open[]
+        try
         if _Makie.is_mouseinside(ax.scene)
             moved = false
             v = move_speed_obs[] / 30.0
@@ -335,6 +355,9 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                 rn < 0.45 * M && (state.pos *= 0.45 * M / rn)
             end
             moved && request_render()
+        end
+        catch e
+            @error "Flythrough key loop error" exception=(e, catch_backtrace())
         end
         sleep(1 / 30)
     end

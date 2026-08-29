@@ -35,8 +35,8 @@ export RayData, WorldLine, init_photon, render_no_doppler, render, raytrace, ren
 export sample_background, get_ray_direction, get_ray
 export sensor_coordinate, jittered_grid, sample_lens_point
 export PreviewSettings, render_preview, viewfinder, flythrough
-export MetalPreviewContext, render_preview_mtl, render_draft_mtl,
-       set_volume_enabled!
+export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
+       render_draft_mtl, set_volume_enabled!
 export yaw, pitch, roll, truck, pedestal, dolly, offset_camera, @gimbal
 export visualize_solution, trace_fan, compare_hamiltonian_drift, shadow_radius
 export postprocess, airy_convolve, generate_psf, fft_convolve, aces_tonemap,

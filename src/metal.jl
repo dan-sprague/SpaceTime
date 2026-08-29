@@ -595,9 +595,24 @@ end
 
 Render one preview frame on the GPU using `ctx`.  Returns a `width × height`
 `Matrix{RGBf}` suitable for display.
+
+    render_preview_mtl!(img, host, ctx, cam, spacetime)
+
+In-place variant for render loops: writes into a caller-owned `img`
+(`Matrix{RGBf}(undef, width, height)`) via the caller-owned staging buffer
+`host` (`Array{Float32,3}(undef, 3, width, height)`), so a flight loop
+allocates nothing per frame.
 """
 function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
                             spacetime::Schwarzschild)
+    img = Matrix{RGBf}(undef, ctx.width, ctx.height)
+    host = Array{Float32,3}(undef, 3, ctx.width, ctx.height)
+    return render_preview_mtl!(img, host, ctx, cam, spacetime)
+end
+
+function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
+                             ctx::MetalPreviewContext, cam::Camera,
+                             spacetime::Schwarzschild)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -619,7 +634,11 @@ function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
     _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params, ctx.spacetime_params,
                    ctx.width, ctx.height, nmax, dt,
                    0.5f0, 0.5f0, 1.0f0, 0, ctx.height)
-    return _download_rgb(ctx.out_gpu, ctx.width, ctx.height)
+    copyto!(host, ctx.out_gpu)
+    @inbounds for j in 1:ctx.height, i in 1:ctx.width
+        img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
+    end
+    return img
 end
 
 """
@@ -740,4 +759,12 @@ function render_preview_mtl(ctx::MetalPreviewContext, cam::ThinLensCamera,
     fov = (cam.sensor_width / 2.0) / cam.focal_length
     pinhole = Camera(cam.pos, cam.pos + cam.fwd, cam.up_local, fov)
     return render_preview_mtl(ctx, pinhole, spacetime)
+end
+
+function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
+                             ctx::MetalPreviewContext, cam::ThinLensCamera,
+                             spacetime::Schwarzschild)
+    fov = (cam.sensor_width / 2.0) / cam.focal_length
+    pinhole = Camera(cam.pos, cam.pos + cam.fwd, cam.up_local, fov)
+    return render_preview_mtl!(img, host, ctx, pinhole, spacetime)
 end

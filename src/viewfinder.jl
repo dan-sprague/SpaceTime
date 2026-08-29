@@ -629,6 +629,14 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
 
     Threads.@spawn begin
         done = 0
+        # Reused ping-pong buffers (two images so the GL texture upload never
+        # races the next frame's write) and a frame-rate cap: rendering
+        # faster than the display only floods thread 1 with uploads and GC.
+        host_buf = Array{Float32,3}(undef, 3, settings.width, settings.height)
+        img_a = Matrix{RGBf}(undef, settings.width, settings.height)
+        img_b = Matrix{RGBf}(undef, settings.width, settings.height)
+        flip = false
+        min_period = 1 / 40
         try
             while true
                 take!(wakeup)
@@ -639,7 +647,9 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     # A failed frame must not kill the worker: log it, skip
                     # the frame, and keep serving future requests.
                     img = try
-                        render_preview_mtl(ctx, cam_now, spacetime)
+                        flip = !flip
+                        render_preview_mtl!(flip ? img_a : img_b, host_buf,
+                                            ctx, cam_now, spacetime)
                     catch e
                         e isa InvalidStateException && rethrow()
                         @error "Preview frame failed" exception=(e, catch_backtrace())
@@ -652,6 +662,8 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
                         end
                         put!(img_chan, (img, cam_now, time() - t0))
                     end
+                    elapsed = time() - t0
+                    elapsed < min_period && sleep(min_period - elapsed)
                 end
             end
         catch e
