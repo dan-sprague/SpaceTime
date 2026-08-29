@@ -16,7 +16,8 @@ AccretionDisc(; inner_radius=3.0, outer_radius=20.0, blackbody=Blackbody(), dens
     get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime, disc::AccretionDisc)
 Calculates the observed color of the accretion disc at a given radius `r`, position `pos`, and photon momentum `p_cartesian`, taking into account Doppler and gravitational redshift effects. The function uses the properties of the black hole spacetime `bh` and the accretion disc `disc` to compute the local temperature and intensity of the emitted radiation, and returns the resulting color as an RGB value along with the observed temperature.
 """
-function get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime, disc::AccretionDisc)
+function get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime,
+                                disc::AccretionDisc, gcam::Float64=1.0)
     M = bh.M
     R = r / (2M)
     Rsqr = R^2
@@ -36,7 +37,7 @@ function get_disc_color_doppler(r, pos, p_cartesian, bh::AbstractSpacetime, disc
 
     opz_grav = 1.0 / sqrt(max(1.0 - 1.0 / max(R, 1.0), 0.01))
 
-    T_obs = T_emit / clamp(opz_doppler * opz_grav, 0.1, Inf)
+    T_obs = T_emit * gcam / clamp(opz_doppler * opz_grav, 0.1, Inf)
 
     intensity_val = 1.0 / (exp(29622.4 / max(T_obs, 1.0)) - 1.0)
 

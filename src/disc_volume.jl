@@ -207,7 +207,7 @@ function _accumulate_volume_sample!(meta, st::Schwarzschild,
     R_sph = r / (2M)
     opz_grav = 1.0 / sqrt(max(1.0 - 1.0 / max(R_sph, 1.0), 0.01))
     opz = max(γ * (1.0 + vdotn) * opz_grav, 0.1)
-    T_obs = T_emit / opz
+    T_obs = T_emit * meta.gcam / opz
     inten = 100.0 / (exp(29622.4 / max(T_obs, 1.0)) - 1.0)
     c = wb_blackbody_color_fast(T_obs, disc.blackbody)
 

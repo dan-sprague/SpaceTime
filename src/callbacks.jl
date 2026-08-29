@@ -65,7 +65,9 @@ function disc_affect_doppler!(integrator)
     pos_cartesian = SVector(r*sin(θ)*cos(ϕ), r*sin(θ)*sin(ϕ), r*cos(θ))
 
     if disc.inner_radius < r < disc.outer_radius
-        local_color, T_obs = get_disc_color_doppler(r, pos_cartesian, p_cartesian, bh, disc)
+        local_color, T_obs = get_disc_color_doppler(r, pos_cartesian,
+                                                    p_cartesian, bh, disc,
+                                                    meta.gcam)
 
         R = r / (2M)
         R_inner = disc.inner_radius / (2M)

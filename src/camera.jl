@@ -98,6 +98,40 @@ function get_ray(cam::Camera, u, v, rng::Random.AbstractRNG=Random.default_rng()
     return cam.pos, get_ray_direction(cam, u, v)
 end
 
+"""
+    FisheyeCamera(pos, target, up; theta_edge=deg2rad(100.0))
+
+Equidistant fisheye camera: pixel radius maps linearly to view angle, with
+`theta_edge` the half-angle at the top edge of the frame (the horizontal
+edge extends by the aspect ratio). Fields with wider-than-180° views render
+cleanly — a rectilinear pinhole cannot. Matches the Metal kernel's fisheye
+lens (`fisheye_deg`).
+"""
+struct FisheyeCamera <: AbstractCamera
+    pos::SVector{3, Float64}
+    fwd::SVector{3, Float64}
+    right::SVector{3, Float64}
+    up_local::SVector{3, Float64}
+    theta_edge::Float64
+
+    function FisheyeCamera(pos, target, up; theta_edge=deg2rad(100.0))
+        fwd = normalize(target - pos)
+        right = normalize(cross(fwd, up))
+        up_local = cross(right, fwd)
+        new(pos, fwd, right, up_local, theta_edge)
+    end
+end
+
+function get_ray(cam::FisheyeCamera, u, v,
+                 rng::Random.AbstractRNG=Random.default_rng())
+    ρ = sqrt(u^2 + v^2)
+    ρ < 1e-12 && return cam.pos, cam.fwd
+    θ = ρ * cam.theta_edge
+    s, c = sincos(θ)
+    dir = c * cam.fwd + (s / ρ) * (u * cam.right + v * cam.up_local)
+    return cam.pos, dir
+end
+
 function get_ray(cam::ThinLensCamera, u, v, rng::Random.AbstractRNG=Random.default_rng())
     # Pinhole direction and the point it hits on the focal plane.
     pinhole_dir = get_ray_direction(Camera(cam.pos, cam.pos + cam.fwd,

@@ -34,7 +34,8 @@ include("postapp.jl")
 export AbstractSpacetime, Schwarzschild, Kerr, metric_inverse, hamiltonian
 export Blackbody, AccretionDisc
 export DiscVolume, sample_disc_volume
-export Lens, Photon, Camera, AbstractCamera, PinholeCamera, ThinLensCamera
+export Lens, Photon, Camera, AbstractCamera, PinholeCamera, ThinLensCamera,
+       FisheyeCamera
 export RayData, WorldLine, init_photon, render_no_doppler, render, raytrace, render_motion
 export sample_background, get_ray_direction, get_ray
 export sensor_coordinate, jittered_grid, sample_lens_point

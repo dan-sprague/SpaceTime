@@ -425,12 +425,14 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                 img = render(cam_cpu, spacetime, background;
                              disc=disc_now, volume=vol_now,
                              width=1920, height=1080, samples=2,
+                             relativistic=rel_obs[],
                              progress=p -> (Threads.atomic_xchg!(cpu_progress,
                                                                  Float64(p)); nothing))
                 save_raw(fname, img; metadata=render_metadata(cam_cpu, 0.0, ap,
                     Dict{String,Any}("renderer" => "cpu",
                                      "width" => 1920, "height" => 1080,
-                                     "samples" => 2)))
+                                     "samples" => 2,
+                                     "relativistic" => rel_obs[])))
                 put!(result, (:ok, fname))
             catch e
                 @error "CPU render failed" exception=(e, catch_backtrace())

@@ -39,6 +39,22 @@ mutable struct RayData
     alpha::Float64
     r_min::Float64
     path_length::Float64
+    # Camera/infinity frequency ratio for relativistic shading; 1 shades to
+    # the observer at infinity (the default and historical behaviour).
+    gcam::Float64
+end
+RayData(c, a, r, p) = RayData(c, a, r, p, 1.0)
+
+"""
+Blackbody-locus tint of a background star for camera/infinity shift `g`:
+a ~5800 K source observed at `g`·5800 K, per-channel Planck ratios at
+610/550/465 nm (matches the Metal kernel).
+"""
+function _relativistic_sky_tint(c::RGB, g::Float64)
+    g == 1.0 && return RGBf(c)
+    return RGBf(red(c) * 57.4 / (exp(4.067 / g) - 1.0),
+                green(c) * 90.2 / (exp(4.513 / g) - 1.0),
+                blue(c) * 206.5 / (exp(5.335 / g) - 1.0))
 end
 
 """
@@ -185,7 +201,8 @@ function _trace_color(integrator, meta, cam::AbstractCamera,
     color = if final_r < 2.1 * spacetime.M
         meta.acc_color
     else
-        bg_color = sample_background(background, final_θ, final_ϕ)
+        bg_color = _relativistic_sky_tint(
+            sample_background(background, final_θ, final_ϕ), meta.gcam)
         meta.acc_color + (bg_color * meta.alpha)
     end
 
@@ -236,9 +253,13 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                 samples::Int=1,
                 jittered::Bool=true,
                 rng::Random.AbstractRNG=Random.default_rng(),
-                progress::Union{Function,Nothing}=nothing)
+                progress::Union{Function,Nothing}=nothing,
+                relativistic::Bool=false)
     image = zeros(RGBf, width, height)
     cam_dist = norm(cam.pos)
+    # Static exterior camera: the camera/infinity shift is uniform.
+    gcam = relativistic ?
+           1.0 / sqrt(max(1.0 - 2.0 * spacetime.M / cam_dist, 1e-6)) : 1.0
     r_max = max(5.0 * cam_dist, 100.0)
     tspan = (0.0, max(10.0 * cam_dist, 500.0))
     # A volumetric disc replaces the thin-plane crossing callback.
@@ -247,7 +268,7 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     make_volume_cb(volume, disc))
 
     nchunks = _render_nchunks()
-    thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf, 0.0) for _ in 1:nchunks]
+    thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf, 0.0, gcam) for _ in 1:nchunks]
     thread_rngs = [copy(rng) for _ in 1:nchunks]
     μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0; rng=rng)
     base_prob = ODEProblem(spacetime, μ0_dummy, tspan, (spacetime, thread_metas[1], disc))
