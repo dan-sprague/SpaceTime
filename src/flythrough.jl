@@ -279,12 +279,13 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
         request_render()
     end
 
+    disc_on = Ref(true)   # master disc switch state, shared by both toggles
     local vol_toggle = nothing
     if !isnothing(volume)
         vol_toggle = Toggle(bar[1, 9]; active=true)
         Label(bar[1, 10], "Volumetric"; halign=:left)
         on(vol_toggle.active) do a
-            set_volume_enabled!(base_ctx, a)   # vol_on is shared by every ctx
+            set_volume_enabled!(base_ctx, a && disc_on[])   # vol_on shared
             request_render()
         end
     end
@@ -300,6 +301,67 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
         fisheye_obs[] = deg
         request_render()
         return nothing
+    end
+
+    # Master disc switch: kills both the thin plane and (when off) the
+    # volumetric gas, leaving the pure lensed starfield. Re-enabling
+    # restores the volumetric toggle's own state.
+    if !isnothing(disc)
+        disc_toggle = Toggle(bar[1, 13]; active=true)
+        Label(bar[1, 14], "Disc"; halign=:left)
+        on(disc_toggle.active) do a
+            disc_on[] = a
+            set_disc_enabled!(base_ctx, disc, a)
+            vol_now = a && !isnothing(vol_toggle) && vol_toggle.active[]
+            set_volume_enabled!(base_ctx, vol_now)
+            request_render()
+        end
+    end
+
+    # Save the current view as a 4K linear HDR raw (32-bit float TIFF +
+    # TOML sidecar) for the standalone post app. The draft renderer uses its
+    # own parameter buffers, so the live preview keeps running while it
+    # traces; disc/volume/lens state is honoured automatically.
+    raw_btn = Button(bar[1, 15]; label="Save raw")
+    saving_raw = Ref(false)
+    on(raw_btn.clicks) do _
+        saving_raw[] && return
+        saving_raw[] = true
+        cam_now = build_camera()
+        fe = fisheye_obs[]
+        fname = "flyraw_" * Dates.format(Dates.now(), "yyyymmdd_HHMMSS") * ".tiff"
+        raw_btn.label[] = "Tracing…"
+        result = Channel{Any}(1)
+        Threads.@spawn begin
+            try
+                img = render_draft_mtl(base_ctx, cam_now, spacetime;
+                                       width=3840, height=2160, samples=2,
+                                       dt=0.02, fisheye_deg=fe)
+                save_raw(fname, img; metadata=Dict{String,Any}(
+                    "camera_pos" => collect(cam_now.pos),
+                    "camera_fwd" => collect(cam_now.fwd),
+                    "camera_up" => collect(cam_now.up_local),
+                    "fov_factor" => cam_now.fov_factor,
+                    "fisheye_deg" => fe,
+                    "M" => spacetime.M,
+                    "width" => 3840, "height" => 2160,
+                    "samples" => 2, "dt" => 0.02,
+                    "disc" => disc_on[],
+                    "volumetric" => base_ctx.vol_on[]))
+                put!(result, (:ok, fname))
+            catch e
+                @error "Raw save failed" exception=(e, catch_backtrace())
+                put!(result, (:error, e))
+            end
+        end
+        @async begin
+            res = take!(result)
+            saving_raw[] = false
+            raw_btn.label[] = "Save raw"
+            status_obs[] = res[1] === :ok ?
+                "Saved: $(res[2]) (+ .toml) — grade it with postprocessor(\"$(res[2])\")" :
+                "Raw save error (see terminal)"
+        end
     end
 
     Label(bar[2, 1:8], status_obs; halign=:left, fontsize=13, color=:gray)

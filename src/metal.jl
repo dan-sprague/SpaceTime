@@ -122,6 +122,24 @@ function set_volume_enabled!(ctx::MetalPreviewContext, enabled::Bool)
     return nothing
 end
 
+"""
+    set_disc_enabled!(ctx, disc::AccretionDisc, enabled)
+
+Enable/disable the thin-plane accretion disc at runtime by rewriting the
+6-float disc parameter buffer (`inner = 0` disables it in the kernel).
+Contexts that share `disc_params` (flythrough resolution variants) all
+follow. The volumetric disc has its own switch: [`set_volume_enabled!`](@ref).
+"""
+function set_disc_enabled!(ctx::MetalPreviewContext, disc::AccretionDisc,
+                           enabled::Bool)
+    bb = disc.blackbody
+    copyto!(ctx.disc_params,
+            Float32[enabled ? disc.inner_radius : 0.0, disc.outer_radius,
+                    disc.density_falloff, bb.table_min, bb.table_max,
+                    bb.table_size])
+    return nothing
+end
+
 # ---------------------------------------------------------------------------
 # Kernel helpers
 # ---------------------------------------------------------------------------
