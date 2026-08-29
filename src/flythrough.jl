@@ -2,12 +2,14 @@
 # Flythrough: a minimal real-time flight app around the black hole
 # ---------------------------------------------------------------------------
 
+# (label, value) tuples: Makie's Menu labels Pairs by their full string form,
+# so tuples are required for the labels to render correctly.
 const _FLY_RESOLUTIONS = [
-    "480 × 270" => (480, 270),
-    "640 × 360" => (640, 360),
-    "960 × 540" => (960, 540),
-    "1280 × 720" => (1280, 720),
-    "1920 × 1080" => (1920, 1080),
+    ("480 × 270", (480, 270)),
+    ("640 × 360", (640, 360)),
+    ("960 × 540", (960, 540)),
+    ("1280 × 720", (1280, 720)),
+    ("1920 × 1080", (1920, 1080)),
 ]
 
 """
