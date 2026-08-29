@@ -25,6 +25,7 @@ include("sensor_effects.jl")
 include("utils.jl")
 include("viewfinder.jl")
 include("metal.jl")
+include("flythrough.jl")
 
 export AbstractSpacetime, Schwarzschild, Kerr, metric_inverse, hamiltonian
 export Blackbody, AccretionDisc
@@ -33,7 +34,7 @@ export Lens, Photon, Camera, AbstractCamera, PinholeCamera, ThinLensCamera
 export RayData, WorldLine, init_photon, render_no_doppler, render, raytrace, render_motion
 export sample_background, get_ray_direction, get_ray
 export sensor_coordinate, jittered_grid, sample_lens_point
-export PreviewSettings, render_preview, viewfinder
+export PreviewSettings, render_preview, viewfinder, flythrough
 export MetalPreviewContext, render_preview_mtl, render_draft_mtl,
        set_volume_enabled!
 export yaw, pitch, roll, truck, pedestal, dolly, offset_camera, @gimbal

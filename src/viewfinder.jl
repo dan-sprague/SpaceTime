@@ -66,21 +66,81 @@ function rk4_step_preview(μ::SVector{6,T}, p_t::T, M::T, dt::T) where T
     return μ + (dt / T(6)) * (k1 + 2k2 + 2k3 + k4)
 end
 
-"""
-    ks_init_photon(origin, direction, M) -> (μ::SVector{6}, p_t)
+# The camera observer freezes into a static frame outside this radius and is
+# a radial free-faller (dropped from rest here) inside it, so the view is
+# unchanged in the exterior and remains physical through the horizon, where
+# no static observers exist.
+const _KS_FREEZE_R = 2.5      # in units of M
+const _KS_FREEZE_E2 = 1.0 - 2.0 / _KS_FREEZE_R   # conserved E² of that faller
 
-Null-ray initialisation in Kerr–Schild coordinates: chooses the covariant
-momentum so the coordinate velocity at `origin` is exactly the unit
-`direction` (closed form; the null condition gives `p_t² = 1 − f(1 − κ²)`).
+"""
+    ks_camera_tetrad(pos, fwd, right, up, M) -> (u, Ef, Er, Eu)
+
+Orthonormal camera tetrad in Cartesian Kerr–Schild coordinates, as four
+contravariant 4-vectors `(t, x, y, z)`. The observer `u` is static for
+`r ≥ 2.5M` and a radial free-faller dropped from rest at `2.5M` inside
+(regular through the horizon; static frames don't exist there). `Ef/Er/Eu`
+are the camera's forward/right/up axes, Gram–Schmidt orthonormalised under
+the KS metric with forward first, so the look direction is exact.
+"""
+function ks_camera_tetrad(pos::SVector{3,Float64}, fwd::SVector{3,Float64},
+                          right::SVector{3,Float64}, up::SVector{3,Float64},
+                          M::Float64)
+    r = norm(pos)
+    x̂ = pos / r
+    f = 2M / r
+    # Radial-geodesic observer: E² = max(E_freeze², 1−f) gives dr/dτ = 0
+    # exactly for r ≥ 2.5M and the freeze-radius faller inside.
+    E = sqrt(max(_KS_FREEZE_E2, 1.0 - f))
+    v = -sqrt(max(E^2 - (1.0 - f), 0.0))
+    w = (1.0 - E * (E - v)) / (E - v)           # covariant u_i = w x̂_i
+    lu = E + w                                   # l^μ u_μ
+    u = SVector(E + f * lu, ((w - f * lu) * x̂)...)
+
+    ldot(A) = A[1] + x̂[1] * A[2] + x̂[2] * A[3] + x̂[3] * A[4]
+    gdot(A, B) = -A[1] * B[1] + A[2] * B[2] + A[3] * B[3] + A[4] * B[4] +
+                 f * ldot(A) * ldot(B)
+
+    Ef = SVector(0.0, fwd[1], fwd[2], fwd[3])
+    Er = SVector(0.0, right[1], right[2], right[3])
+    Eu = SVector(0.0, up[1], up[2], up[3])
+    Ef = Ef + gdot(Ef, u) * u                    # project out u (g(u,u) = −1)
+    Ef = Ef / sqrt(gdot(Ef, Ef))
+    Er = Er + gdot(Er, u) * u
+    Er = Er - gdot(Er, Ef) * Ef
+    Er = Er / sqrt(gdot(Er, Er))
+    Eu = Eu + gdot(Eu, u) * u
+    Eu = Eu - gdot(Eu, Ef) * Ef - gdot(Eu, Er) * Er
+    Eu = Eu / sqrt(gdot(Eu, Eu))
+    return u, Ef, Er, Eu
+end
+
+"""
+    ks_init_photon(origin, direction, M, tet, fwd, right, up) -> (μ, p_t)
+
+Null-ray initialisation from the camera tetrad `tet` (see
+[`ks_camera_tetrad`](@ref)). The unit pixel direction `direction` is
+decomposed in the camera's flat basis and rebuilt on the orthonormal tetrad,
+giving the received photon `p = ω(u + n)`; the ray is then traced with
+`q = n − u`, i.e. **backward in time**, which is what lets it legally exit
+the horizon when the camera is inside. Works at any r > 0.
 """
 function ks_init_photon(origin::SVector{3,Float64},
-                        direction::SVector{3,Float64}, M::Float64)
+                        direction::SVector{3,Float64}, M::Float64,
+                        tet::NTuple{4,SVector{4,Float64}},
+                        fwd::SVector{3,Float64}, right::SVector{3,Float64},
+                        up::SVector{3,Float64})
+    u, Ef, Er, Eu = tet
+    cf = dot(direction, fwd)
+    cr = dot(direction, right)
+    cu = dot(direction, up)
+    q = cf * Ef + cr * Er + cu * Eu - u          # past-directed null, outward
+    # Lower the index: p_μ = η_μν q^ν + f l_μ (l_ν q^ν),  l_μ = (1, x̂).
     r = norm(origin)
     f = 2M / r
-    κd = dot(origin, direction) / r
-    p_t = -sqrt(max(1.0 - f * (1.0 - κd^2), 1e-12))
-    β = f * (κd - p_t) / max(1.0 - f, 1e-6)
-    p = direction + (β / r) * origin
+    lq = q[1] + (origin[1] * q[2] + origin[2] * q[3] + origin[3] * q[4]) / r
+    p_t = -q[1] + f * lq
+    p = SVector(q[2], q[3], q[4]) + (f * lq / r) * origin
     return vcat(origin, p), p_t
 end
 
@@ -103,33 +163,73 @@ function render_preview(cam::Camera, spacetime::Schwarzschild, background;
     width, height = settings.width, settings.height
     image = zeros(RGBf, width, height)
     M = spacetime.M
-    r_horizon = 2.1 * M
-    r_escape = settings.r_escape_factor * norm(cam.pos)
+    # Escape radius: never smaller than 30M, so a camera deep inside still
+    # traces rays out to a sensible sky distance.
+    r_escape = settings.r_escape_factor * max(norm(cam.pos), 15.0 * M)
     dt = settings.dt
-    # Dynamic step cap, kept in sync with render_preview_mtl: rays must be able
-    # to reach the escape radius even from distant cameras.
-    nmax = min(max(settings.nmax, ceil(Int, 3.0 * r_escape / dt)), 20_000)
+    # Dynamic step cap, kept in sync with render_preview_mtl: with
+    # radius-adaptive steps the travel legs are logarithmic; the constant is
+    # the strong-field winding budget.
+    nmax = min(max(settings.nmax,
+                   ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)),
+               20_000)
+
+    # Asymptotic coordinate velocity of the ray (for sky sampling by
+    # direction rather than escape position).
+    function ray_dir(μ, p_t)
+        r = max(sqrt(μ[1]^2 + μ[2]^2 + μ[3]^2), 1e-12)
+        f = 2M / r
+        κ = (μ[1] * μ[4] + μ[2] * μ[5] + μ[3] * μ[6]) / r
+        c1 = f * (-p_t + κ) / r
+        v = SVector(μ[4] - c1 * μ[1], μ[5] - c1 * μ[2], μ[6] - c1 * μ[3])
+        return v / max(norm(v), 1e-20)
+    end
+
+    # Backward-traced rays can exit the horizon (camera inside, r strictly
+    # increasing) but can never legally enter it. Exact kill criterion: an
+    # escaping null geodesic never has a turning point below the photon
+    # sphere (periapsis > 3M requires b > b_crit), so any ray moving inward
+    # below ~2.95M is sub-critical horizon-bound light — the shadow. This
+    # also stops rays numerically bouncing off the horizon ridge and
+    # escaping as phantom sky.
+    r_band = 2.95 * M
+    r_kill = 0.3 * M   # numerical safety net near the singularity
+
+    tet = ks_camera_tetrad(cam.pos, cam.fwd, cam.right, cam.up_local, M)
 
     Threads.@threads :static for i in 1:width
         for j in 1:height
             u, v = sensor_coordinate(i, j, width, height)
             origin, direction = get_ray(cam, u, v)
-            μ, p_t = ks_init_photon(origin, direction, M)
+            μ, p_t = ks_init_photon(origin, direction, M, tet,
+                                    cam.fwd, cam.right, cam.up_local)
             hit = false
+            cam_outside = norm(origin) > 2.05 * M
+            r_prev = -1.0
             for _ in 1:nmax
                 r = sqrt(μ[1]^2 + μ[2]^2 + μ[3]^2)
-                if r < r_horizon || r > r_escape
-                    hit = r < r_horizon
-                    if r > r_escape
-                        θ = acos(clamp(μ[3] / r, -1.0, 1.0))
-                        ϕ = atan(μ[2], μ[1])
-                        image[i, j] = sample_background(background, θ, ϕ)
-                        hit = true
-                    end
+                # A camera-outside ray below 2M is always a numerical
+                # overshoot of the horizon ridge — no legal path leads there.
+                if r < r_kill ||
+                   (r < r_band && r_prev > 0.0 && r < r_prev - 1.0e-4 * M) ||
+                   (cam_outside && r < 2.0 * M)
+                    hit = true   # horizon-redshifted (or fell apart): black
                     break
                 end
+                if r > r_escape
+                    v = ray_dir(μ, p_t)
+                    θ = acos(clamp(v[3], -1.0, 1.0))
+                    image[i, j] = sample_background(background, θ,
+                                                    atan(v[2], v[1]))
+                    hit = true
+                    break
+                end
+                r_prev = r
                 z_prev = μ[3]
-                μ = rk4_step_preview(μ, p_t, M, dt)
+                # Radius-adaptive step (kept in sync with the Metal kernel):
+                # curvature ~ M/r³, so h ∝ r keeps per-step bending uniform.
+                h = dt * clamp(0.16 * r / M, 1.0, 8.0)
+                μ = rk4_step_preview(μ, p_t, M, h)
                 # Non-finite ray: paint black, matching the kernel bail-out.
                 if !(μ[1] == μ[1]) || !(μ[3] == μ[3])
                     hit = true
@@ -146,10 +246,16 @@ function render_preview(cam::Camera, spacetime::Schwarzschild, background;
                 end
             end
             if !hit
-                # Ran out of steps: sample the sky at the last position.
+                # Ran out of steps. Rays still deep in the strong field are
+                # (near-)critical or horizon-hugging: black. Rays that made
+                # real progress sample the sky along their final direction.
                 r = max(sqrt(μ[1]^2 + μ[2]^2 + μ[3]^2), 1e-12)
-                θ = acos(clamp(μ[3] / r, -1.0, 1.0))
-                image[i, j] = sample_background(background, θ, atan(μ[2], μ[1]))
+                if r > 4.0 * M
+                    v = ray_dir(μ, p_t)
+                    θ = acos(clamp(v[3], -1.0, 1.0))
+                    image[i, j] = sample_background(background, θ,
+                                                    atan(v[2], v[1]))
+                end
             end
         end
     end
@@ -618,6 +724,8 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
             fwd = _flycam_basis(state)[1]
             step = 0.05 * sc[2] * max(norm(state.pos), 2.0)
             state.pos += step * fwd
+            rn = norm(state.pos)
+            rn < 0.45 * spacetime.M && (state.pos *= 0.45 * spacetime.M / rn)
         end
         request_render()
         return _Makie.Consume(true)
@@ -694,20 +802,25 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
     end
     crow += 1
 
-    Label(cam_col[crow, 1], status_obs; halign=:left)
+    # tellwidth=false: long status text must not widen the column past its
+    # relative share (it would push the whole column off the window edge).
+    Label(cam_col[crow, 1], status_obs; halign=:left, tellwidth=false)
     crow += 1
-    Label(cam_col[crow, 1], cam_pos_label_obs; halign=:left)
+    Label(cam_col[crow, 1], cam_pos_label_obs; halign=:left, tellwidth=false)
     crow += 1
     Label(cam_col[crow, 1],
           "Drag: look · Scroll: dolly · WASD: move · Q/E: down/up (z) · Shift: fast";
-          halign=:left, color=:gray)
+          halign=:left, color=:gray, tellwidth=false, word_wrap=true)
     rowgap!(cam_col, 6)
 
     # --- Column 2: post-processing ---
     post_col = GridLayout(controls[1, 2]; valign=:top, tellheight=false)
     Label(post_col[1, 1], "Post-processing"; fontsize=16, halign=:left)
-    post_sg = SliderGrid(
-        post_col[2, 1],
+    # Two side-by-side slider grids: 13 stacked rows would be taller than the
+    # controls row and push the last sliders off screen.
+    post_pair = GridLayout(post_col[2, 1])
+    post_sg_a = SliderGrid(
+        post_pair[1, 1],
         (label = "Gain", range = 0.0:0.01:2.0, format = "{:.2f}", startvalue = 1.0),
         (label = "Exposure (EV)", range = -5.0:0.1:5.0, format = "{:.1f}", startvalue = 0.0),
         (label = "Gamma", range = 0.1:0.05:3.0, format = "{:.2f}", startvalue = 2.2),
@@ -715,14 +828,25 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
         (label = "Bloom threshold", range = 0.0:0.05:2.0, format = "{:.2f}", startvalue = 0.5),
         (label = "Bloom radius", range = 1.0:1.0:50.0, format = "{:.0f}", startvalue = 15.0),
         (label = "Bloom power", range = 0.1:0.1:3.0, format = "{:.1f}", startvalue = 1.5),
+        valign = :top, tellwidth = false, tellheight = true
+    )
+    post_sg_b = SliderGrid(
+        post_pair[1, 2],
         (label = "Streak strength", range = 0.0:0.05:2.0, format = "{:.2f}", startvalue = 0.3),
         (label = "Streak length", range = 0.05:0.05:1.0, format = "{:.2f}", startvalue = 0.4),
         (label = "Streak width", range = 0.5:0.5:5.0, format = "{:.1f}", startvalue = 1.5),
         (label = "Star spikes", range = 2:1:8, format = "{:.0f}", startvalue = 4),
         (label = "Color preserve", range = 0.0:0.05:1.0, format = "{:.2f}", startvalue = 0.75),
         (label = "Contrast", range = -1.0:0.05:1.0, format = "{:.2f}", startvalue = 0.0),
-        tellwidth = false, tellheight = true
+        valign = :top, tellwidth = false, tellheight = true
     )
+    # Fixed widths: the grids only report a collapsed minimum width, so
+    # relative sizing here would shrink-wrap and overlap them.
+    colsize!(post_pair, 1, GLMakie.Fixed(270))
+    colsize!(post_pair, 2, GLMakie.Fixed(270))
+    colgap!(post_pair, 14)
+    # Kept in the original 13-slider order: preset and snapshot code index it.
+    post_sliders_all = vcat(post_sg_a.sliders, post_sg_b.sliders)
     rowgap!(post_col, 6)
 
     # --- Column 3: sensor, dust, final render ---
@@ -765,34 +889,41 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
     rowgap!(sensor_grid, 4)
     orow += 1
 
+    # Two textbox pairs per row keeps the column short enough to fit on
+    # screen together with the ten sensor rows above it.
     settings_grid = GridLayout(out_col[orow, 1])
     Label(settings_grid[1, 1], "Width"; halign=:left)
     width_tb = Textbox(settings_grid[1, 2]; stored_string="3840", validator=Int,
                        tellwidth=false)
-    Label(settings_grid[2, 1], "Height"; halign=:left)
-    height_tb = Textbox(settings_grid[2, 2]; stored_string="2160", validator=Int,
+    Label(settings_grid[1, 3], "Height"; halign=:left)
+    height_tb = Textbox(settings_grid[1, 4]; stored_string="2160", validator=Int,
                         tellwidth=false)
-    Label(settings_grid[3, 1], "Samples"; halign=:left)
-    samples_tb = Textbox(settings_grid[3, 2]; stored_string="4", validator=Int,
+    Label(settings_grid[2, 1], "Samples"; halign=:left)
+    samples_tb = Textbox(settings_grid[2, 2]; stored_string="4", validator=Int,
                          tellwidth=false)
-    Label(settings_grid[4, 1], "File"; halign=:left)
-    filename_tb = Textbox(settings_grid[4, 2]; stored_string="render.png",
+    Label(settings_grid[2, 3], "File"; halign=:left)
+    filename_tb = Textbox(settings_grid[2, 4]; stored_string="render.png",
                           tellwidth=false)
-    colsize!(settings_grid, 1, GLMakie.Auto())
-    colsize!(settings_grid, 2, GLMakie.Relative(0.55))
+    colsize!(settings_grid, 2, GLMakie.Relative(0.28))
+    colsize!(settings_grid, 4, GLMakie.Relative(0.28))
     rowgap!(settings_grid, 4)
     orow += 1
 
     final_btn_grid = GridLayout(out_col[orow, 1]; halign=:left)
     render_btn = Button(final_btn_grid[1, 1]; label="Render final image")
     draft_btn = Button(final_btn_grid[1, 2]; label="GPU draft")
+    live_btn = Button(final_btn_grid[1, 3]; label="Save live view")
     colgap!(final_btn_grid, 8)
     orow += 1
 
-    # Progress bar: a decoration-free mini axis with a filled rectangle.
+    rowgap!(out_col, 6)
+
+    # Progress bar: a full-width strip at the bottom of the figure (its own
+    # layout row), so it can never be clipped off by a tall control column.
     progress_obs = Observable(0.0)
     progress_label_obs = Observable("Ready")
-    pax = GLMakie.Axis(out_col[orow, 1]; height=14, limits=(0, 1, 0, 1),
+    prog_row = GridLayout(fig[3, 1:2])
+    pax = GLMakie.Axis(prog_row[1, 1]; height=14, limits=(0, 1, 0, 1),
                        backgroundcolor=RGBf(0.15, 0.15, 0.15))
     hidedecorations!(pax)
     hidespines!(pax)
@@ -801,10 +932,8 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
     end
     poly!(pax, @lift(Rect2f(0.0, 0.0, max($progress_obs, 1e-4), 1.0));
           color=:seagreen)
-    orow += 1
-
-    Label(out_col[orow, 1], progress_label_obs; halign=:left)
-    rowgap!(out_col, 6)
+    Label(prog_row[1, 2], progress_label_obs; halign=:left, width=340)
+    colgap!(prog_row, 12)
 
     colsize!(controls, 1, GLMakie.Relative(0.29))
     colsize!(controls, 2, GLMakie.Relative(0.42))
@@ -833,7 +962,7 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
         set_close_to!(cam_sg.sliders[4], 2.0)
         set_close_to!(cam_sg.sliders[5], 27.0)   # ≈ distance to disc inner edge
         thinlens_toggle.active[] = true
-        for (sl, val) in zip(post_sg.sliders,
+        for (sl, val) in zip(post_sliders_all,
                              (1.0, 1.2, 0.2, 1.0, 0.5, 10.0, 1.5,
                               2.0, 0.1, 1.0, 4.0, 0.75, 0.0))
             set_close_to!(sl, val)
@@ -908,7 +1037,7 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
         cam_now = build_camera()
         vol_now = active_volume()
         filename = filename_tb.stored_string[]
-        post_sliders = post_sg.sliders
+        post_sliders = post_sliders_all
         gain = post_sliders[1].value[]
         exposure = post_sliders[2].value[]
         gamma = post_sliders[3].value[]
@@ -1028,6 +1157,67 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
         start_photo_render(true)
     end
 
+    # "Save live view": the GPU preview look, exactly as on screen — no
+    # post-processing, no sensor model — at the output resolution (the draft
+    # tracer supersamples, so it is a clean version of the same image).
+    on(live_btn.clicks) do _
+        rendering[] && return
+        width_val = tryparse(Int, width_tb.stored_string[])
+        height_val = tryparse(Int, height_tb.stored_string[])
+        if isnothing(width_val) || isnothing(height_val) ||
+           width_val <= 0 || height_val <= 0
+            progress_label_obs[] = "Error: invalid resolution"
+            return
+        end
+        cam_now = build_camera()
+        save_name = "live_" * basename(filename_tb.stored_string[])
+        idle_label = live_btn.label[]
+        rendering[] = true
+        live_btn.label[] = "Rendering…"
+        set_progress!(0.0)
+        result = Channel{Any}(1)
+        Threads.@spawn begin
+            try
+                img = render_draft_mtl(ctx, cam_now, spacetime;
+                                       width=width_val, height=height_val,
+                                       samples=2, dt=0.02,
+                                       progress=set_progress!)
+                img = map(clamp01nan, img)
+                FileIO.save(save_name, rotr90(img))
+                put!(result, (:ok, img, save_name))
+            catch e
+                @error "Live-view render failed" exception=(e, catch_backtrace())
+                put!(result, (:error, e))
+            end
+        end
+        @async begin
+            while !isready(result)
+                p = progress_atomic[]
+                progress_obs[] = p
+                progress_label_obs[] = string(round(Int, 100 * p), "%")
+                sleep(0.1)
+            end
+            res = take!(result)
+            rendering[] = false
+            live_btn.label[] = idle_label
+            if res[1] === :ok
+                progress_obs[] = 1.0
+                progress_label_obs[] = "Saved: $(res[3])"
+                final_img = res[2]
+                sx = max(1, cld(size(final_img, 1), settings.width))
+                sy = max(1, cld(size(final_img, 2), settings.height))
+                img_obs[] = final_img[1:sx:end, 1:sy:end]
+                if size(img_obs[]) != last_img_size[]
+                    last_img_size[] = size(img_obs[])
+                    autolimits!(ax)
+                end
+            else
+                progress_obs[] = 0.0
+                progress_label_obs[] = "Error: $(res[2])"
+            end
+        end
+    end
+
     # -------------------------------------------------------------------------
     # Initial state
     # -------------------------------------------------------------------------
@@ -1079,6 +1269,9 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
                 if ispressed(fig, Keyboard.e)
                     state.pos += v * world_z; moved = true
                 end
+                # Keep clear of the singularity (integrator kill radius 0.3M).
+                rn = norm(state.pos)
+                rn < 0.45 * spacetime.M && (state.pos *= 0.45 * spacetime.M / rn)
             end
             moved && request_render()
         end

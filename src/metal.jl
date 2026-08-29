@@ -70,7 +70,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
                               volume::Union{DiscVolume,Nothing}=nothing)
     bg_gpu = _upload_background(background)
     out_gpu = MtlArray{Float32,3}(undef, 3, width, height)
-    cam_params = MtlVector{Float32}(undef, 13)
+    cam_params = MtlVector{Float32}(undef, 20)
     spacetime_params = MtlVector{Float32}(undef, 3)
     disc_params = MtlVector{Float32}(undef, 6)
     if isnothing(disc)
@@ -292,42 +292,47 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     end
 
     M = spacetime_params[1]
-    r_horizon = spacetime_params[2]
     r_escape = spacetime_params[3]
 
-    # Unpack camera basis.
+    # Unpack camera position, field of view and the orthonormal tetrad
+    # (forward/right/up axes + observer 4-velocity, all contravariant,
+    # precomputed on the CPU by `ks_camera_tetrad`).
     cx = cam_params[1];  cy = cam_params[2];  cz = cam_params[3]
-    fx = cam_params[4];  fy = cam_params[5];  fz = cam_params[6]
-    rx = cam_params[7];  ry = cam_params[8];  rz = cam_params[9]
-    ux = cam_params[10]; uy = cam_params[11]; uz = cam_params[12]
-    fov = cam_params[13]
+    fov = cam_params[4]
+    ef0 = cam_params[5];  ef1 = cam_params[6];  ef2 = cam_params[7];  ef3 = cam_params[8]
+    er0 = cam_params[9];  er1 = cam_params[10]; er2 = cam_params[11]; er3 = cam_params[12]
+    eu0 = cam_params[13]; eu1 = cam_params[14]; eu2 = cam_params[15]; eu3 = cam_params[16]
+    ut0 = cam_params[17]; ut1 = cam_params[18]; ut2 = cam_params[19]; ut3 = cam_params[20]
 
     # Sensor coordinate with subpixel jitter.
     half_h = Float32(height) / 2.0f0
     u = (Float32(i) - 1.0f0 + jitter_u - Float32(width) / 2.0f0) / half_h
     v = (Float32(j) - 1.0f0 + jitter_v - Float32(height) / 2.0f0) / half_h
 
-    # Ray direction in world space.
+    # Pixel direction as unit coefficients on the camera tetrad axes.
     dx_local = u * fov
     dy_local = v * fov
-    dx = rx * dx_local + ux * dy_local + fx
-    dy = ry * dx_local + uy * dy_local + fy
-    dz = rz * dx_local + uz * dy_local + fz
-    len = sqrt(dx * dx + dy * dy + dz * dz)
-    dx /= len; dy /= len; dz /= len
+    ν = sqrt(dx_local * dx_local + dy_local * dy_local + 1.0f0)
+    cr = dx_local / ν
+    cu = dy_local / ν
+    cf = 1.0f0 / ν
 
-    # Kerr–Schild null-ray initialisation (closed form): choose p⃗ = d̂ + β x̂
-    # so the coordinate velocity at the camera is exactly d̂; the null
-    # condition then gives p_t² = 1 − f(1 − κ²).
+    # Received photon p = ω(u + n); trace q = n − u, i.e. backward in time
+    # (regular through the horizon in both directions). Lower the index:
+    # p_μ = η_μν q^ν + f l_μ (l_ν q^ν) with l_μ = (1, x̂).
     x = cx; y = cy; z = cz
     r = sqrt(x * x + y * y + z * z)
     f = 2.0f0 * M / r
-    κd = (x * dx + y * dy + z * dz) / r
-    p_t = -sqrt(max(1.0f0 - f * (1.0f0 - κd * κd), 1.0f-6))
-    β = f * (κd - p_t) / max(1.0f0 - f, 1.0f-4)
-    px = dx + β * x / r
-    py = dy + β * y / r
-    pz = dz + β * z / r
+    qt = cf * ef0 + cr * er0 + cu * eu0 - ut0
+    qx = cf * ef1 + cr * er1 + cu * eu1 - ut1
+    qy = cf * ef2 + cr * er2 + cu * eu2 - ut2
+    qz = cf * ef3 + cr * er3 + cu * eu3 - ut3
+    lq = qt + (x * qx + y * qy + z * qz) / r
+    p_t = -qt + f * lq
+    flr = f * lq / r
+    px = qx + flr * x
+    py = qy + flr * y
+    pz = qz + flr * z
 
     disc_inner = disc_params[1]
     disc_outer = disc_params[2]
@@ -354,18 +359,44 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     acc_b = 0.0f0
     alpha = 1.0f0
 
-    # Fixed-step RK4 integration.
+    # Fixed-step RK4 integration. Backward-traced rays exit the horizon
+    # freely (camera inside: r strictly increases) but can never legally
+    # enter it — a ray reaching the band just above r = 2M while moving
+    # inward is infinitely redshifted horizon-skimming light (the shadow),
+    # and numerically an unstable ridge, so it is killed as black.
     hit_horizon = false
+    # Camera outside the horizon: no legal ray is ever below 2M (a dip is
+    # horizon-ridge overshoot). Camera inside: rays exit through the band,
+    # floor is the near-singularity safety net.
+    r_floor = r > 2.05f0 * M ? 2.0f0 * M : 0.3f0 * M
+    r_prev = -1.0f0
     for stepi in 1:nmax
         r2 = x * x + y * y + z * z
         r = sqrt(r2)
-        if r < r_horizon
-            hit_horizon = true
-            break
+        if r < 3.2f0 * M   # strong-field zone: kill checks live only here
+            # Exact criterion: an escaping null geodesic never has a turning
+            # point below the photon sphere (periapsis > 3M requires
+            # b > b_crit), so a ray moving inward below ~2.95M can never
+            # legally return — it is sub-critical, horizon-bound light: the
+            # shadow. This also stops rays numerically bouncing off the
+            # horizon ridge and escaping as phantom sky.
+            if r < r_floor ||
+               (r < 2.95f0 * M && r_prev > 0.0f0 && r < r_prev - 1.0f-4 * M)
+                hit_horizon = true
+                break
+            end
+            r_prev = r
         end
         if r > r_escape
             break   # ray escaped: background will be sampled below
         end
+
+        # Radius-adaptive affine step: curvature ~ M/r³, so scaling h with r
+        # keeps the per-step bending error uniform while collapsing the
+        # nearly-flat travel legs. Capped at 2× inside the gas volume so
+        # turbulence stays sampled at feature scale, 8× otherwise.
+        hcap = (VOL && r2 < vol_rb2) ? 2.0f0 : 8.0f0
+        h = dt * min(max(0.16f0 * r / M, 1.0f0), hcap)
 
         xp = x; yp = y; zp = z
         pxp = px; pyp = py; pzp = pz
@@ -385,7 +416,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                     if ρ > 1.0f-4
                         vlen = max(sqrt(k1[1] * k1[1] + k1[2] * k1[2] +
                                         k1[3] * k1[3]), 1.0f-20)
-                        ds = 2.0f0 * dt * vlen
+                        ds = 2.0f0 * h * vlen
 
                         R = s_cyl / (2.0f0 * M)
                         T_emit = exp(10.034259f0 - 0.375f0 * log(max(R * R, 1.0f-6)))
@@ -425,24 +456,24 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
         end
 
         k2 = ks_rhs_mtl(
-            x + 0.5f0 * dt * k1[1], y + 0.5f0 * dt * k1[2], z + 0.5f0 * dt * k1[3],
-            px + 0.5f0 * dt * k1[4], py + 0.5f0 * dt * k1[5], pz + 0.5f0 * dt * k1[6],
+            x + 0.5f0 * h * k1[1], y + 0.5f0 * h * k1[2], z + 0.5f0 * h * k1[3],
+            px + 0.5f0 * h * k1[4], py + 0.5f0 * h * k1[5], pz + 0.5f0 * h * k1[6],
             p_t, M)
         k3 = ks_rhs_mtl(
-            x + 0.5f0 * dt * k2[1], y + 0.5f0 * dt * k2[2], z + 0.5f0 * dt * k2[3],
-            px + 0.5f0 * dt * k2[4], py + 0.5f0 * dt * k2[5], pz + 0.5f0 * dt * k2[6],
+            x + 0.5f0 * h * k2[1], y + 0.5f0 * h * k2[2], z + 0.5f0 * h * k2[3],
+            px + 0.5f0 * h * k2[4], py + 0.5f0 * h * k2[5], pz + 0.5f0 * h * k2[6],
             p_t, M)
         k4 = ks_rhs_mtl(
-            x + dt * k3[1], y + dt * k3[2], z + dt * k3[3],
-            px + dt * k3[4], py + dt * k3[5], pz + dt * k3[6],
+            x + h * k3[1], y + h * k3[2], z + h * k3[3],
+            px + h * k3[4], py + h * k3[5], pz + h * k3[6],
             p_t, M)
 
-        x  += (dt / 6.0f0) * (k1[1] + 2.0f0 * k2[1] + 2.0f0 * k3[1] + k4[1])
-        y  += (dt / 6.0f0) * (k1[2] + 2.0f0 * k2[2] + 2.0f0 * k3[2] + k4[2])
-        z  += (dt / 6.0f0) * (k1[3] + 2.0f0 * k2[3] + 2.0f0 * k3[3] + k4[3])
-        px += (dt / 6.0f0) * (k1[4] + 2.0f0 * k2[4] + 2.0f0 * k3[4] + k4[4])
-        py += (dt / 6.0f0) * (k1[5] + 2.0f0 * k2[5] + 2.0f0 * k3[5] + k4[5])
-        pz += (dt / 6.0f0) * (k1[6] + 2.0f0 * k2[6] + 2.0f0 * k3[6] + k4[6])
+        x  += (h / 6.0f0) * (k1[1] + 2.0f0 * k2[1] + 2.0f0 * k3[1] + k4[1])
+        y  += (h / 6.0f0) * (k1[2] + 2.0f0 * k2[2] + 2.0f0 * k3[2] + k4[2])
+        z  += (h / 6.0f0) * (k1[3] + 2.0f0 * k2[3] + 2.0f0 * k3[3] + k4[3])
+        px += (h / 6.0f0) * (k1[4] + 2.0f0 * k2[4] + 2.0f0 * k3[4] + k4[4])
+        py += (h / 6.0f0) * (k1[5] + 2.0f0 * k2[5] + 2.0f0 * k3[5] + k4[5])
+        pz += (h / 6.0f0) * (k1[6] + 2.0f0 * k2[6] + 2.0f0 * k3[6] + k4[6])
 
         # A non-finite ray can never satisfy the exit tests and would reach
         # the background sampler as NaN, trapping the kernel. Paint it black
@@ -515,16 +546,28 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     W = size(bg, 2)
     H = size(bg, 3)
 
-    if hit_horizon
+    # Rays that ran out of steps while still deep in the strong field are
+    # (near-)critical or horizon-hugging: treat them as black too.
+    rf = max(sqrt(x * x + y * y + z * z), 1.0f-6)
+    if hit_horizon || rf < 4.0f0 * M
         out[1, i, j] += weight * acc_r
         out[2, i, j] += weight * acc_g
         out[3, i, j] += weight * acc_b
     else
-        # Escaped rays (and any that ran out of steps) show the background
-        # sky attenuated by any disc gas along the way.
-        rf = max(sqrt(x * x + y * y + z * z), 1.0f-6)
-        θbg = acos(clamp(z / rf, -1.0f0, 1.0f0))
-        φbg = atan(y, x)
+        # Escaped rays show the background sky attenuated by any disc gas
+        # along the way. Sample by the asymptotic momentum direction, not the
+        # escape position: position sampling parallax-shifts stars by up to
+        # ~b/r_escape radians for disc-grazing rays.
+        inv_rf = 1.0f0 / rf
+        ff = 2.0f0 * M * inv_rf
+        κf = (x * px + y * py + z * pz) * inv_rf
+        c1f = ff * (-p_t + κf) * inv_rf
+        vx = px - c1f * x
+        vy = py - c1f * y
+        vz = pz - c1f * z
+        vl = max(sqrt(vx * vx + vy * vy + vz * vz), 1.0f-20)
+        θbg = acos(clamp(vz / vl, -1.0f0, 1.0f0))
+        φbg = atan(vy, vx)
         r_col, g_col, b_col = sample_background_mtl(bg, θbg, φbg, W, H)
         out[1, i, j] += weight * (acc_r + alpha * r_col)
         out[2, i, j] += weight * (acc_g + alpha * g_col)
@@ -538,6 +581,14 @@ end
 # Public API
 # ---------------------------------------------------------------------------
 
+"""20-float camera parameter block: position, fov, and the KS tetrad."""
+function _ks_cam_params(cam::Camera, M::Float64)
+    u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
+                                      cam.up_local, M)
+    return Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
+                   Ef..., Er..., Eu..., u4...]
+end
+
 """
     render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
                        spacetime::Schwarzschild)
@@ -548,25 +599,21 @@ Render one preview frame on the GPU using `ctx`.  Returns a `width × height`
 function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
                             spacetime::Schwarzschild)
     M = Float32(spacetime.M)
-    r_horizon = Float32(2.1f0 * spacetime.M)
-    r_escape = Float32(ctx.r_escape_factor * norm(cam.pos))
+    r_band = Float32(2.05 * spacetime.M)
+    r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
+                                                 15.0 * spacetime.M))
     dt = ctx.dt
-    # Dynamic step count: ensure rays can reach the escape radius even from
-    # distant cameras.  A ray needs roughly r_escape / dt steps in the weak
-    # field; add headroom for strong-field winding near the black hole.  The
-    # cap keeps a single dispatch under the macOS GPU watchdog even when the
-    # camera is very far away.
-    nmax = min(max(ctx.nmax, ceil(Int, 3.0f0 * r_escape / dt)), 20_000)
+    # Dynamic step count. With radius-adaptive steps the travel legs are
+    # logarithmic in r_escape; the constant is the strong-field winding
+    # budget (a few photon-sphere orbits). The cap keeps a single dispatch
+    # under the macOS GPU watchdog even when the camera is very far away.
+    nmax = min(max(ctx.nmax,
+                   ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)),
+               20_000)
 
     # Update reusable GPU parameter buffers with a single host-to-device copy.
-    copyto!(ctx.cam_params, Float32[
-        cam.pos[1], cam.pos[2], cam.pos[3],
-        cam.fwd[1], cam.fwd[2], cam.fwd[3],
-        cam.right[1], cam.right[2], cam.right[3],
-        cam.up_local[1], cam.up_local[2], cam.up_local[3],
-        cam.fov_factor
-    ])
-    copyto!(ctx.spacetime_params, Float32[M, r_horizon, r_escape])
+    copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M))
+    copyto!(ctx.spacetime_params, Float32[M, r_band, r_escape])
 
     fill!(ctx.out_gpu, 0.0f0)
     _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params, ctx.spacetime_params,
@@ -638,22 +685,19 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           progress::Union{Function,Nothing}=nothing)
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
-    r_horizon = Float32(2.1f0 * spacetime.M)
-    r_escape = Float32(ctx.r_escape_factor * norm(cam.pos))
-    nmax = min(max(ctx.nmax, ceil(Int, 3.0f0 * r_escape / dt32)), 40_000)
+    r_band = Float32(2.05 * spacetime.M)
+    r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
+                                                 15.0 * spacetime.M))
+    nmax = min(max(ctx.nmax,
+                   ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt32)),
+               40_000)
 
     # Own parameter buffers: preview frames may update ctx's buffers while the
     # draft's tiles are still dispatching.
-    cam_params = MtlVector{Float32}(undef, 13)
+    cam_params = MtlVector{Float32}(undef, 20)
     spacetime_params = MtlVector{Float32}(undef, 3)
-    copyto!(cam_params, Float32[
-        cam.pos[1], cam.pos[2], cam.pos[3],
-        cam.fwd[1], cam.fwd[2], cam.fwd[3],
-        cam.right[1], cam.right[2], cam.right[3],
-        cam.up_local[1], cam.up_local[2], cam.up_local[3],
-        cam.fov_factor
-    ])
-    copyto!(spacetime_params, Float32[M, r_horizon, r_escape])
+    copyto!(cam_params, _ks_cam_params(cam, spacetime.M))
+    copyto!(spacetime_params, Float32[M, r_band, r_escape])
 
     out = MtlArray{Float32,3}(undef, 3, width, height)
     fill!(out, 0.0f0)
