@@ -70,8 +70,8 @@ function MetalPreviewContext(background, width::Int, height::Int;
                               volume::Union{DiscVolume,Nothing}=nothing)
     bg_gpu = _upload_background(background)
     out_gpu = MtlArray{Float32,3}(undef, 3, width, height)
-    cam_params = MtlVector{Float32}(undef, 22)
-    spacetime_params = MtlVector{Float32}(undef, 3)
+    cam_params = MtlVector{Float32}(undef, 25)
+    spacetime_params = MtlVector{Float32}(undef, 4)
     disc_params = MtlVector{Float32}(undef, 6)
     if isnothing(disc)
         copyto!(disc_params, zeros(Float32, 6))
@@ -344,6 +344,18 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
         dx_local = u * fov
         dy_local = v * fov
         ν = sqrt(dx_local * dx_local + dy_local * dy_local + 1.0f0)
+        # Thin lens: cam_params[23:24] hold this pass's aperture offset
+        # (world units, zero for pinhole). The ray leaves the offset origin
+        # aimed at the pinhole ray's focal-plane point, exactly matching the
+        # CPU `get_ray(::ThinLensCamera, …)`.
+        offr = cam_params[23]
+        offu = cam_params[24]
+        if offr != 0.0f0 || offu != 0.0f0
+            k = ν / cam_params[25]   # 1 / (focus distance along the ray)
+            dx_local -= offr * k
+            dy_local -= offu * k
+            ν = sqrt(dx_local * dx_local + dy_local * dy_local + 1.0f0)
+        end
         cr = dx_local / ν
         cu = dy_local / ν
         cf = 1.0f0 / ν
@@ -352,7 +364,11 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     # Received photon p = ω(u + n); trace q = n − u, i.e. backward in time
     # (regular through the horizon in both directions). Lower the index:
     # p_μ = η_μν q^ν + f l_μ (l_ν q^ν) with l_μ = (1, x̂).
-    x = cx; y = cy; z = cz
+    # The origin carries the aperture offset along the tetrad right/up axes
+    # (zero for pinhole).
+    x = cx + cam_params[23] * er1 + cam_params[24] * eu1
+    y = cy + cam_params[23] * er2 + cam_params[24] * eu2
+    z = cz + cam_params[23] * er3 + cam_params[24] * eu3
     r = sqrt(x * x + y * y + z * z)
     f = 2.0f0 * M / r
     qt = cf * ef0 + cr * er0 + cu * eu0 - ut0
@@ -365,6 +381,13 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     px = qx + flr * x
     py = qy + flr * y
     pz = qz + flr * z
+
+    # Optional relativistic shading: each ray is normalised to unit frequency
+    # in the camera tetrad, and the conserved p_t is the frequency at
+    # infinity, so the camera/infinity shift factor is simply g = 1/|p_t|.
+    # 1 when the option is off.
+    scam = spacetime_params[4] > 0.5f0 ?
+           1.0f0 / clamp(abs(p_t), 0.05f0, 20.0f0) : 1.0f0
 
     disc_inner = disc_params[1]
     disc_outer = disc_params[2]
@@ -461,7 +484,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                         Rs = r / (2.0f0 * M)
                         opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(Rs, 1.0f0), 0.01f0))
                         opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
-                        T_obs = T_emit / opz
+                        T_obs = T_emit * scam / opz
                         inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
 
                         frac = (clamp(T_obs, lut_tmin, lut_tmax) - lut_tmin) /
@@ -545,7 +568,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                 gam = 1.0f0 / sqrt(1.0f0 - clamp(v_mag * v_mag, 0.0f0, 0.99f0))
                 opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(R, 1.0f0), 0.01f0))
                 opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
-                T_obs = T_emit / opz
+                T_obs = T_emit * scam / opz
                 inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
 
                 frac = (clamp(T_obs, lut_tmin, lut_tmax) - lut_tmin) /
@@ -601,6 +624,14 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
         θbg = acos(clamp(vz / vl, -1.0f0, 1.0f0))
         φbg = atan(vy, vx)
         r_col, g_col, b_col = sample_background_mtl(bg, θbg, φbg, W, H)
+        if scam != 1.0f0
+            # Relativistic sky: a ~5800 K star observed at T = g·5800 K.
+            # Per-channel Planck ratios at 610/550/465 nm; brightness boost
+            # (→ g⁴ bolometric) emerges from the same formula.
+            r_col *= 57.4f0 / (exp(4.067f0 / scam) - 1.0f0)
+            g_col *= 90.2f0 / (exp(4.513f0 / scam) - 1.0f0)
+            b_col *= 206.5f0 / (exp(5.335f0 / scam) - 1.0f0)
+        end
         out[1, i, j] += weight * (acc_r + alpha * r_col)
         out[2, i, j] += weight * (acc_g + alpha * g_col)
         out[3, i, j] += weight * (acc_b + alpha * b_col)
@@ -620,12 +651,14 @@ vertical half-angle at the image's top edge (pixel radius ∝ view angle, so
 fields wider than 180° render cleanly — a rectilinear pinhole caps below
 180° at any focal length).
 """
-function _ks_cam_params(cam::Camera, M::Float64; fisheye_deg::Real=0.0)
+function _ks_cam_params(cam::Camera, M::Float64; fisheye_deg::Real=0.0,
+                        focus_dist::Real=1.0)
     u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
                                       cam.up_local, M)
     return Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
                    Ef..., Er..., Eu..., u4...,
-                   fisheye_deg > 0 ? 1.0 : 0.0, deg2rad(max(fisheye_deg, 0.0))]
+                   fisheye_deg > 0 ? 1.0 : 0.0, deg2rad(max(fisheye_deg, 0.0)),
+                   0.0, 0.0, focus_dist]   # per-pass lens offset + focus
 end
 
 """
@@ -643,16 +676,19 @@ In-place variant for render loops: writes into a caller-owned `img`
 allocates nothing per frame.
 """
 function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
-                            spacetime::Schwarzschild; fisheye_deg::Real=0.0)
+                            spacetime::Schwarzschild; fisheye_deg::Real=0.0,
+                            relativistic::Bool=false)
     img = Matrix{RGBf}(undef, ctx.width, ctx.height)
     host = Array{Float32,3}(undef, 3, ctx.width, ctx.height)
     return render_preview_mtl!(img, host, ctx, cam, spacetime;
-                               fisheye_deg=fisheye_deg)
+                               fisheye_deg=fisheye_deg,
+                               relativistic=relativistic)
 end
 
 function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              ctx::MetalPreviewContext, cam::Camera,
-                             spacetime::Schwarzschild; fisheye_deg::Real=0.0)
+                             spacetime::Schwarzschild; fisheye_deg::Real=0.0,
+                             relativistic::Bool=false)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -669,7 +705,8 @@ function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
     # Update reusable GPU parameter buffers with a single host-to-device copy.
     copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
                                            fisheye_deg=fisheye_deg))
-    copyto!(ctx.spacetime_params, Float32[M, r_band, r_escape])
+    copyto!(ctx.spacetime_params,
+            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
 
     fill!(ctx.out_gpu, 0.0f0)
     _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params, ctx.spacetime_params,
@@ -743,7 +780,9 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           samples::Int=2, dt::Real=0.02,
                           rng::Random.AbstractRNG=Random.default_rng(),
                           progress::Union{Function,Nothing}=nothing,
-                          fisheye_deg::Real=0.0)
+                          fisheye_deg::Real=0.0,
+                          aperture_world::Real=0.0, focus_dist::Real=1.0,
+                          relativistic::Bool=false)
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
@@ -755,11 +794,16 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
 
     # Own parameter buffers: preview frames may update ctx's buffers while the
     # draft's tiles are still dispatching.
-    cam_params = MtlVector{Float32}(undef, 22)
-    spacetime_params = MtlVector{Float32}(undef, 3)
-    copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
-                                       fisheye_deg=fisheye_deg))
-    copyto!(spacetime_params, Float32[M, r_band, r_escape])
+    cam_params = MtlVector{Float32}(undef, 25)
+    spacetime_params = MtlVector{Float32}(undef, 4)
+    base_params = _ks_cam_params(cam, spacetime.M; fisheye_deg=fisheye_deg,
+                                 focus_dist=focus_dist)
+    copyto!(cam_params, base_params)
+    copyto!(spacetime_params,
+            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
+    # Depth of field: each supersampling pass gets its own aperture sample,
+    # so `samples²` passes double as the bokeh samples. Fisheye stays pinhole.
+    use_dof = aperture_world > 0.0 && fisheye_deg <= 0.0
 
     out = MtlArray{Float32,3}(undef, 3, width, height)
     fill!(out, 0.0f0)
@@ -775,6 +819,12 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     ndispatch = length(offsets) * ntiles
     done = 0
     for (du, dv) in offsets
+        if use_dof
+            ldr, ldu = sample_lens_point(aperture_world, rng)
+            base_params[23] = Float32(ldr)
+            base_params[24] = Float32(ldu)
+            copyto!(cam_params, base_params)
+        end
         for t in 0:(ntiles - 1)
             row0 = t * rows_per_tile
             rows = min(rows_per_tile, height - row0)
@@ -794,7 +844,10 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::ThinLensCamera,
                           spacetime::Schwarzschild; kwargs...)
     fov = (cam.sensor_width / 2.0) / cam.focal_length
     pinhole = Camera(cam.pos, cam.pos + cam.fwd, cam.up_local, fov)
-    return render_draft_mtl(ctx, pinhole, spacetime; kwargs...)
+    # Same world-space aperture as the CPU get_ray: diameter = focus/f_number.
+    ap = cam.aperture * cam.focus_distance / cam.focal_length
+    return render_draft_mtl(ctx, pinhole, spacetime; kwargs...,
+                            aperture_world=ap, focus_dist=cam.focus_distance)
 end
 
 function render_preview_mtl(ctx::MetalPreviewContext, cam::ThinLensCamera,

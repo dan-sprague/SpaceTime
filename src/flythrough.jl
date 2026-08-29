@@ -23,8 +23,8 @@ recompiles.
 function _fly_resolution_ctx(base::MetalPreviewContext, width::Int, height::Int)
     MetalPreviewContext(base.bg_gpu,
                         MtlArray{Float32,3}(undef, 3, width, height),
-                        MtlVector{Float32}(undef, 20),
-                        MtlVector{Float32}(undef, 3),
+                        MtlVector{Float32}(undef, 25),
+                        MtlVector{Float32}(undef, 4),
                         base.disc_params, base.bb_lut, base.vol_gpu,
                         base.vol_params, width, height, base.dt, base.nmax,
                         base.r_escape_factor, base.has_volume, base.vol_on,
@@ -91,6 +91,9 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # escape porthole — its angular radius never drops below ~80° on the dive,
     # beyond any rectilinear focal length.
     fisheye_obs = Observable(0.0)
+    # Relativistic shading: gravitational blueshift + Doppler of the camera
+    # applied to the sky (Planck-locus tint + brightness) and disc.
+    rel_obs = Observable(false)
     focal_obs = Observable(24.0)
     move_speed_obs = Observable(2.0)
     auto_speed_obs = Observable(true)
@@ -159,7 +162,8 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                         flip = !flip
                         render_preview_mtl!(flip ? ia : ib, host, ctx_now,
                                             cam_now, spacetime;
-                                            fisheye_deg=fisheye_obs[])
+                                            fisheye_deg=fisheye_obs[],
+                                            relativistic=rel_obs[])
                     catch e
                         e isa InvalidStateException && rethrow()
                         @error "Flythrough frame failed" exception=(e, catch_backtrace())
@@ -318,54 +322,138 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
         end
     end
 
-    # Save the current view as a 4K linear HDR raw (32-bit float TIFF +
-    # TOML sidecar) for the standalone post app. The draft renderer uses its
-    # own parameter buffers, so the live preview keeps running while it
-    # traces; disc/volume/lens state is honoured automatically.
-    raw_btn = Button(bar[1, 15]; label="Save raw")
-    saving_raw = Ref(false)
-    on(raw_btn.clicks) do _
-        saving_raw[] && return
-        saving_raw[] = true
+    # Render row: trace-time camera options (depth of field cannot be added
+    # in post) plus the two offline renderers. Both save 4K linear HDR raws
+    # (32-bit float TIFF + TOML sidecar) for the standalone post app; the
+    # live preview keeps running while a render traces.
+    Label(bar[2, 1], "Thin lens"; halign=:right)
+    tl_toggle = Toggle(bar[2, 2]; active=false)
+    Label(bar[2, 3], "f/"; halign=:right)
+    fnum_sl = Slider(bar[2, 4]; range=1.0:0.1:22.0, startvalue=2.8, width=110)
+    Label(bar[2, 5], "Focus (M)"; halign=:right)
+    focus_sl = Slider(bar[2, 6]; range=0.5:0.5:60.0, startvalue=27.0, width=110)
+    gpu_btn = Button(bar[2, 7]; label="GPU render")
+    cpu_btn = Button(bar[2, 8]; label="CPU render")
+    rel_toggle = Toggle(bar[2, 9]; active=false)
+    Label(bar[2, 10], "Rel. shading"; halign=:left)
+    on(rel_toggle.active) do a
+        rel_obs[] = a
+        request_render()
+    end
+
+    rendering = Ref(false)
+    function render_metadata(cam_now, fe, ap, extra)
+        merge!(Dict{String,Any}(
+            "camera_pos" => collect(cam_now.pos),
+            "camera_fwd" => collect(cam_now.fwd),
+            "camera_up" => collect(cam_now.up_local),
+            "fov_factor" => cam_now.fov_factor,
+            "fisheye_deg" => fe, "M" => spacetime.M,
+            "aperture_world" => ap, "focus_dist" => focus_sl.value[],
+            "disc" => disc_on[], "volumetric" => base_ctx.vol_on[]), extra)
+    end
+
+    on(gpu_btn.clicks) do _
+        rendering[] && return
+        rendering[] = true
         cam_now = build_camera()
         fe = fisheye_obs[]
+        ap = tl_toggle.active[] ? focus_sl.value[] / fnum_sl.value[] : 0.0
+        tl_toggle.active[] && fe > 0.0 &&
+            (status_obs[] = "Note: DoF is ignored with a fisheye lens")
+        # With DoF each supersampling pass is one bokeh sample, so trace more.
+        smp = (ap > 0.0 && fe <= 0.0) ? 4 : 2
+        focusd = focus_sl.value[]
         fname = "flyraw_" * Dates.format(Dates.now(), "yyyymmdd_HHMMSS") * ".tiff"
-        raw_btn.label[] = "Tracing…"
+        gpu_btn.label[] = "Tracing…"
         result = Channel{Any}(1)
         Threads.@spawn begin
             try
                 img = render_draft_mtl(base_ctx, cam_now, spacetime;
-                                       width=3840, height=2160, samples=2,
-                                       dt=0.02, fisheye_deg=fe)
-                save_raw(fname, img; metadata=Dict{String,Any}(
-                    "camera_pos" => collect(cam_now.pos),
-                    "camera_fwd" => collect(cam_now.fwd),
-                    "camera_up" => collect(cam_now.up_local),
-                    "fov_factor" => cam_now.fov_factor,
-                    "fisheye_deg" => fe,
-                    "M" => spacetime.M,
-                    "width" => 3840, "height" => 2160,
-                    "samples" => 2, "dt" => 0.02,
-                    "disc" => disc_on[],
-                    "volumetric" => base_ctx.vol_on[]))
+                                       width=3840, height=2160, samples=smp,
+                                       dt=0.02, fisheye_deg=fe,
+                                       aperture_world=ap, focus_dist=focusd,
+                                       relativistic=rel_obs[])
+                save_raw(fname, img; metadata=render_metadata(cam_now, fe, ap,
+                    Dict{String,Any}("renderer" => "gpu_draft",
+                                     "width" => 3840, "height" => 2160,
+                                     "samples" => smp, "dt" => 0.02,
+                                     "relativistic" => rel_obs[])))
                 put!(result, (:ok, fname))
             catch e
-                @error "Raw save failed" exception=(e, catch_backtrace())
+                @error "GPU render failed" exception=(e, catch_backtrace())
                 put!(result, (:error, e))
             end
         end
         @async begin
             res = take!(result)
-            saving_raw[] = false
-            raw_btn.label[] = "Save raw"
+            rendering[] = false
+            gpu_btn.label[] = "GPU render"
             status_obs[] = res[1] === :ok ?
-                "Saved: $(res[2]) (+ .toml) — grade it with postprocessor(\"$(res[2])\")" :
-                "Raw save error (see terminal)"
+                "Saved: $(res[2]) (+ .toml) — grade with post_demo.jl" :
+                "GPU render error (see terminal)"
         end
     end
 
-    Label(bar[2, 1:8], status_obs; halign=:left, fontsize=13, color=:gray)
-    Label(bar[3, 1:8],
+    # CPU reference render: full Float64 adaptive integration with dust-free
+    # scene as configured. Spherical chart + static camera: exterior,
+    # rectilinear only.
+    cpu_progress = Threads.Atomic{Float64}(0.0)
+    on(cpu_btn.clicks) do _
+        rendering[] && return
+        fisheye_obs[] > 0.0 &&
+            (status_obs[] = "CPU renderer is rectilinear only — switch Lens"; return)
+        r_cam = lock(state_lock) do
+            norm(state.pos)
+        end
+        r_cam < 2.6 * M &&
+            (status_obs[] = "CPU renderer needs r > 2.6M (spherical chart)"; return)
+        rendering[] = true
+        cam_cpu = lock(state_lock) do
+            camera_from_state(state, focal_obs[], fnum_sl.value[],
+                              focus_sl.value[], tl_toggle.active[])
+        end
+        ap = tl_toggle.active[] ? focus_sl.value[] / fnum_sl.value[] : 0.0
+        disc_now = disc_on[] ? disc : nothing
+        vol_now = base_ctx.vol_on[] ? volume : nothing
+        fname = "flyraw_cpu_" * Dates.format(Dates.now(), "yyyymmdd_HHMMSS") * ".tiff"
+        cpu_btn.label[] = "Tracing…"
+        Threads.atomic_xchg!(cpu_progress, 0.0)
+        result = Channel{Any}(1)
+        Threads.@spawn begin
+            try
+                img = render(cam_cpu, spacetime, background;
+                             disc=disc_now, volume=vol_now,
+                             width=1920, height=1080, samples=2,
+                             progress=p -> (Threads.atomic_xchg!(cpu_progress,
+                                                                 Float64(p)); nothing))
+                save_raw(fname, img; metadata=render_metadata(cam_cpu, 0.0, ap,
+                    Dict{String,Any}("renderer" => "cpu",
+                                     "width" => 1920, "height" => 1080,
+                                     "samples" => 2)))
+                put!(result, (:ok, fname))
+            catch e
+                @error "CPU render failed" exception=(e, catch_backtrace())
+                put!(result, (:error, e))
+            end
+        end
+        @async begin
+            while !isready(result)
+                status_obs[] = string("CPU render: ",
+                                      round(Int, 100 * cpu_progress[]), "%")
+                sleep(0.25)
+            end
+            res = take!(result)
+            rendering[] = false
+            cpu_btn.label[] = "CPU render"
+            status_obs[] = res[1] === :ok ?
+                "Saved: $(res[2]) (+ .toml) — grade with post_demo.jl" :
+                "CPU render error (see terminal)"
+        end
+    end
+
+    Label(bar[3, 1:8], status_obs; halign=:left, fontsize=13, color=:gray)
+    Label(bar[4, 1:8],
           "Drag: look · Scroll: dolly · WASD: move · Q/E: down/up · Z/C: roll · Shift: fast";
           halign=:left, fontsize=12, color=:gray)
 
