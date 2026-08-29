@@ -70,7 +70,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
                               volume::Union{DiscVolume,Nothing}=nothing)
     bg_gpu = _upload_background(background)
     out_gpu = MtlArray{Float32,3}(undef, 3, width, height)
-    cam_params = MtlVector{Float32}(undef, 20)
+    cam_params = MtlVector{Float32}(undef, 22)
     spacetime_params = MtlVector{Float32}(undef, 3)
     disc_params = MtlVector{Float32}(undef, 6)
     if isnothing(disc)
@@ -309,13 +309,27 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     u = (Float32(i) - 1.0f0 + jitter_u - Float32(width) / 2.0f0) / half_h
     v = (Float32(j) - 1.0f0 + jitter_v - Float32(height) / 2.0f0) / half_h
 
-    # Pixel direction as unit coefficients on the camera tetrad axes.
-    dx_local = u * fov
-    dy_local = v * fov
-    ν = sqrt(dx_local * dx_local + dy_local * dy_local + 1.0f0)
-    cr = dx_local / ν
-    cu = dy_local / ν
-    cf = 1.0f0 / ν
+    # Pixel direction as unit coefficients on the camera tetrad axes:
+    # rectilinear pinhole, or equidistant fisheye (angle ∝ pixel radius).
+    cr = 0.0f0
+    cu = 0.0f0
+    cf = 1.0f0
+    if cam_params[21] > 0.5f0
+        ρ = sqrt(u * u + v * v)
+        θp = ρ * cam_params[22]
+        sθ = sin(θp)
+        inv_ρ = ρ > 1.0f-8 ? 1.0f0 / ρ : 0.0f0
+        cr = sθ * u * inv_ρ
+        cu = sθ * v * inv_ρ
+        cf = cos(θp)
+    else
+        dx_local = u * fov
+        dy_local = v * fov
+        ν = sqrt(dx_local * dx_local + dy_local * dy_local + 1.0f0)
+        cr = dx_local / ν
+        cu = dy_local / ν
+        cf = 1.0f0 / ν
+    end
 
     # Received photon p = ω(u + n); trace q = n − u, i.e. backward in time
     # (regular through the horizon in both directions). Lower the index:
@@ -581,12 +595,19 @@ end
 # Public API
 # ---------------------------------------------------------------------------
 
-"""20-float camera parameter block: position, fov, and the KS tetrad."""
-function _ks_cam_params(cam::Camera, M::Float64)
+"""
+22-float camera parameter block: position, fov, the KS tetrad, and the
+projection. `fisheye_deg > 0` selects an equidistant fisheye with that
+vertical half-angle at the image's top edge (pixel radius ∝ view angle, so
+fields wider than 180° render cleanly — a rectilinear pinhole caps below
+180° at any focal length).
+"""
+function _ks_cam_params(cam::Camera, M::Float64; fisheye_deg::Real=0.0)
     u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
                                       cam.up_local, M)
     return Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
-                   Ef..., Er..., Eu..., u4...]
+                   Ef..., Er..., Eu..., u4...,
+                   fisheye_deg > 0 ? 1.0 : 0.0, deg2rad(max(fisheye_deg, 0.0))]
 end
 
 """
@@ -604,15 +625,16 @@ In-place variant for render loops: writes into a caller-owned `img`
 allocates nothing per frame.
 """
 function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
-                            spacetime::Schwarzschild)
+                            spacetime::Schwarzschild; fisheye_deg::Real=0.0)
     img = Matrix{RGBf}(undef, ctx.width, ctx.height)
     host = Array{Float32,3}(undef, 3, ctx.width, ctx.height)
-    return render_preview_mtl!(img, host, ctx, cam, spacetime)
+    return render_preview_mtl!(img, host, ctx, cam, spacetime;
+                               fisheye_deg=fisheye_deg)
 end
 
 function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              ctx::MetalPreviewContext, cam::Camera,
-                             spacetime::Schwarzschild)
+                             spacetime::Schwarzschild; fisheye_deg::Real=0.0)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -627,7 +649,8 @@ function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                20_000)
 
     # Update reusable GPU parameter buffers with a single host-to-device copy.
-    copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M))
+    copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
+                                           fisheye_deg=fisheye_deg))
     copyto!(ctx.spacetime_params, Float32[M, r_band, r_escape])
 
     fill!(ctx.out_gpu, 0.0f0)
@@ -701,7 +724,8 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           width::Int=1920, height::Int=1080,
                           samples::Int=2, dt::Real=0.02,
                           rng::Random.AbstractRNG=Random.default_rng(),
-                          progress::Union{Function,Nothing}=nothing)
+                          progress::Union{Function,Nothing}=nothing,
+                          fisheye_deg::Real=0.0)
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
@@ -713,9 +737,10 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
 
     # Own parameter buffers: preview frames may update ctx's buffers while the
     # draft's tiles are still dispatching.
-    cam_params = MtlVector{Float32}(undef, 20)
+    cam_params = MtlVector{Float32}(undef, 22)
     spacetime_params = MtlVector{Float32}(undef, 3)
-    copyto!(cam_params, _ks_cam_params(cam, spacetime.M))
+    copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
+                                       fisheye_deg=fisheye_deg))
     copyto!(spacetime_params, Float32[M, r_band, r_escape])
 
     out = MtlArray{Float32,3}(undef, 3, width, height)
@@ -763,8 +788,8 @@ end
 
 function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              ctx::MetalPreviewContext, cam::ThinLensCamera,
-                             spacetime::Schwarzschild)
+                             spacetime::Schwarzschild; kwargs...)
     fov = (cam.sensor_width / 2.0) / cam.focal_length
     pinhole = Camera(cam.pos, cam.pos + cam.fwd, cam.up_local, fov)
-    return render_preview_mtl!(img, host, ctx, pinhole, spacetime)
+    return render_preview_mtl!(img, host, ctx, pinhole, spacetime; kwargs...)
 end

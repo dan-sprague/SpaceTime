@@ -86,6 +86,11 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # ------------------------------------------------------------------
     state = FlyCamState(cam)
     state_lock = ReentrantLock()
+    # Swappable lens: 0 = rectilinear (focal slider applies); > 0 = equidistant
+    # fisheye with that vertical half-angle. Fisheye is what frames the whole
+    # escape porthole — its angular radius never drops below ~80° on the dive,
+    # beyond any rectilinear focal length.
+    fisheye_obs = Observable(0.0)
     focal_obs = Observable(24.0)
     move_speed_obs = Observable(2.0)
     auto_speed_obs = Observable(true)
@@ -153,7 +158,8 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                         end
                         flip = !flip
                         render_preview_mtl!(flip ? ia : ib, host, ctx_now,
-                                            cam_now, spacetime)
+                                            cam_now, spacetime;
+                                            fisheye_deg=fisheye_obs[])
                     catch e
                         e isa InvalidStateException && rethrow()
                         @error "Flythrough frame failed" exception=(e, catch_backtrace())
@@ -281,6 +287,19 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
             set_volume_enabled!(base_ctx, a)   # vol_on is shared by every ctx
             request_render()
         end
+    end
+
+    Label(bar[1, 11], "Lens"; halign=:right)
+    lens_menu = Menu(bar[1, 12];
+                     options=[("Rectilinear", 0.0),
+                              ("Fisheye 180°", 90.0),
+                              ("Fisheye 235°", 117.5)],
+                     default="Rectilinear", width=140)
+    on(lens_menu.selection) do deg
+        isnothing(deg) && return
+        fisheye_obs[] = deg
+        request_render()
+        return nothing
     end
 
     Label(bar[2, 1:8], status_obs; halign=:left, fontsize=13, color=:gray)
