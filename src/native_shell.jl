@@ -42,7 +42,10 @@ end
 #   [5] vignette  [6:8] white-balance gains (r, g, b)
 #   [9] bloom strength [10] bloom threshold [11] tonemap hue-preserve k
 #   [12] gamma power (0.4545 = sRGB; 5 = the gamma-0.2 crush)
-#   [13] grain amount  [14] streak fraction of scattered light  [15:16] spare
+#   [13] grain amount  [14] streak fraction of scattered light
+#   [15] streak peak gain (compensates the quarter-res line width — the
+#        video's FFT streaks are pixel-thin and ~4× brighter per pixel)
+#   [16] spare
 
 # Per-channel bright-pass 4×4 box downsample into the quarter-res source
 # (matches postprocess(): bright = max(c·ev − threshold, 0)).
@@ -102,8 +105,8 @@ function _streak_kernel!(dst, src, BW, BH, L)
     while d < 4
         dx = d == 0 ? 1.0f0 : d == 1 ? 0.7071f0 : d == 2 ? 0.0f0 : -0.7071f0
         dy = d == 0 ? 0.0f0 : d == 1 ? 0.7071f0 : d == 2 ? 1.0f0 : 0.7071f0
-        for t in 1:24
-            s = Float32(t) * 2.5f0
+        for t in 1:16
+            s = Float32(t) * 4.0f0
             w = exp(-s * invL)
             for sgn in (-1.0f0, 1.0f0)
                 sx = clamp(unsafe_trunc(Int32, Float32(x) + sgn * s * dx),
@@ -185,81 +188,84 @@ function _pack_bgra_kernel!(dst, src, bloomg, bloomw, blooms,
     i > W * H && return
     x = (i - 1) % W + 1
     j = H - (i - 1) ÷ W
-    e = grade[1] * escale
-    r = src[1, x, j] * e * grade[6]
-    g = src[2, x, j] * e * grade[7]
-    b = src[3, x, j] * e * grade[8]
+    # One-time register loads of the grade block (device-memory reads inside
+    # the hot path below would repeat per use).
+    g_exp = grade[1]; g_film = grade[2]; g_crush = grade[3]
+    g_sat = grade[4]; g_vig = grade[5]
+    g_wbr = grade[6]; g_wbg = grade[7]; g_wbb = grade[8]
+    g_bloom = grade[9]; g_hue = grade[11]; g_gp = grade[12]
+    g_grain = grade[13]; g_sfrac = grade[14]; g_sgain = grade[15]
+    e = g_exp * escale
+    r = src[1, x, j] * e * g_wbr
+    g = src[2, x, j] * e * g_wbg
+    b = src[3, x, j] * e * g_wbb
     r = r == r ? r : 0.0f0
     g = g == g ? g : 0.0f0
     b = b == b ? b : 0.0f0
-    if grade[9] > 0.0f0
+    if g_bloom > 0.0f0
         # Scattered light: Gaussian core + wide stage (Moffat-like tails),
         # plus the streak pass, split by the streak fraction.
-        sfrac = grade[14]
-        bfrac = 1.0f0 - sfrac
+        bfrac = 1.0f0 - g_sfrac
         fx = (Float32(x) - 0.5f0) * Float32(BW) / Float32(W) + 0.5f0
         fy = (Float32(j) - 0.5f0) * Float32(BH) / Float32(H) + 0.5f0
         wx = (Float32(x) - 0.5f0) * Float32(WW) / Float32(W) + 0.5f0
         wy = (Float32(j) - 0.5f0) * Float32(WH) / Float32(H) + 0.5f0
-        s = grade[9]
         for c in 1:3
             core = _grade_bilinear(bloomg, c, fx, fy, BW, BH)
             wide = _grade_bilinear(bloomw, c, wx, wy, WW, WH)
             bl = bfrac * (0.6f0 * core + 0.4f0 * wide)
-            if sfrac > 0.0f0
-                bl += sfrac * _grade_bilinear(blooms, c, fx, fy, BW, BH)
+            if g_sfrac > 0.0f0
+                bl += g_sfrac * g_sgain *
+                      _grade_bilinear(blooms, c, fx, fy, BW, BH)
             end
             if c == 1
-                r += s * bl
+                r += g_bloom * bl
             elseif c == 2
-                g += s * bl
+                g += g_bloom * bl
             else
-                b += s * bl
+                b += g_bloom * bl
             end
         end
     end
     l = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
-    sat = grade[4]
-    r = max(l + sat * (r - l), 0.0f0)
-    g = max(l + sat * (g - l), 0.0f0)
-    b = max(l + sat * (b - l), 0.0f0)
-    if grade[2] > 0.5f0
+    r = max(l + g_sat * (r - l), 0.0f0)
+    g = max(l + g_sat * (g - l), 0.0f0)
+    b = max(l + g_sat * (b - l), 0.0f0)
+    if g_film > 0.5f0
         # ACES per channel, blended with the hue-preserving variant
         # (tonemap the luminance, rescale the triple) by grade[11] —
         # postprocess()'s tonemap_hue_preserve.
-        k = grade[11]
         pr = _aces(r); pg = _aces(g); pb = _aces(b)
-        if k > 0.0f0
+        if g_hue > 0.0f0
             Y = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
             sY = _aces(Y) / max(Y, 1.0f-8)
-            r = (1.0f0 - k) * pr + k * clamp(r * sY, 0.0f0, 1.0f0)
-            g = (1.0f0 - k) * pg + k * clamp(g * sY, 0.0f0, 1.0f0)
-            b = (1.0f0 - k) * pb + k * clamp(b * sY, 0.0f0, 1.0f0)
+            r = (1.0f0 - g_hue) * pr + g_hue * clamp(r * sY, 0.0f0, 1.0f0)
+            g = (1.0f0 - g_hue) * pg + g_hue * clamp(g * sY, 0.0f0, 1.0f0)
+            b = (1.0f0 - g_hue) * pb + g_hue * clamp(b * sY, 0.0f0, 1.0f0)
         else
             r = pr; g = pg; b = pb
         end
-        gp = grade[12]
-        r = exp(log(max(r, 1.0f-6)) * gp)
-        g = exp(log(max(g, 1.0f-6)) * gp)
-        b = exp(log(max(b, 1.0f-6)) * gp)
+        r = exp(log(max(r, 1.0f-6)) * g_gp)
+        g = exp(log(max(g, 1.0f-6)) * g_gp)
+        b = exp(log(max(b, 1.0f-6)) * g_gp)
     end
-    if grade[3] != 1.0f0
-        r = exp(log(max(r, 1.0f-6)) * grade[3])
-        g = exp(log(max(g, 1.0f-6)) * grade[3])
-        b = exp(log(max(b, 1.0f-6)) * grade[3])
+    if g_crush != 1.0f0
+        r = exp(log(max(r, 1.0f-6)) * g_crush)
+        g = exp(log(max(g, 1.0f-6)) * g_crush)
+        b = exp(log(max(b, 1.0f-6)) * g_crush)
     end
-    if grade[13] > 0.0f0
+    if g_grain > 0.0f0
         # Sensor grain in display space (the video applies sensor_expose!
         # after the grade): luma-scaled, zero-mean.
         l2 = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
-        n = grade[13] * (_grain_hash(Int32(x), Int32(j)) - 0.5f0) *
+        n = g_grain * (_grain_hash(Int32(x), Int32(j)) - 0.5f0) *
             2.0f0 * sqrt(max(l2, 2.0f-3))
         r += n; g += n; b += n
     end
-    if grade[5] > 0.0f0
+    if g_vig > 0.0f0
         vu = (Float32(x) - 0.5f0 * Float32(W)) / (0.5f0 * Float32(H))
         vv = (Float32(j) - 0.5f0 * Float32(H)) / (0.5f0 * Float32(H))
-        f = max(1.0f0 - grade[5] * 0.25f0 * (vu * vu + vv * vv), 0.0f0)
+        f = max(1.0f0 - g_vig * 0.25f0 * (vu * vu + vv * vv), 0.0f0)
         r *= f; g *= f; b *= f
     end
     r = clamp(r, 0.0f0, 1.0f0)
@@ -344,11 +350,12 @@ function set_grade!(p::MetalPresenter; exposure::Real=p.grade_host[1],
                     hue_preserve::Real=p.grade_host[11],
                     gamma_power::Real=p.grade_host[12],
                     grain::Real=p.grade_host[13],
-                    streak_fraction::Real=p.grade_host[14])
+                    streak_fraction::Real=p.grade_host[14],
+                    streak_gain::Real=p.grade_host[15])
     p.grade_host .= Float32[exposure, filmic ? 1 : 0, crush, saturation,
                             vignette, wb[1], wb[2], wb[3], bloom,
                             bloom_threshold, hue_preserve, gamma_power,
-                            grain, streak_fraction, 0, 0]
+                            grain, streak_fraction, streak_gain, 0]
     copyto!(p.grade, p.grade_host)
     return nothing
 end
@@ -507,7 +514,8 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             set_grade!(presenter; exposure=exposure, filmic=filmic,
                        crush=1.0, saturation=1.0, vignette=0.0,
                        wb=(1.0, 1.0, 1.0), bloom=0.0, hue_preserve=0.0,
-                       gamma_power=0.4545, grain=0.0, streak_fraction=0.0)
+                       gamma_power=0.4545, grain=0.0, streak_fraction=0.0,
+                       streak_gain=1.0)
         elseif n == 2    # film: gentle warmth, bloom, vignette
             set_grade!(presenter; exposure=exposure, filmic=filmic,
                        crush=1.15, saturation=1.12, vignette=0.30,
@@ -529,7 +537,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                        crush=1.0, saturation=1.0, vignette=0.30,
                        wb=(1.0, 1.0, 1.0), bloom=1.0, bloom_threshold=1.0,
                        hue_preserve=0.75, gamma_power=5.0, grain=0.02,
-                       streak_fraction=0.667)
+                       streak_fraction=0.667, streak_gain=4.0)
         end
         grade_rev += 1
         return nothing
