@@ -59,7 +59,7 @@ end
 # the absolute photon-count scale of the shot-noise model: SNR at mid-gray and
 # base ISO is √(0.5·10000) ≈ 70, i.e. clean but not noiseless, and grain grows
 # photographically as ISO rises.
-const SENSOR_FULL_WELL_E = 10_000.0
+const SENSOR_FULL_WELL_E = 60_000.0   # modern full-frame sensor; sets shot-noise scale
 
 """
     add_sensor_noise!(image, settings::SensorSettings; rng=default_rng())
@@ -73,20 +73,20 @@ back. For colour images, noise is added independently to each channel.
 function add_sensor_noise!(image::Matrix{RGBf}, settings::SensorSettings;
                            rng::AbstractRNG=default_rng())
     e_per_unit = SENSOR_FULL_WELL_E * 100.0 / settings.iso
-    inv_e_per_unit = 1.0 / e_per_unit
     read_sigma = settings.read_noise_e
 
+    # Luminance-correlated grain: one Poisson deviate per pixel, applied as a
+    # common gain to all three channels. Independent per-channel deviates
+    # produce red/green chroma confetti that reads as pixelation — real
+    # post-demosaic sensor noise is luma-dominant.
     for idx in eachindex(image)
         c = image[idx]
-        r_e = _poisson_sample(rng, max(c.r * e_per_unit, 0.0)) + read_sigma * randn(rng)
-        g_e = _poisson_sample(rng, max(c.g * e_per_unit, 0.0)) + read_sigma * randn(rng)
-        b_e = _poisson_sample(rng, max(c.b * e_per_unit, 0.0)) + read_sigma * randn(rng)
-
-        image[idx] = RGBf(
-            max(r_e * inv_e_per_unit, 0.0),
-            max(g_e * inv_e_per_unit, 0.0),
-            max(b_e * inv_e_per_unit, 0.0)
-        )
+        Y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+        e_mean = max(Y * e_per_unit, 0.0)
+        e_obs = _poisson_sample(rng, e_mean) + read_sigma * randn(rng)
+        gain = max(e_obs, 0.0) / max(e_mean, 1.0)
+        image[idx] = RGBf(max(c.r * gain, 0.0), max(c.g * gain, 0.0),
+                          max(c.b * gain, 0.0))
     end
     return image
 end

@@ -85,7 +85,8 @@ the KS metric with forward first, so the look direction is exact.
 """
 function ks_camera_tetrad(pos::SVector{3,Float64}, fwd::SVector{3,Float64},
                           right::SVector{3,Float64}, up::SVector{3,Float64},
-                          M::Float64)
+                          M::Float64;
+                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
     r = norm(pos)
     x̂ = pos / r
     f = 2M / r
@@ -112,6 +113,24 @@ function ks_camera_tetrad(pos::SVector{3,Float64}, fwd::SVector{3,Float64},
     Eu = Eu + gdot(Eu, u) * u
     Eu = Eu - gdot(Eu, Ef) * Ef - gdot(Eu, Er) * Er
     Eu = Eu / sqrt(gdot(Eu, Eu))
+
+    # Optional Lorentz boost of the whole tetrad by the camera's 3-velocity
+    # `beta` (components along Ef/Er/Eu, |beta| < 1). Rays are initialised in
+    # the boosted frame, so aberration, motion Doppler, and beaming all follow
+    # from the standard machinery downstream (p_t carries the full shift).
+    b2 = dot(beta, beta)
+    if b2 > 1.0e-12
+        b2 = min(b2, 0.9801)                    # clamp |β| ≤ 0.99
+        β = beta * sqrt(b2 / dot(beta, beta))
+        γ = 1.0 / sqrt(1.0 - b2)
+        bE = β[1] * Ef + β[2] * Er + β[3] * Eu  # β^i e_i (4-vector)
+        u_b = γ * (u + bE)
+        k = (γ - 1.0) / b2
+        Ef_b = Ef + β[1] * (k * bE + γ * u)
+        Er_b = Er + β[2] * (k * bE + γ * u)
+        Eu_b = Eu + β[3] * (k * bE + γ * u)
+        return u_b, Ef_b, Er_b, Eu_b
+    end
     return u, Ef, Er, Eu
 end
 

@@ -70,7 +70,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
                               volume::Union{DiscVolume,Nothing}=nothing)
     bg_gpu = _upload_background(background)
     out_gpu = MtlArray{Float32,3}(undef, 3, width, height)
-    cam_params = MtlVector{Float32}(undef, 25)
+    cam_params = MtlVector{Float32}(undef, 28)
     spacetime_params = MtlVector{Float32}(undef, 4)
     disc_params = MtlVector{Float32}(undef, 6)
     if isnothing(disc)
@@ -327,6 +327,37 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     u = (Float32(i) - 1.0f0 + jitter_u - Float32(width) / 2.0f0) / half_h
     v = (Float32(j) - 1.0f0 + jitter_v - Float32(height) / 2.0f0) / half_h
 
+    # Thin-lens aperture offset, per-pixel stratified: cam_params[26] is the
+    # lens stratum width (0 = pinhole), [23:24] this pass's stratum origin in
+    # [0,1)², [27] the world-space aperture radius, [28] the pass seed. Each
+    # pixel hashes its own point inside the pass's stratum and maps it to the
+    # aperture disk with the Shirley–Chiu concentric map — without this, all
+    # pixels share one lens point per pass and stars render as `passes`
+    # stacked copies instead of smooth bokeh.
+    offr = 0.0f0
+    offu = 0.0f0
+    if cam_params[26] > 0.0f0
+        sd = unsafe_trunc(Int32, cam_params[28])
+        u01 = cam_params[23] + _sim_hash(Int32(i), Int32(j), sd) * cam_params[26]
+        v01 = cam_params[24] + _sim_hash(Int32(i), Int32(j), sd + Int32(7919)) *
+              cam_params[26]
+        ox = 2.0f0 * u01 - 1.0f0
+        oy = 2.0f0 * v01 - 1.0f0
+        if ox != 0.0f0 || oy != 0.0f0
+            rr = 0.0f0
+            θc = 0.0f0
+            if abs(ox) > abs(oy)
+                rr = ox
+                θc = 0.785398f0 * (oy / ox)
+            else
+                rr = oy
+                θc = 1.570796f0 - 0.785398f0 * (ox / oy)
+            end
+            offr = cam_params[27] * rr * cos(θc)
+            offu = cam_params[27] * rr * sin(θc)
+        end
+    end
+
     # Pixel direction as unit coefficients on the camera tetrad axes:
     # rectilinear pinhole, or equidistant fisheye (angle ∝ pixel radius).
     cr = 0.0f0
@@ -344,12 +375,8 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
         dx_local = u * fov
         dy_local = v * fov
         ν = sqrt(dx_local * dx_local + dy_local * dy_local + 1.0f0)
-        # Thin lens: cam_params[23:24] hold this pass's aperture offset
-        # (world units, zero for pinhole). The ray leaves the offset origin
-        # aimed at the pinhole ray's focal-plane point, exactly matching the
-        # CPU `get_ray(::ThinLensCamera, …)`.
-        offr = cam_params[23]
-        offu = cam_params[24]
+        # Thin lens: the ray leaves the offset origin aimed at the pinhole
+        # ray's focal-plane point, matching the CPU `get_ray(::ThinLensCamera)`.
         if offr != 0.0f0 || offu != 0.0f0
             k = ν / cam_params[25]   # 1 / (focus distance along the ray)
             dx_local -= offr * k
@@ -366,9 +393,9 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     # p_μ = η_μν q^ν + f l_μ (l_ν q^ν) with l_μ = (1, x̂).
     # The origin carries the aperture offset along the tetrad right/up axes
     # (zero for pinhole).
-    x = cx + cam_params[23] * er1 + cam_params[24] * eu1
-    y = cy + cam_params[23] * er2 + cam_params[24] * eu2
-    z = cz + cam_params[23] * er3 + cam_params[24] * eu3
+    x = cx + offr * er1 + offu * eu1
+    y = cy + offr * er2 + offu * eu2
+    z = cz + offr * er3 + offu * eu3
     r = sqrt(x * x + y * y + z * z)
     f = 2.0f0 * M / r
     qt = cf * ef0 + cr * er0 + cu * eu0 - ut0
@@ -645,20 +672,22 @@ end
 # ---------------------------------------------------------------------------
 
 """
-22-float camera parameter block: position, fov, the KS tetrad, and the
+28-float camera parameter block: position, fov, the KS tetrad, and the
 projection. `fisheye_deg > 0` selects an equidistant fisheye with that
 vertical half-angle at the image's top edge (pixel radius ∝ view angle, so
 fields wider than 180° render cleanly — a rectilinear pinhole caps below
 180° at any focal length).
 """
 function _ks_cam_params(cam::Camera, M::Float64; fisheye_deg::Real=0.0,
-                        focus_dist::Real=1.0)
+                        focus_dist::Real=1.0,
+                        beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
     u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
-                                      cam.up_local, M)
+                                      cam.up_local, M; beta=beta)
     return Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
                    Ef..., Er..., Eu..., u4...,
                    fisheye_deg > 0 ? 1.0 : 0.0, deg2rad(max(fisheye_deg, 0.0)),
-                   0.0, 0.0, focus_dist]   # per-pass lens offset + focus
+                   0.0, 0.0, focus_dist,
+                   0.0, 0.0, 0.0]   # lens stratum origin/width, radius, seed
 end
 
 """
@@ -782,7 +811,8 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           progress::Union{Function,Nothing}=nothing,
                           fisheye_deg::Real=0.0,
                           aperture_world::Real=0.0, focus_dist::Real=1.0,
-                          relativistic::Bool=false)
+                          relativistic::Bool=false,
+                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
@@ -794,10 +824,10 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
 
     # Own parameter buffers: preview frames may update ctx's buffers while the
     # draft's tiles are still dispatching.
-    cam_params = MtlVector{Float32}(undef, 25)
+    cam_params = MtlVector{Float32}(undef, 28)
     spacetime_params = MtlVector{Float32}(undef, 4)
     base_params = _ks_cam_params(cam, spacetime.M; fisheye_deg=fisheye_deg,
-                                 focus_dist=focus_dist)
+                                 focus_dist=focus_dist, beta=beta)
     copyto!(cam_params, base_params)
     copyto!(spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
@@ -818,11 +848,18 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     offsets = jittered_grid(samples; rng=rng)
     ndispatch = length(offsets) * ntiles
     done = 0
-    for (du, dv) in offsets
+    # Depth of field: each pass owns one aperture stratum (shuffled so lens
+    # strata pair randomly with the pixel-jitter strata) and every pixel
+    # hashes its own point inside it — see the kernel's stratified-lens block.
+    lens_perm = Random.randperm(rng, samples^2)
+    for (pass, (du, dv)) in enumerate(offsets)
         if use_dof
-            ldr, ldu = sample_lens_point(aperture_world, rng)
-            base_params[23] = Float32(ldr)
-            base_params[24] = Float32(ldu)
+            m = lens_perm[pass] - 1
+            base_params[23] = Float32((m ÷ samples) / samples)
+            base_params[24] = Float32((m % samples) / samples)
+            base_params[26] = Float32(1.0 / samples)
+            base_params[27] = Float32(aperture_world / 2.0)
+            base_params[28] = Float32(pass)
             copyto!(cam_params, base_params)
         end
         for t in 0:(ntiles - 1)
@@ -863,4 +900,142 @@ function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
     fov = (cam.sensor_width / 2.0) / cam.focal_length
     pinhole = Camera(cam.pos, cam.pos + cam.fwd, cam.up_local, fov)
     return render_preview_mtl!(img, host, ctx, pinhole, spacetime; kwargs...)
+end
+
+# ---------------------------------------------------------------------------
+# Asynchronous reprojection ("timewarp")
+# ---------------------------------------------------------------------------
+
+# One compiled warp pipeline serves every context (argument types are fixed).
+const _WARP_KERNEL = Ref{Any}(nothing)
+
+"""
+    warp_kernel_mtl!(out, prev, wp, width, height)
+
+Rotation-only reprojection of a previously traced frame: each output pixel's
+view direction (in the *new* camera basis) is expressed in the *previous*
+camera basis and mapped back through the lens to a source pixel, which is
+bilinearly sampled. Exact for pure rotation — turning the camera re-aims
+rays without creating information — and a one-frame approximation under
+translation, corrected by the next full trace.
+
+`wp` (22 floats): new fwd/right/up (9), prev fwd/right/up (9), fov,
+projection mode (>0.5 = fisheye), θ_edge (rad), pad.
+"""
+function warp_kernel_mtl!(out, prev, wp, width, height)
+    idx = thread_position_in_grid().x
+    idx > width * height && return
+    j = (idx - 1) ÷ width + 1
+    i = (idx - 1) % width + 1
+
+    half_h = Float32(height) / 2.0f0
+    u = (Float32(i) - 0.5f0 - Float32(width) / 2.0f0) / half_h
+    v = (Float32(j) - 0.5f0 - Float32(height) / 2.0f0) / half_h
+
+    fov = wp[19]
+    fe = wp[20] > 0.5f0
+    θe = wp[21]
+
+    # Pixel direction in the new camera basis.
+    cr = 0.0f0; cu = 0.0f0; cf = 1.0f0
+    if fe
+        ρ = sqrt(u * u + v * v)
+        θp = ρ * θe
+        sθ = sin(θp)
+        inv_ρ = ρ > 1.0f-8 ? 1.0f0 / ρ : 0.0f0
+        cr = sθ * u * inv_ρ
+        cu = sθ * v * inv_ρ
+        cf = cos(θp)
+    else
+        dx = u * fov; dy = v * fov
+        ν = sqrt(dx * dx + dy * dy + 1.0f0)
+        cr = dx / ν; cu = dy / ν; cf = 1.0f0 / ν
+    end
+    dx_w = cf * wp[1] + cr * wp[4] + cu * wp[7]
+    dy_w = cf * wp[2] + cr * wp[5] + cu * wp[8]
+    dz_w = cf * wp[3] + cr * wp[6] + cu * wp[9]
+
+    # Same direction in the previous camera basis.
+    a = dx_w * wp[10] + dy_w * wp[11] + dz_w * wp[12]   # · fwd_prev
+    b = dx_w * wp[13] + dy_w * wp[14] + dz_w * wp[15]   # · right_prev
+    c = dx_w * wp[16] + dy_w * wp[17] + dz_w * wp[18]   # · up_prev
+
+    uo = 0.0f0; vo = 0.0f0; valid = true
+    if fe
+        θ = acos(clamp(a, -1.0f0, 1.0f0))
+        s = sqrt(b * b + c * c)
+        if s < 1.0f-6
+            uo = 0.0f0; vo = 0.0f0
+            valid = θ < θe
+        else
+            ρo = θ / θe
+            uo = ρo * b / s
+            vo = ρo * c / s
+        end
+    else
+        if a < 0.02f0
+            valid = false
+        else
+            uo = (b / a) / fov
+            vo = (c / a) / fov
+        end
+    end
+
+    x = uo * half_h + Float32(width) / 2.0f0 + 0.5f0
+    y = vo * half_h + Float32(height) / 2.0f0 + 0.5f0
+    if !valid || x < 1.0f0 || x > Float32(width) || y < 1.0f0 || y > Float32(height)
+        out[1, i, j] = 0.0f0; out[2, i, j] = 0.0f0; out[3, i, j] = 0.0f0
+        return
+    end
+    x0 = clamp(unsafe_trunc(Int32, floor(x)), Int32(1), Int32(width - 1))
+    y0 = clamp(unsafe_trunc(Int32, floor(y)), Int32(1), Int32(height - 1))
+    tx = x - Float32(x0); ty = y - Float32(y0)
+    x1 = x0 + Int32(1); y1 = y0 + Int32(1)
+    w00 = (1.0f0 - tx) * (1.0f0 - ty); w10 = tx * (1.0f0 - ty)
+    w01 = (1.0f0 - tx) * ty;           w11 = tx * ty
+    out[1, i, j] = prev[1, x0, y0] * w00 + prev[1, x1, y0] * w10 +
+                   prev[1, x0, y1] * w01 + prev[1, x1, y1] * w11
+    out[2, i, j] = prev[2, x0, y0] * w00 + prev[2, x1, y0] * w10 +
+                   prev[2, x0, y1] * w01 + prev[2, x1, y1] * w11
+    out[3, i, j] = prev[3, x0, y0] * w00 + prev[3, x1, y0] * w10 +
+                   prev[3, x0, y1] * w01 + prev[3, x1, y1] * w11
+    return
+end
+
+"""
+    warp_preview_mtl!(img, host, ctx, warp_out, prev, warp_params,
+                      cam, prev_cam; fisheye_deg=0.0)
+
+Emit one reprojected frame: warps `prev` (a retained copy of the last traced
+`out_gpu`) from `prev_cam`'s orientation to `cam`'s, downloading into the
+caller-owned `img`/`host` like `render_preview_mtl!`. `warp_out` is a
+`(3, width, height)` MtlArray and `warp_params` a 22-float MtlVector, both
+caller-retained.
+"""
+function warp_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
+                           ctx::MetalPreviewContext, warp_out, prev,
+                           warp_params, cam::Camera, prev_cam::Camera;
+                           fisheye_deg::Real=0.0)
+    copyto!(warp_params,
+            Float32[cam.fwd..., cam.right..., cam.up_local...,
+                    prev_cam.fwd..., prev_cam.right..., prev_cam.up_local...,
+                    cam.fov_factor,
+                    fisheye_deg > 0 ? 1.0 : 0.0,
+                    deg2rad(max(fisheye_deg, 0.0)), 0.0])
+    if _WARP_KERNEL[] === nothing
+        _WARP_KERNEL[] = @metal launch=false warp_kernel_mtl!(warp_out, prev,
+                                                              warp_params,
+                                                              ctx.width,
+                                                              ctx.height)
+    end
+    kern = _WARP_KERNEL[]
+    n = ctx.width * ctx.height
+    threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
+    kern(warp_out, prev, warp_params, ctx.width, ctx.height;
+         threads=threads, groups=cld(n, threads))
+    copyto!(host, warp_out)
+    @inbounds for j in 1:ctx.height, i in 1:ctx.width
+        img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
+    end
+    return img
 end

@@ -74,19 +74,23 @@ function init_photon(origin::SVector{3,Float64}, direction::SVector{3,Float64},
     ϕ = atan(y, x)
     q0 = @SVector [0.0, r, θ, ϕ]
 
-    # Project unit direction onto spherical basis vectors.
-    vr = dx * sin(θ) * cos(ϕ) + dy * sin(θ) * sin(ϕ) + dz * cos(θ)
-    vθ = (dx * cos(θ) * cos(ϕ) + dy * cos(θ) * sin(ϕ) - dz * sin(θ)) / r
-    vϕ = (-dx * sin(ϕ) + dy * cos(ϕ)) / (r * sin(θ))
+    # Unit projections onto the local orthonormal spherical axes (r̂, θ̂, ϕ̂).
+    nr = dx * sin(θ) * cos(ϕ) + dy * sin(θ) * sin(ϕ) + dz * cos(θ)
+    nθ = dx * cos(θ) * cos(ϕ) + dy * cos(θ) * sin(ϕ) - dz * sin(θ)
+    nϕ = -dx * sin(ϕ) + dy * cos(ϕ)
 
     g_inv = metric_inverse(spacetime, q0)
 
-    pr = vr / g_inv[2,2]
-    pθ = vθ / g_inv[3,3]
-    pϕ = vϕ / g_inv[4,4]
-
-    spatial_part = g_inv[2,2]*pr^2 + g_inv[3,3]*pθ^2 + g_inv[4,4]*pϕ^2
-    pt = -sqrt(abs(spatial_part / g_inv[1,1]))
+    # Static-observer orthonormal tetrad for a diagonal metric: e_î = √(g^ii) ∂_i,
+    # e_t̂ = √(−g^tt) ∂_t. A unit-local-frequency photon p = e_t̂ + n^î e_î then has
+    # lowered components p_i = n_î / √(g^ii) and p_t = −1/√(−g^tt) (the conserved,
+    # gravitationally redshifted energy). Sensor angles are thereby proper angles
+    # in the static observer's frame — matching the GPU kernel's tetrad — rather
+    # than coordinate angles, which stretch radially near the horizon.
+    pt = -1.0 / sqrt(abs(g_inv[1,1]))
+    pr = nr / sqrt(abs(g_inv[2,2]))
+    pθ = nθ / sqrt(abs(g_inv[3,3]))
+    pϕ = nϕ / sqrt(abs(g_inv[4,4]))
 
     return vcat(q0, SVector(pt, pr, pθ, pϕ))
 end
@@ -98,8 +102,10 @@ Convenience wrapper that samples a ray from `cam` at normalised sensor
 coordinates `(u, v)` and converts it to a photon state vector.
 """
 function init_photon(cam::AbstractCamera, spacetime::AbstractSpacetime, u, v;
-                     rng::Random.AbstractRNG=Random.default_rng())
-    origin, direction = get_ray(cam, u, v, rng)
+                     rng::Random.AbstractRNG=Random.default_rng(),
+                     lens::Union{Nothing, NTuple{2, Float64}}=nothing)
+    origin, direction = lens === nothing ? get_ray(cam, u, v, rng) :
+                        get_ray(cam, u, v, rng, lens)
     init_photon(origin, direction, spacetime)
 end
 
@@ -175,8 +181,9 @@ Trace one sample through `(u, v)` and return the accumulated RGB colour.
 function _trace_color(integrator, meta, cam::AbstractCamera,
                       spacetime::Schwarzschild, background, disc, u, v;
                       rng::Random.AbstractRNG=Random.default_rng(),
-                      dust::Union{InterstellarDust,Nothing}=nothing)
-    μ0 = init_photon(cam, spacetime, u, v; rng)
+                      dust::Union{InterstellarDust,Nothing}=nothing,
+                      lens::Union{Nothing, NTuple{2, Float64}}=nothing)
+    μ0 = init_photon(cam, spacetime, u, v; rng, lens)
 
     meta.acc_color = RGBf(0, 0, 0)
     meta.alpha = 1.0
@@ -269,7 +276,9 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
 
     nchunks = _render_nchunks()
     thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf, 0.0, gcam) for _ in 1:nchunks]
-    thread_rngs = [copy(rng) for _ in 1:nchunks]
+    # Independently seeded per-chunk RNGs. `copy(rng)` would give every chunk
+    # the same stream, tiling one noise pattern across all chunks.
+    thread_rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nchunks]
     μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0; rng=rng)
     base_prob = ODEProblem(spacetime, μ0_dummy, tspan, (spacetime, thread_metas[1], disc))
     thread_integrators = [init(base_prob, solver, callback=cb_for(r_max),
@@ -277,10 +286,11 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                                reltol=1e-6, abstol=1e-6,
                                maxiters=50_000, verbose=false) for _ in 1:nchunks]
 
-    inv_samples2 = 1.0 / samples^2
-    subpixel_offsets = jittered ? jittered_grid(samples; rng=rng) :
-                       [(du, dv) for du in range(0.5/samples, 1.0, samples),
-                        dv in range(0.5/samples, 1.0, samples)]
+    n_sub = samples^2
+    inv_samples2 = 1.0 / n_sub
+    fixed_offsets = [(du, dv) for du in range(0.5/samples, 1.0, samples)
+                     for dv in range(0.5/samples, 1.0, samples)]
+    use_lens = cam isa ThinLensCamera
 
     progress_counter = Threads.Atomic{Int}(0)
     progress_interval = max(1, width ÷ 100)
@@ -289,14 +299,29 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
         integrator = thread_integrators[ci]
         meta = thread_metas[ci]
         local_rng = thread_rngs[ci]
+        pix_offs = Vector{NTuple{2, Float64}}(undef, n_sub)
+        lens_offs = Vector{NTuple{2, Float64}}(undef, n_sub)
         for i in cols
             for j in 1:height
+                # Fresh stratified jitter per pixel; a single grid reused for
+                # every pixel correlates the sampling image-wide.
+                jittered ? jittered_grid!(pix_offs, samples, local_rng) :
+                           copyto!(pix_offs, fixed_offsets)
+                if use_lens
+                    # Stratified aperture samples (concentric-mapped in
+                    # `get_ray`), shuffled so lens strata pair randomly with
+                    # subpixel strata.
+                    jittered_grid!(lens_offs, samples, local_rng)
+                    Random.shuffle!(local_rng, lens_offs)
+                end
                 pixel_color = RGBf(0, 0, 0)
-                for (du, dv) in subpixel_offsets
+                for k in 1:n_sub
+                    du, dv = pix_offs[k]
                     u, v = sensor_coordinate(i, j, width, height; du=du, dv=dv)
                     pixel_color += _trace_color(integrator, meta, cam, spacetime,
                                                 background, disc, u, v;
-                                                rng=local_rng, dust=dust)
+                                                rng=local_rng, dust=dust,
+                                                lens=use_lens ? lens_offs[k] : nothing)
                 end
                 image[i, j] = pixel_color * inv_samples2
             end
@@ -330,7 +355,7 @@ function render_no_doppler(cam::AbstractCamera, spacetime::AbstractSpacetime;
 
     nchunks = _render_nchunks()
     thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf, 0.0) for _ in 1:nchunks]
-    thread_rngs = [copy(rng) for _ in 1:nchunks]
+    thread_rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nchunks]
     μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0; rng=rng)
     base_prob = ODEProblem(spacetime, μ0_dummy, tspan, (spacetime, thread_metas[1]))
     thread_integrators = [init(base_prob, solver, callback=cb,
@@ -400,7 +425,7 @@ function render_motion(camera_at::Function, t0::Real, t1::Real,
         tspan = (0.0, max(10.0 * cam_dist, 500.0))
 
         thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf, 0.0) for _ in 1:nchunks]
-        thread_rngs = [copy(rng) for _ in 1:nchunks]
+        thread_rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nchunks]
         μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0; rng=rng)
         cb = isnothing(volume) ? make_cb_set(rm, disc) :
             CallbackSet(ContinuousCallback(make_boundary_condition(rm), horizon_affect!),

@@ -86,6 +86,30 @@ function sample_lens_point(aperture::Real, rng::Random.AbstractRNG=Random.defaul
 end
 
 """
+    concentric_disk(u, v)
+
+Shirley–Chiu low-distortion mapping from `(u, v) ∈ [0,1)²` to the unit disk
+(PBRT's `SampleUniformDiskConcentric`). Adjacent sample strata map to adjacent
+disk areas, so stratified lens samples cover the aperture far more evenly than
+independent uniform draws — much less defocus noise at the same ray count.
+"""
+function concentric_disk(u::Real, v::Real)
+    ox = 2.0 * u - 1.0
+    oy = 2.0 * v - 1.0
+    if ox == 0.0 && oy == 0.0
+        return 0.0, 0.0
+    end
+    if abs(ox) > abs(oy)
+        r = ox
+        θ = (π / 4) * (oy / ox)
+    else
+        r = oy
+        θ = π / 2 - (π / 4) * (ox / oy)
+    end
+    return r * cos(θ), r * sin(θ)
+end
+
+"""
     get_ray(cam::Camera, u, v)
     get_ray(cam::ThinLensCamera, u, v, rng=Random.default_rng())
 
@@ -132,23 +156,43 @@ function get_ray(cam::FisheyeCamera, u, v,
     return cam.pos, dir
 end
 
-function get_ray(cam::ThinLensCamera, u, v, rng::Random.AbstractRNG=Random.default_rng())
+function _thin_lens_ray(cam::ThinLensCamera, u, v, dx, dy)
     # Pinhole direction and the point it hits on the focal plane.
     pinhole_dir = get_ray_direction(Camera(cam.pos, cam.pos + cam.fwd,
                                            cam.up_local, cam.fov_factor), u, v)
     focal_point = cam.pos + cam.focus_distance * pinhole_dir
-
-    # Convert aperture from mm to world units.  The sensor half-width
-    # (sensor_width / 2) mm maps to fov_factor * focus_distance world units
-    # at the focal plane, so 1 mm = focus_distance / focal_length world units.
-    # The world-space aperture diameter then simplifies to focus_distance / f_number.
-    aperture_world = cam.aperture * cam.focus_distance / cam.focal_length
-    dx, dy = sample_lens_point(aperture_world, rng)
     origin = cam.pos + dx * cam.right + dy * cam.up_local
-
     direction = normalize(focal_point - origin)
     return origin, direction
 end
+
+# Convert aperture from mm to world units.  The sensor half-width
+# (sensor_width / 2) mm maps to fov_factor * focus_distance world units
+# at the focal plane, so 1 mm = focus_distance / focal_length world units.
+# The world-space aperture diameter then simplifies to focus_distance / f_number.
+_aperture_world(cam::ThinLensCamera) =
+    cam.aperture * cam.focus_distance / cam.focal_length
+
+function get_ray(cam::ThinLensCamera, u, v, rng::Random.AbstractRNG=Random.default_rng())
+    dx, dy = sample_lens_point(_aperture_world(cam), rng)
+    return _thin_lens_ray(cam, u, v, dx, dy)
+end
+
+"""
+    get_ray(cam, u, v, rng, lens::NTuple{2,Float64})
+
+Stratified-lens variant: `lens` is a sample in `[0,1)²` mapped onto the
+aperture disk via `concentric_disk`. Cameras without an aperture ignore it.
+"""
+function get_ray(cam::ThinLensCamera, u, v, rng::Random.AbstractRNG,
+                 lens::NTuple{2, Float64})
+    px, py = concentric_disk(lens[1], lens[2])
+    half = _aperture_world(cam) / 2.0
+    return _thin_lens_ray(cam, u, v, half * px, half * py)
+end
+
+get_ray(cam::AbstractCamera, u, v, rng::Random.AbstractRNG,
+        lens::NTuple{2, Float64}) = get_ray(cam, u, v, rng)
 
 # -----------------------------------------------------------------------------
 # Camera transforms
@@ -278,8 +322,19 @@ Divides the pixel into `samples × samples` cells and picks one random point
 inside each cell. This reduces aliasing compared to a regular grid.
 """
 function jittered_grid(samples::Int; rng::Random.AbstractRNG=Random.default_rng())
-    inv_s = 1.0 / samples
     offsets = Vector{NTuple{2, Float64}}(undef, samples * samples)
+    return jittered_grid!(offsets, samples, rng)
+end
+
+"""
+    jittered_grid!(offsets, samples, rng)
+
+In-place `jittered_grid` for per-pixel refresh without allocations. `offsets`
+must have length `samples^2`.
+"""
+function jittered_grid!(offsets::Vector{NTuple{2, Float64}}, samples::Int,
+                        rng::Random.AbstractRNG)
+    inv_s = 1.0 / samples
     idx = 1
     for si in 0:(samples-1), sj in 0:(samples-1)
         du = (si + rand(rng)) * inv_s

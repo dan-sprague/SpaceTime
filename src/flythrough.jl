@@ -23,7 +23,7 @@ recompiles.
 function _fly_resolution_ctx(base::MetalPreviewContext, width::Int, height::Int)
     MetalPreviewContext(base.bg_gpu,
                         MtlArray{Float32,3}(undef, 3, width, height),
-                        MtlVector{Float32}(undef, 25),
+                        MtlVector{Float32}(undef, 28),
                         MtlVector{Float32}(undef, 4),
                         base.disc_params, base.bb_lut, base.vol_gpu,
                         base.vol_params, width, height, base.dt, base.nmax,
@@ -127,6 +127,23 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     wakeup = Channel{Nothing}(1)
     img_chan = Channel{Tuple{Matrix{RGBf},Float64,Float64}}(1)
 
+    # Live fluid disc (Tier-2 turbulence): stepped by the render worker only,
+    # keeping all Metal work off thread 1. `live_flag` is set by the UI
+    # toggle; sim time advances with wall time at `SIM_RATE` M per second
+    # (inner-edge orbit ≈ 33 M, so one lap every ~33 s at rate 1).
+    fluid_sim = (isnothing(volume) || isnothing(disc)) ? nothing :
+                DiscFluidSim(volume, disc; M=spacetime.M)
+    live_flag = Ref(false)
+    last_sim_t = Ref(time())
+    SIM_RATE = 1.0
+
+    # Asynchronous reprojection: between full traces, re-display the last
+    # traced frame warped by the camera rotation since it was traced (exact
+    # for rotation; translation error is corrected by the next full trace,
+    # forced at least every FULL_TRACE_PERIOD).
+    reproj_flag = Ref(false)
+    FULL_TRACE_PERIOD = 0.1
+
     function request_render()
         Threads.atomic_add!(render_version, 1)
         isready(wakeup) || put!(wakeup, nothing)
@@ -141,8 +158,17 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
         # frame's write.
         BufT = Tuple{Array{Float32,3},Matrix{RGBf},Matrix{RGBf}}
         bufs = Dict{Tuple{Int,Int},BufT}()
+        # Reprojection state: retained copy of the last traced frame plus the
+        # camera/lens it was traced with, and the warp scratch buffers.
+        WBufT = Tuple{MtlArray{Float32,3},MtlArray{Float32,3},MtlVector{Float32}}
+        wbufs = Dict{Tuple{Int,Int},WBufT}()
+        prev_cam = Ref{Any}(nothing)
+        prev_fe = Ref(0.0)
+        prev_dims = Ref((0, 0))
+        last_full = Ref(0.0)
         flip = false
         min_period = 1 / 40   # rendering faster than this only floods thread 1
+        warp_period = 1 / 60  # warped frames are cheap; let them run faster
         try
             while true
                 take!(wakeup)
@@ -153,17 +179,58 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                         ctx_ref[]
                     end
                     t0 = time()
+                    fe_now = fisheye_obs[]
+                    dims = (ctx_now.width, ctx_now.height)
+                    # Warp when reprojection is on, the retained frame is
+                    # fresh (< FULL_TRACE_PERIOD) and compatible (same lens
+                    # and resolution); otherwise trace and retain.
+                    warped = reproj_flag[] && prev_cam[] !== nothing &&
+                             t0 - last_full[] < FULL_TRACE_PERIOD &&
+                             fe_now == prev_fe[] && dims == prev_dims[]
                     img = try
-                        host, ia, ib = get!(bufs, (ctx_now.width, ctx_now.height)) do
+                        if !warped && live_flag[] && !isnothing(fluid_sim) &&
+                           ctx_now.vol_on[]
+                            wall = time()
+                            # Step at ≤25 Hz: a sim step costs ~20 ms of
+                            # dispatch overhead, so per-frame stepping would
+                            # halve the preview rate for invisible gains.
+                            if wall - last_sim_t[] >= 0.04
+                                dt_sim = clamp(wall - last_sim_t[], 0.0, 0.15) * SIM_RATE
+                                last_sim_t[] = wall
+                                step_sim!(fluid_sim, ctx_now; dt=dt_sim)
+                            end
+                        end
+                        host, ia, ib = get!(bufs, dims) do
                             (Array{Float32,3}(undef, 3, ctx_now.width, ctx_now.height),
                              Matrix{RGBf}(undef, ctx_now.width, ctx_now.height),
                              Matrix{RGBf}(undef, ctx_now.width, ctx_now.height))
                         end
                         flip = !flip
-                        render_preview_mtl!(flip ? ia : ib, host, ctx_now,
-                                            cam_now, spacetime;
-                                            fisheye_deg=fisheye_obs[],
-                                            relativistic=rel_obs[])
+                        if warped
+                            prev_gpu, wout, wpar = wbufs[dims]
+                            warp_preview_mtl!(flip ? ia : ib, host, ctx_now,
+                                              wout, prev_gpu, wpar, cam_now,
+                                              prev_cam[]; fisheye_deg=fe_now)
+                        else
+                            frame = render_preview_mtl!(flip ? ia : ib, host,
+                                                        ctx_now, cam_now,
+                                                        spacetime;
+                                                        fisheye_deg=fe_now,
+                                                        relativistic=rel_obs[])
+                            if reproj_flag[]
+                                prev_gpu, _, _ = get!(wbufs, dims) do
+                                    (MtlArray{Float32}(undef, 3, dims...),
+                                     MtlArray{Float32}(undef, 3, dims...),
+                                     MtlVector{Float32}(undef, 22))
+                                end
+                                copyto!(prev_gpu, ctx_now.out_gpu)
+                                prev_cam[] = cam_now
+                                prev_fe[] = fe_now
+                                prev_dims[] = dims
+                            end
+                            last_full[] = time()
+                            frame
+                        end
                     catch e
                         e isa InvalidStateException && rethrow()
                         @error "Flythrough frame failed" exception=(e, catch_backtrace())
@@ -177,7 +244,8 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                         put!(img_chan, (img, time() - t0, norm(cam_now.pos)))
                     end
                     elapsed = time() - t0
-                    elapsed < min_period && sleep(min_period - elapsed)
+                    period = warped ? warp_period : min_period
+                    elapsed < period && sleep(period - elapsed)
                 end
             end
         catch e
@@ -322,6 +390,23 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
         end
     end
 
+    # Live fluid disc: a stable-fluids solver on the disc grid, stepped by
+    # the render worker (Metal work stays off thread 1). The ticker below
+    # keeps frames coming while the camera is still.
+    if !isnothing(fluid_sim)
+        live_toggle = Toggle(bar[1, 15]; active=false)
+        Label(bar[1, 16], "Live gas"; halign=:left)
+        on(live_toggle.active) do a
+            live_flag[] = a
+            request_render()
+        end
+        # Ticker: keep frames (and sim steps) coming while the camera rests.
+        @async while events(fig.scene).window_open[]
+            live_flag[] && base_ctx.vol_on[] && request_render()
+            sleep(1 / 24)
+        end
+    end
+
     # Render row: trace-time camera options (depth of field cannot be added
     # in post) plus the two offline renderers. Both save 4K linear HDR raws
     # (32-bit float TIFF + TOML sidecar) for the standalone post app; the
@@ -338,6 +423,15 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     Label(bar[2, 10], "Rel. shading"; halign=:left)
     on(rel_toggle.active) do a
         rel_obs[] = a
+        request_render()
+    end
+
+    # Asynchronous reprojection: cheap rotation-warped frames between full
+    # traces (VR "timewarp") for high-refresh mouse-look.
+    reproj_toggle = Toggle(bar[2, 11]; active=false)
+    Label(bar[2, 12], "Reproject"; halign=:left)
+    on(reproj_toggle.active) do a
+        reproj_flag[] = a
         request_render()
     end
 

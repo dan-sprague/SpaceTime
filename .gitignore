@@ -1,0 +1,9 @@
+.*
+renders/
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.gif
+*.tiff.toml
