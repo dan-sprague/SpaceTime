@@ -29,30 +29,125 @@ struct _CGSize
     height::Cdouble
 end
 
-# Pack the renderer's (3, W, H) Float32 output into BGRA8 texture order,
-# through the display transform: exposure, an ACES-style filmic curve (tames
-# the disc's linear-radiance blowout), and sRGB-ish gamma. Row 0 of the
-# texture is the top of the image, which is column j = H of the render (the
-# PNG save path applies rotr90 for the same reason). NaN guards: clamp
-# propagates NaN, and a checked convert would trap the GPU.
-function _pack_bgra_kernel!(dst, src, W, H, exposure, filmic)
+# ---------------------------------------------------------------------------
+# Display grade
+# ---------------------------------------------------------------------------
+#
+# The presenter carries a 12-float grade block applied on the GPU during
+# packing, plus a quarter-resolution bloom chain (bright-pass, separable
+# Gaussian) mixed in before the filmic curve:
+#   [1] exposure  [2] filmic on   [3] crush (post-curve contrast power)
+#   [4] saturation [5] vignette   [6:8] white-balance gains (r, g, b)
+#   [9] bloom strength [10] bloom threshold (linear)  [11:12] spare
+
+# Bright-pass 4×4 box downsample into the quarter-res bloom source.
+function _bloom_down_kernel!(dst, src, W, H, BW, BH, e, thresh)
+    i = thread_position_in_grid().x
+    i > BW * BH && return
+    bx = (i - 1) % BW
+    by = (i - 1) ÷ BW
+    r = 0.0f0; g = 0.0f0; b = 0.0f0
+    for oy in 1:4, ox in 1:4
+        sx = min(4 * bx + ox, W)
+        sy = min(4 * by + oy, H)
+        r += src[1, sx, sy]
+        g += src[2, sx, sy]
+        b += src[3, sx, sy]
+    end
+    r *= 0.0625f0 * e; g *= 0.0625f0 * e; b *= 0.0625f0 * e
+    r = r == r ? r : 0.0f0
+    g = g == g ? g : 0.0f0
+    b = b == b ? b : 0.0f0
+    l = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
+    w = l > thresh ? (l - thresh) / l : 0.0f0
+    dst[1, bx + 1, by + 1] = r * w
+    dst[2, bx + 1, by + 1] = g * w
+    dst[3, bx + 1, by + 1] = b * w
+    return nothing
+end
+
+# 9-tap separable Gaussian blur along (dx, dy) at bloom resolution.
+function _bloom_blur_kernel!(dst, src, BW, BH, dx, dy)
+    i = thread_position_in_grid().x
+    i > BW * BH && return
+    x = (i - 1) % BW + 1
+    y = (i - 1) ÷ BW + 1
+    r = 0.0f0; g = 0.0f0; b = 0.0f0
+    wsum = 0.0f0
+    for t in -4:4
+        w = t == 0 ? 0.205f0 : (abs(t) == 1 ? 0.180f0 : abs(t) == 2 ? 0.124f0 :
+                                abs(t) == 3 ? 0.066f0 : 0.028f0)
+        sx = clamp(x + t * dx, 1, BW)
+        sy = clamp(y + t * dy, 1, BH)
+        r += w * src[1, sx, sy]
+        g += w * src[2, sx, sy]
+        b += w * src[3, sx, sy]
+        wsum += w
+    end
+    dst[1, x, y] = r / wsum
+    dst[2, x, y] = g / wsum
+    dst[3, x, y] = b / wsum
+    return nothing
+end
+
+# Pack the renderer's (3, W, H) Float32 output into BGRA8 texture order
+# through the full display grade. Row 0 of the texture is the top of the
+# image, which is column j = H of the render (the PNG save path applies
+# rotr90 for the same reason). NaN guards: clamp propagates NaN, and a
+# checked convert would trap the GPU. `escale` is an extra linear factor
+# (the progressive-refinement pass average).
+function _pack_bgra_kernel!(dst, src, bloom, W, H, BW, BH, grade, escale)
     i = thread_position_in_grid().x
     i > W * H && return
     x = (i - 1) % W + 1
     j = H - (i - 1) ÷ W
-    r = src[1, x, j] * exposure
-    g = src[2, x, j] * exposure
-    b = src[3, x, j] * exposure
+    e = grade[1] * escale
+    r = src[1, x, j] * e * grade[6]
+    g = src[2, x, j] * e * grade[7]
+    b = src[3, x, j] * e * grade[8]
     r = r == r ? r : 0.0f0
     g = g == g ? g : 0.0f0
     b = b == b ? b : 0.0f0
-    if filmic > 0.5f0
+    if grade[9] > 0.0f0
+        fx = (Float32(x) - 0.5f0) * Float32(BW) / Float32(W) + 0.5f0
+        fy = (Float32(j) - 0.5f0) * Float32(BH) / Float32(H) + 0.5f0
+        x0 = clamp(unsafe_trunc(Int32, floor(fx)), Int32(1), Int32(BW - 1))
+        y0 = clamp(unsafe_trunc(Int32, floor(fy)), Int32(1), Int32(BH - 1))
+        tx = clamp(fx - Float32(x0), 0.0f0, 1.0f0)
+        ty = clamp(fy - Float32(y0), 0.0f0, 1.0f0)
+        w00 = (1.0f0 - tx) * (1.0f0 - ty); w10 = tx * (1.0f0 - ty)
+        w01 = (1.0f0 - tx) * ty;           w11 = tx * ty
+        s = grade[9]
+        r += s * (bloom[1, x0, y0] * w00 + bloom[1, x0 + 1, y0] * w10 +
+                  bloom[1, x0, y0 + 1] * w01 + bloom[1, x0 + 1, y0 + 1] * w11)
+        g += s * (bloom[2, x0, y0] * w00 + bloom[2, x0 + 1, y0] * w10 +
+                  bloom[2, x0, y0 + 1] * w01 + bloom[2, x0 + 1, y0 + 1] * w11)
+        b += s * (bloom[3, x0, y0] * w00 + bloom[3, x0 + 1, y0] * w10 +
+                  bloom[3, x0, y0 + 1] * w01 + bloom[3, x0 + 1, y0 + 1] * w11)
+    end
+    l = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
+    sat = grade[4]
+    r = max(l + sat * (r - l), 0.0f0)
+    g = max(l + sat * (g - l), 0.0f0)
+    b = max(l + sat * (b - l), 0.0f0)
+    if grade[2] > 0.5f0
         r = (r * (2.51f0 * r + 0.03f0)) / (r * (2.43f0 * r + 0.59f0) + 0.14f0)
         g = (g * (2.51f0 * g + 0.03f0)) / (g * (2.43f0 * g + 0.59f0) + 0.14f0)
         b = (b * (2.51f0 * b + 0.03f0)) / (b * (2.43f0 * b + 0.59f0) + 0.14f0)
         r = exp(log(max(r, 1.0f-6)) * 0.454545f0)
         g = exp(log(max(g, 1.0f-6)) * 0.454545f0)
         b = exp(log(max(b, 1.0f-6)) * 0.454545f0)
+    end
+    if grade[3] != 1.0f0
+        r = exp(log(max(r, 1.0f-6)) * grade[3])
+        g = exp(log(max(g, 1.0f-6)) * grade[3])
+        b = exp(log(max(b, 1.0f-6)) * grade[3])
+    end
+    if grade[5] > 0.0f0
+        vu = (Float32(x) - 0.5f0 * Float32(W)) / (0.5f0 * Float32(H))
+        vv = (Float32(j) - 0.5f0 * Float32(H)) / (0.5f0 * Float32(H))
+        f = max(1.0f0 - grade[5] * 0.25f0 * (vu * vu + vv * vv), 0.0f0)
+        r *= f; g *= f; b *= f
     end
     r = clamp(r, 0.0f0, 1.0f0)
     g = clamp(g, 0.0f0, 1.0f0)
@@ -73,7 +168,12 @@ mutable struct MetalPresenter{Q}
     queue::Q             # Metal.jl's batched global queue: command buffers
                          # created on it order after batched kernel launches
     pack_gpu::MtlArray{UInt32,1}
-    pack_kernel::Base.RefValue{Any}   # compiled-once kernel, like _WARP_KERNEL
+    pack_kernel::Base.RefValue{Any}   # compiled-once kernels, like _WARP_KERNEL
+    bloom_kernels::Base.RefValue{Any}
+    grade::MtlVector{Float32}         # 12-float display-grade block
+    grade_host::Vector{Float32}
+    bloom_a::MtlArray{Float32,3}      # quarter-res bloom ping-pong
+    bloom_b::MtlArray{Float32,3}
     width::Int
     height::Int
 end
@@ -93,9 +193,39 @@ function MetalPresenter(win::GLFW.Window, width::Int, height::Int)
     @objc [view::id{Object} setWantsLayer:true::Bool]::Nothing
     @objc [view::id{Object} setLayer:layer::id{Object}]::Nothing
     queue = Metal.global_queue(dev)
+    grade_host = Float32[1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0]
+    grade = MtlArray(grade_host)
+    bw, bh = cld(width, 4), cld(height, 4)
     MetalPresenter{typeof(queue)}(layer, queue,
                                   MtlArray{UInt32}(undef, width * height),
-                                  Ref{Any}(nothing), width, height)
+                                  Ref{Any}(nothing), Ref{Any}(nothing),
+                                  grade, grade_host,
+                                  MtlArray{Float32,3}(undef, 3, bw, bh),
+                                  MtlArray{Float32,3}(undef, 3, bw, bh),
+                                  width, height)
+end
+
+"""
+    set_grade!(p::MetalPresenter; exposure, filmic, crush, saturation,
+               vignette, wb, bloom, bloom_threshold)
+
+Update the presenter's display grade (any subset of the fields; `wb` is an
+`(r, g, b)` gain tuple). Applied on the next `present!`.
+"""
+function set_grade!(p::MetalPresenter; exposure::Real=p.grade_host[1],
+                    filmic::Bool=p.grade_host[2] > 0.5,
+                    crush::Real=p.grade_host[3],
+                    saturation::Real=p.grade_host[4],
+                    vignette::Real=p.grade_host[5],
+                    wb::NTuple{3,<:Real}=(p.grade_host[6], p.grade_host[7],
+                                          p.grade_host[8]),
+                    bloom::Real=p.grade_host[9],
+                    bloom_threshold::Real=p.grade_host[10])
+    p.grade_host .= Float32[exposure, filmic ? 1 : 0, crush, saturation,
+                            vignette, wb[1], wb[2], wb[3], bloom,
+                            bloom_threshold, 0, 0]
+    copyto!(p.grade, p.grade_host)
+    return nothing
 end
 
 """
@@ -108,16 +238,34 @@ in-flight render kernels; an explicit flush publishes Metal.jl's batched
 launches before ours commits.
 """
 function present!(p::MetalPresenter, src::MtlArray{Float32,3};
-                  exposure::Float32=1.0f0, filmic::Bool=true)
+                  escale::Float32=1.0f0)
     W, H = p.width, p.height
+    BW, BH = size(p.bloom_a, 2), size(p.bloom_a, 3)
     n = W * H
+    if p.grade_host[9] > 0.0f0
+        if p.bloom_kernels[] === nothing
+            p.bloom_kernels[] = (
+                @metal(launch=false, _bloom_down_kernel!(
+                    p.bloom_a, src, W, H, BW, BH, 1.0f0, 1.0f0)),
+                @metal(launch=false, _bloom_blur_kernel!(
+                    p.bloom_b, p.bloom_a, BW, BH, 1, 0)))
+        end
+        kd, kb = p.bloom_kernels[]
+        nb = BW * BH
+        td = min(kd.pipeline.maxTotalThreadsPerThreadgroup, nb)
+        kd(p.bloom_a, src, W, H, BW, BH, p.grade_host[1] * escale,
+           p.grade_host[10]; threads=td, groups=cld(nb, td))
+        tb = min(kb.pipeline.maxTotalThreadsPerThreadgroup, nb)
+        kb(p.bloom_b, p.bloom_a, BW, BH, 1, 0; threads=tb, groups=cld(nb, tb))
+        kb(p.bloom_a, p.bloom_b, BW, BH, 0, 1; threads=tb, groups=cld(nb, tb))
+    end
     if p.pack_kernel[] === nothing
         p.pack_kernel[] = @metal launch=false _pack_bgra_kernel!(
-            p.pack_gpu, src, W, H, exposure, filmic ? 1.0f0 : 0.0f0)
+            p.pack_gpu, src, p.bloom_a, W, H, BW, BH, p.grade, escale)
     end
     kern = p.pack_kernel[]
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
-    kern(p.pack_gpu, src, W, H, exposure, filmic ? 1.0f0 : 0.0f0;
+    kern(p.pack_gpu, src, p.bloom_a, W, H, BW, BH, p.grade, escale;
          threads=threads, groups=cld(n, threads))
     Metal.flush!()
     drawable = @objc [p.layer::id{Object} nextDrawable]::id{Object}
@@ -161,10 +309,11 @@ retro-burn (Space), time warp (`-`/`=`) — the viewport still renders from
 the local reference observer.
 
 Other keys: drag to look; Z/C roll; V volumetric gas; R relativistic
-shading; L lens (rectilinear/fisheye); T/G exposure; P filmic display
-transform on/off; X reset position; Esc quit. When the camera rests, one
-full-native-resolution gas pass renders (stills are sharp) and the GPU
-parks until something changes.
+shading; L lens (rectilinear/fisheye); **1/2/3 grade presets**
+(neutral / film / hectic — white balance, saturation, contrast crush,
+vignette, GPU bloom); T/G exposure; P filmic curve on/off; X reset
+position; Esc quit. When the camera rests, refinement passes accumulate a
+supersampled still, then the GPU parks until something changes.
 Telemetry lives in the window title. Runs on the calling (main) thread
 until the window closes.
 """
@@ -197,6 +346,24 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     twarp = 2.0             # ship proper time per wall second, M
     exposure = 1.0f0        # display transform (T/G keys)
     filmic = true           # ACES-style display curve (P toggles)
+    grade_rev = 0           # bumped on any grade change (re-presents stills)
+    function apply_grade!(n)
+        if n == 1        # neutral: filmic curve only
+            set_grade!(presenter; exposure=exposure, filmic=filmic,
+                       crush=1.0, saturation=1.0, vignette=0.0,
+                       wb=(1.0, 1.0, 1.0), bloom=0.0)
+        elseif n == 2    # film: gentle warmth, bloom, vignette
+            set_grade!(presenter; exposure=exposure, filmic=filmic,
+                       crush=1.15, saturation=1.12, vignette=0.30,
+                       wb=(1.02, 1.0, 0.97), bloom=0.8, bloom_threshold=0.75)
+        else             # hectic: crushed, saturated, dripping bloom
+            set_grade!(presenter; exposure=exposure, filmic=filmic,
+                       crush=1.5, saturation=1.25, vignette=0.45,
+                       wb=(1.05, 1.0, 0.94), bloom=1.6, bloom_threshold=0.55)
+        end
+        grade_rev += 1
+        return nothing
+    end
 
     # Layered engine state: deflection fan + the disc/gas layer. While
     # moving, the layer renders FRESH every frame at half display resolution
@@ -234,6 +401,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # Warm every kernel (fan, both layer variants, composite, pack) before
     # the clock starts: first-call compilation costs seconds and would
     # otherwise hitch the opening frames.
+    apply_grade!(2)   # default look: the film preset
     let cam0 = build_cam()
         update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate)
         if ctx.has_volume
@@ -302,9 +470,20 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             set_volume_enabled!(ctx, !ctx.vol_on[])
         pressed_once(GLFW.KEY_R) && (relativistic = !relativistic)
         pressed_once(GLFW.KEY_L) && (fisheye = fisheye > 0.0 ? 0.0 : 100.0)
-        pressed_once(GLFW.KEY_P) && (filmic = !filmic)
-        down(GLFW.KEY_T) && (exposure = min(20.0f0, exposure * 1.04f0))
-        down(GLFW.KEY_G) && (exposure = max(0.05f0, exposure / 1.04f0))
+        if pressed_once(GLFW.KEY_P)
+            filmic = !filmic
+            set_grade!(presenter; filmic=filmic)
+            grade_rev += 1
+        end
+        if down(GLFW.KEY_T) || down(GLFW.KEY_G)
+            exposure = down(GLFW.KEY_T) ? min(20.0f0, exposure * 1.04f0) :
+                                          max(0.05f0, exposure / 1.04f0)
+            set_grade!(presenter; exposure=exposure)
+            grade_rev += 1
+        end
+        pressed_once(GLFW.KEY_1) && apply_grade!(1)
+        pressed_once(GLFW.KEY_2) && apply_grade!(2)
+        pressed_once(GLFW.KEY_3) && apply_grade!(3)
         if pressed_once(GLFW.KEY_F)
             flight = !flight
             flight && (ship = ShipState(state.pos, M))
@@ -384,7 +563,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         # — stills get offline sharpness), parked (nothing to render; the
         # layer retains the last drawable and the GPU idles).
         sig = (state.pos, state.yaw, state.pitch, state.roll, fisheye,
-               relativistic, ctx.vol_on[], exposure, filmic)
+               relativistic, ctx.vol_on[], grade_rev)
         cam_now = build_cam()
         if sig != last_sig
             if haskey(ENV, "SPACETIME_DEBUG") && last_sig !== nothing
@@ -430,7 +609,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                                     relativistic=relativistic,
                                     trace_layer=false)
             end
-            present!(presenter, ctx.out_gpu; exposure=exposure, filmic=filmic)
+            present!(presenter, ctx.out_gpu)
             frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
             last_move_time = wall
             nframes += 1
@@ -463,8 +642,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             if refine_row >= height
                 refine_row = 0
                 passes += 1
-                present!(presenter, accum;
-                         exposure=exposure / Float32(passes), filmic=filmic)
+                present!(presenter, accum; escale=1.0f0 / Float32(passes))
                 nframes += 1
             end
         else
