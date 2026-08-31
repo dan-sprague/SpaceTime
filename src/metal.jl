@@ -760,6 +760,27 @@ function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
                              band_rows::Int=0,
                              on_band::Union{Nothing,Function}=nothing)
+    _trace_preview_gpu!(ctx, cam, spacetime; fisheye_deg=fisheye_deg,
+                        relativistic=relativistic, beta=beta,
+                        band_rows=band_rows, on_band=on_band)
+    copyto!(host, ctx.out_gpu)
+    @inbounds for j in 1:ctx.height, i in 1:ctx.width
+        img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
+    end
+    return img
+end
+
+"""
+GPU-only preview trace: run the kernel into `ctx.out_gpu` without downloading
+to the host. The native shell presents `out_gpu` straight to a CAMetalLayer;
+`render_preview_mtl!` adds the host download for CPU consumers.
+"""
+function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
+                             spacetime::Schwarzschild; fisheye_deg::Real=0.0,
+                             relativistic::Bool=false,
+                             beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
+                             band_rows::Int=0,
+                             on_band::Union{Nothing,Function}=nothing)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -800,11 +821,7 @@ function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
             row0 < ctx.height && on_band()
         end
     end
-    copyto!(host, ctx.out_gpu)
-    @inbounds for j in 1:ctx.height, i in 1:ctx.width
-        img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
-    end
-    return img
+    return nothing
 end
 
 """
@@ -1126,6 +1143,18 @@ function warp_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                            ctx::MetalPreviewContext, warp_out, prev,
                            warp_params, cam::Camera, prev_cam::Camera;
                            fisheye_deg::Real=0.0)
+    _warp_gpu!(ctx, warp_out, prev, warp_params, cam, prev_cam;
+               fisheye_deg=fisheye_deg)
+    copyto!(host, warp_out)
+    @inbounds for j in 1:ctx.height, i in 1:ctx.width
+        img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
+    end
+    return img
+end
+
+"""GPU-only reprojection: warp `prev` into `warp_out` without downloading."""
+function _warp_gpu!(ctx::MetalPreviewContext, warp_out, prev, warp_params,
+                    cam::Camera, prev_cam::Camera; fisheye_deg::Real=0.0)
     copyto!(warp_params,
             Float32[cam.fwd..., cam.right..., cam.up_local...,
                     prev_cam.fwd..., prev_cam.right..., prev_cam.up_local...,
@@ -1143,9 +1172,5 @@ function warp_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
     kern(warp_out, prev, warp_params, ctx.width, ctx.height;
          threads=threads, groups=cld(n, threads))
-    copyto!(host, warp_out)
-    @inbounds for j in 1:ctx.height, i in 1:ctx.width
-        img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
-    end
-    return img
+    return nothing
 end

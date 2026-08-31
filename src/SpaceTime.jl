@@ -60,6 +60,7 @@ include("ship.jl")       # GR flight dynamics; uses the viewfinder integrator
 include("metal.jl")
 include("disc_sim.jl")   # live fluid disc; dispatches on MetalPreviewContext
 include("flythrough.jl")
+include("native_shell.jl") # Makie-free Metal window shell for the simulator
 include("postapp.jl")
 include("app.jl")        # julia_main: standalone-app entry point (create_app)
 
@@ -90,6 +91,7 @@ export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
 # --- Interactive apps and flight dynamics
 export PreviewSettings, render_preview, viewfinder, flythrough, postprocessor
 export ShipState, step_ship!, ship_velocity
+export fly_native
 
 # --- Image pipeline
 export postprocess, airy_convolve, generate_psf, fft_convolve, aces_tonemap,
