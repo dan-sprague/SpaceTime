@@ -29,21 +29,34 @@ struct _CGSize
     height::Cdouble
 end
 
-# Pack the renderer's (3, W, H) Float32 output into BGRA8 texture order.
-# Row 0 of the texture is the top of the image, which is column j = H of the
-# render (the PNG save path applies rotr90 for the same reason). NaN guards:
-# clamp propagates NaN, and a checked convert would trap the GPU.
-function _pack_bgra_kernel!(dst, src, W, H)
+# Pack the renderer's (3, W, H) Float32 output into BGRA8 texture order,
+# through the display transform: exposure, an ACES-style filmic curve (tames
+# the disc's linear-radiance blowout), and sRGB-ish gamma. Row 0 of the
+# texture is the top of the image, which is column j = H of the render (the
+# PNG save path applies rotr90 for the same reason). NaN guards: clamp
+# propagates NaN, and a checked convert would trap the GPU.
+function _pack_bgra_kernel!(dst, src, W, H, exposure, filmic)
     i = thread_position_in_grid().x
     i > W * H && return
     x = (i - 1) % W + 1
     j = H - (i - 1) ÷ W
-    r = clamp(src[1, x, j], 0.0f0, 1.0f0)
-    g = clamp(src[2, x, j], 0.0f0, 1.0f0)
-    b = clamp(src[3, x, j], 0.0f0, 1.0f0)
+    r = src[1, x, j] * exposure
+    g = src[2, x, j] * exposure
+    b = src[3, x, j] * exposure
     r = r == r ? r : 0.0f0
     g = g == g ? g : 0.0f0
     b = b == b ? b : 0.0f0
+    if filmic > 0.5f0
+        r = (r * (2.51f0 * r + 0.03f0)) / (r * (2.43f0 * r + 0.59f0) + 0.14f0)
+        g = (g * (2.51f0 * g + 0.03f0)) / (g * (2.43f0 * g + 0.59f0) + 0.14f0)
+        b = (b * (2.51f0 * b + 0.03f0)) / (b * (2.43f0 * b + 0.59f0) + 0.14f0)
+        r = exp(log(max(r, 1.0f-6)) * 0.454545f0)
+        g = exp(log(max(g, 1.0f-6)) * 0.454545f0)
+        b = exp(log(max(b, 1.0f-6)) * 0.454545f0)
+    end
+    r = clamp(r, 0.0f0, 1.0f0)
+    g = clamp(g, 0.0f0, 1.0f0)
+    b = clamp(b, 0.0f0, 1.0f0)
     dst[i] = unsafe_trunc(UInt32, r * 255.0f0 + 0.5f0) << 16 |
              unsafe_trunc(UInt32, g * 255.0f0 + 0.5f0) << 8 |
              unsafe_trunc(UInt32, b * 255.0f0 + 0.5f0) | 0xff000000
@@ -94,16 +107,18 @@ Command-buffer order on the shared global queue keeps the pack after any
 in-flight render kernels; an explicit flush publishes Metal.jl's batched
 launches before ours commits.
 """
-function present!(p::MetalPresenter, src::MtlArray{Float32,3})
+function present!(p::MetalPresenter, src::MtlArray{Float32,3};
+                  exposure::Float32=1.0f0, filmic::Bool=true)
     W, H = p.width, p.height
     n = W * H
     if p.pack_kernel[] === nothing
-        p.pack_kernel[] = @metal launch=false _pack_bgra_kernel!(p.pack_gpu,
-                                                                 src, W, H)
+        p.pack_kernel[] = @metal launch=false _pack_bgra_kernel!(
+            p.pack_gpu, src, W, H, exposure, filmic ? 1.0f0 : 0.0f0)
     end
     kern = p.pack_kernel[]
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
-    kern(p.pack_gpu, src, W, H; threads=threads, groups=cld(n, threads))
+    kern(p.pack_gpu, src, W, H, exposure, filmic ? 1.0f0 : 0.0f0;
+         threads=threads, groups=cld(n, threads))
     Metal.flush!()
     drawable = @objc [p.layer::id{Object} nextDrawable]::id{Object}
     reinterpret(Ptr{Cvoid}, drawable) == C_NULL && return false
@@ -145,7 +160,10 @@ retro-burn (Space), time warp (`-`/`=`) — the viewport still renders from
 the local reference observer.
 
 Other keys: drag to look; Z/C roll; V volumetric gas; R relativistic
-shading; L lens (rectilinear/fisheye); X reset position; Esc quit.
+shading; L lens (rectilinear/fisheye); T/G exposure; P filmic display
+transform on/off; X reset position; Esc quit. When the camera rests, one
+full-native-resolution gas pass renders (stills are sharp) and the GPU
+parks until something changes.
 Telemetry lives in the window title. Runs on the calling (main) thread
 until the window closes.
 """
@@ -176,6 +194,8 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     speed = 2.0             # free-cam speed at reference altitude
     thrust = 0.05           # ship max proper acceleration, c²/M
     twarp = 2.0             # ship proper time per wall second, M
+    exposure = 1.0f0        # display transform (T/G keys)
+    filmic = true           # ACES-style display curve (P toggles)
 
     # Layered engine state: deflection fan + reduced-resolution disc layer.
     # The layer resolution is bounded (~300 rows) so the per-frame cost of
@@ -237,6 +257,9 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     β = SVector(0.0, 0.0, 0.0)
     γ = 1.0
     a_mag = 0.0
+    last_sig = nothing
+    refined = false
+    layer_full = Ref{Any}(nothing)   # native-res gas layer for stills
 
     while !GLFW.WindowShouldClose(win) && time() - t_start < max_seconds
         GLFW.PollEvents()
@@ -266,6 +289,9 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             set_volume_enabled!(ctx, !ctx.vol_on[])
         pressed_once(GLFW.KEY_R) && (relativistic = !relativistic)
         pressed_once(GLFW.KEY_L) && (fisheye = fisheye > 0.0 ? 0.0 : 100.0)
+        pressed_once(GLFW.KEY_P) && (filmic = !filmic)
+        down(GLFW.KEY_T) && (exposure = min(20.0f0, exposure * 1.04f0))
+        down(GLFW.KEY_G) && (exposure = max(0.05f0, exposure / 1.04f0))
         if pressed_once(GLFW.KEY_F)
             flight = !flight
             flight && (ship = ShipState(state.pos, M))
@@ -340,15 +366,44 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         end
 
         # --- render: fan + layer + composite, all on the GPU -----------
-        t0 = time()
+        # Change detection drives three states: moving (fast bounded gas
+        # layer, 60 fps), just stopped (one full-native-resolution gas pass
+        # — stills get offline sharpness), parked (nothing to render; the
+        # layer retains the last drawable and the GPU idles).
+        sig = (state.pos, state.yaw, state.pitch, state.roll, fisheye,
+               relativistic, ctx.vol_on[], exposure, filmic)
         cam_now = build_cam()
-        update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
-        render_layered_gpu!(ctx.out_gpu, layer_out, ctx, sky, cam_now,
-                            spacetime; fisheye_deg=fisheye,
-                            relativistic=relativistic, trace_layer=layer_on)
-        present!(presenter, ctx.out_gpu)
-        frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
-        nframes += 1
+        if sig != last_sig
+            if haskey(ENV, "SPACETIME_DEBUG") && last_sig !== nothing
+                for (ci, (a, b)) in enumerate(zip(sig, last_sig))
+                    a != b && println("sig[", ci, "] changed: ", b, " -> ", a)
+                end
+            end
+            last_sig = sig
+            refined = false
+            t0 = time()
+            update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
+            render_layered_gpu!(ctx.out_gpu, layer_out, ctx, sky, cam_now,
+                                spacetime; fisheye_deg=fisheye,
+                                relativistic=relativistic,
+                                trace_layer=layer_on)
+            present!(presenter, ctx.out_gpu; exposure=exposure, filmic=filmic)
+            frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
+            nframes += 1
+        elseif !refined && layer_on
+            if layer_full[] === nothing
+                layer_full[] = MtlArray{Float32,3}(undef, 4, width, height)
+            end
+            render_layered_gpu!(ctx.out_gpu, layer_full[], ctx, sky, cam_now,
+                                spacetime; fisheye_deg=fisheye,
+                                relativistic=relativistic, trace_layer=true)
+            present!(presenter, ctx.out_gpu; exposure=exposure, filmic=filmic)
+            refined = true
+            nframes += 1
+        else
+            refined = true    # sky-only scenes need no refine pass
+            sleep(0.006)
+        end
 
         # --- telemetry in the title bar (cheap, 4 Hz) ------------------
         if wall - last_title > 0.25

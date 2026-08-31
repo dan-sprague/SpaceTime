@@ -1236,14 +1236,20 @@ asymptotic escape direction's in-plane angle from the radial axis and `r_min`
 the closest approach. `cam_params` is the 28-float block for the fan camera
 (`fwd = x̂`, `right = ŷ`); `sky_params[5:6] = (M, r_escape)`.
 """
-function sky_fan_kernel!(fan, cam_params, sky_params, nmax, dt)
+function sky_fan_kernel!(fan, cam_params, sky_params, nmax, dt, band)
     k = thread_position_in_grid().x
     N = size(fan, 2)
     k > N && return
     M = sky_params[5]
     r_escape = sky_params[6]
 
-    ψ = Float32(pi) * (Float32(k) - 1.0f0) / (Float32(N) - 1.0f0)
+    # band > 0: refinement fan across the critical-angle band found by
+    # `fan_band_kernel!` (sky_params[9:10]) — the escape/capture transition
+    # where dθf/dψ diverges and the coarse fan under-resolves the sky.
+    ψ = band > Int32(0) ?
+        sky_params[9] + (sky_params[10] - sky_params[9]) *
+                        (Float32(k) - 1.0f0) / (Float32(N) - 1.0f0) :
+        Float32(pi) * (Float32(k) - 1.0f0) / (Float32(N) - 1.0f0)
     cf = cos(ψ)
     cr = sin(ψ)
 
@@ -1340,7 +1346,7 @@ composite the premultiplied disc/gas `layer` (bilinear, `lw × lh`) over it.
 Near-critical fan entries (neighbours disagreeing in escape or direction)
 fall back to the nearest entry — a sub-pixel zone at the photon ring.
 """
-function sky_composite_kernel!(out, bg, fan, layer, cam_params,
+function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
                                spacetime_params, sky_params,
                                width, height, lw, lh)
     idx = thread_position_in_grid().x
@@ -1397,33 +1403,11 @@ function sky_composite_kernel!(out, bg, fan, layer, cam_params,
     scam = spacetime_params[4] > 0.5f0 ?
            1.0f0 / clamp(abs(p_t), 0.05f0, 20.0f0) : 1.0f0
 
-    # Local angle to the radial axis, then the exact deflection.
+    # Local angle to the radial axis, then the exact deflection (fine fan
+    # inside the critical band, coarse elsewhere).
     cψ = clamp(p_t * sky_params[1] + px * sky_params[2] +
                py * sky_params[3] + pz * sky_params[4], -1.0f0, 1.0f0)
-    N = size(fan, 2)
-    tf = acos(cψ) * (Float32(N) - 1.0f0) / Float32(pi)
-    k0 = clamp(unsafe_trunc(Int32, tf), Int32(0), Int32(N - 2))
-    frac = tf - Float32(k0)
-    e_a = fan[1, k0 + 1]; e_b = fan[1, k0 + 2]
-    c_a = fan[2, k0 + 1]; c_b = fan[2, k0 + 2]
-    s_a = fan[3, k0 + 1]; s_b = fan[3, k0 + 2]
-    esc = 0.0f0
-    cθ = 1.0f0
-    sθ = 0.0f0
-    if e_a == e_b && c_a * c_b + s_a * s_b > 0.9987f0
-        esc = e_a
-        cθ = c_a + frac * (c_b - c_a)
-        sθ = s_a + frac * (s_b - s_a)
-        nl = max(sqrt(cθ * cθ + sθ * sθ), 1.0f-6)
-        cθ /= nl
-        sθ /= nl
-    else
-        # Photon-ring zone: neighbours wind or disagree — nearest entry.
-        kn = frac < 0.5f0 ? k0 + 1 : k0 + 2
-        esc = fan[1, kn]
-        cθ = fan[2, kn]
-        sθ = fan[3, kn]
-    end
+    esc, cθ, sθ = _fan_dir(fan, fine, sky_params[9], sky_params[10], acos(cψ))
 
     sky_r = 0.0f0
     sky_g = 0.0f0
@@ -1492,8 +1476,66 @@ function sky_composite_kernel!(out, bg, fan, layer, cam_params,
     return nothing
 end
 
+"""
+    fan_band_kernel!(sky_params, fan, pad)
+
+Locate the escape/capture transition in the coarse fan and write the ψ band
+`[transition − pad, transition + pad]` (in coarse spacings) into
+`sky_params[9:10]`, where the refinement fan and the composite lookup read
+it. The escape flag is monotone in ψ, so at most one pair differs.
+"""
+function fan_band_kernel!(sky_params, fan, pad)
+    k = thread_position_in_grid().x
+    N = size(fan, 2)
+    k > N - 1 && return
+    if fan[1, k] != fan[1, k + 1]
+        dψ = Float32(pi) / (Float32(N) - 1.0f0)
+        sky_params[9] = max(Float32(k - 1) - Float32(pad), 0.0f0) * dψ
+        sky_params[10] = min(Float32(k) + Float32(pad), Float32(N) - 1.0f0) * dψ
+    end
+    return nothing
+end
+
+"""
+Fan lookup shared by the composite: returns `(esc, cosθf, sinθf)` for local
+angle ψ, using the fine critical-band fan where it applies and falling back
+to the nearest entry where neighbours wind or disagree.
+"""
+@inline function _fan_dir(fan, fine, ψlo, ψhi, ψ)
+    use_fine = ψhi > ψlo && ψlo <= ψ && ψ <= ψhi
+    tf = 0.0f0
+    if use_fine
+        Nf = Float32(size(fine, 2))
+        tf = (ψ - ψlo) / (ψhi - ψlo) * (Nf - 1.0f0)
+    else
+        Nc = Float32(size(fan, 2))
+        tf = ψ * (Nc - 1.0f0) / Float32(pi)
+    end
+    nmax_i = use_fine ? Int32(size(fine, 2)) : Int32(size(fan, 2))
+    k0 = clamp(unsafe_trunc(Int32, tf), Int32(0), nmax_i - Int32(2))
+    frac = tf - Float32(k0)
+    e_a = use_fine ? fine[1, k0 + 1] : fan[1, k0 + 1]
+    e_b = use_fine ? fine[1, k0 + 2] : fan[1, k0 + 2]
+    c_a = use_fine ? fine[2, k0 + 1] : fan[2, k0 + 1]
+    c_b = use_fine ? fine[2, k0 + 2] : fan[2, k0 + 2]
+    s_a = use_fine ? fine[3, k0 + 1] : fan[3, k0 + 1]
+    s_b = use_fine ? fine[3, k0 + 2] : fan[3, k0 + 2]
+    if e_a == e_b && c_a * c_b + s_a * s_b > 0.9987f0
+        cθ = c_a + frac * (c_b - c_a)
+        sθ = s_a + frac * (s_b - s_a)
+        nl = max(sqrt(cθ * cθ + sθ * sθ), 1.0f-6)
+        return e_a, cθ / nl, sθ / nl
+    end
+    kn = frac < 0.5f0 ? k0 + 1 : k0 + 2
+    if use_fine
+        return fine[1, kn], fine[2, kn], fine[3, kn]
+    end
+    return fan[1, kn], fan[2, kn], fan[3, kn]
+end
+
 # Compiled-once pipelines and dummy buffers for the layered engine.
 const _SKY_FAN_KERNEL = Ref{Any}(nothing)
+const _FAN_BAND_KERNEL = Ref{Any}(nothing)
 const _COMPOSITE_KERNEL = Ref{Any}(nothing)
 const _DUMMY_FAN = Ref{Any}(nothing)
 const _DUMMY_SKYP = Ref{Any}(nothing)
@@ -1509,14 +1551,16 @@ Host-side state for the layered engine's deflection fan: the fan table, its
 parameter block, and the fan camera's tetrad block.
 """
 struct SkyFanState
-    fan::MtlArray{Float32,2}
+    fan::MtlArray{Float32,2}     # coarse: uniform in ψ over [0, π]
+    fine::MtlArray{Float32,2}    # refinement across the critical-angle band
     sky_params::MtlVector{Float32}
     fan_cam::MtlVector{Float32}
 end
 
-SkyFanState(; n::Int=4096) = SkyFanState(
+SkyFanState(; n::Int=4096, n_fine::Int=1024) = SkyFanState(
     MtlArray{Float32,2}(undef, 4, n),
-    MtlVector{Float32}(undef, 8),
+    MtlArray{Float32,2}(undef, 4, n_fine),
+    MtlVector{Float32}(undef, 12),
     MtlVector{Float32}(undef, 28))
 
 """
@@ -1548,19 +1592,34 @@ function update_sky_fan!(sky::SkyFanState, ctx::MetalPreviewContext,
     êr = ks_camera_tetrad(pos, x̂, b1, b2, M)[2]
     r_escape = ctx.r_escape_factor * max(r, 15.0 * M)
     copyto!(sky.sky_params,
-            Float32[êr..., M, r_escape, gate, 0.0])
+            Float32[êr..., M, r_escape, gate, 0.0, 0.0, 0.0, 0.0, 0.0])
     nmax = min(max(ctx.nmax,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)),
                20_000)
     n = size(sky.fan, 2)
     if _SKY_FAN_KERNEL[] === nothing
         _SKY_FAN_KERNEL[] = @metal launch=false sky_fan_kernel!(
-            sky.fan, sky.fan_cam, sky.sky_params, nmax, Float32(dt))
+            sky.fan, sky.fan_cam, sky.sky_params, nmax, Float32(dt), Int32(0))
     end
     kern = _SKY_FAN_KERNEL[]
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
-    kern(sky.fan, sky.fan_cam, sky.sky_params, nmax, Float32(dt);
+    kern(sky.fan, sky.fan_cam, sky.sky_params, nmax, Float32(dt), Int32(0);
          threads=threads, groups=cld(n, threads))
+    # Locate the escape/capture transition, then refine across it: the
+    # near-critical zone is where the coarse fan's stairs would show at the
+    # shadow edge. All GPU-side — no host round trip.
+    if _FAN_BAND_KERNEL[] === nothing
+        _FAN_BAND_KERNEL[] = @metal launch=false fan_band_kernel!(
+            sky.sky_params, sky.fan, Int32(3))
+    end
+    bk = sky.sky_params
+    kb = _FAN_BAND_KERNEL[]
+    tb = min(kb.pipeline.maxTotalThreadsPerThreadgroup, n - 1)
+    kb(bk, sky.fan, Int32(3); threads=tb, groups=cld(n - 1, tb))
+    nf = size(sky.fine, 2)
+    tf = min(kern.pipeline.maxTotalThreadsPerThreadgroup, nf)
+    kern(sky.fine, sky.fan_cam, sky.sky_params, nmax, Float32(dt), Int32(1);
+         threads=tf, groups=cld(nf, tf))
     return nothing
 end
 
@@ -1604,13 +1663,14 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
     width, height = size(comp_out, 2), size(comp_out, 3)
     if _COMPOSITE_KERNEL[] === nothing
         _COMPOSITE_KERNEL[] = @metal launch=false sky_composite_kernel!(
-            comp_out, ctx.bg_gpu, sky.fan, layer_out, ctx.cam_params,
-            ctx.spacetime_params, sky.sky_params, width, height, lw, lh)
+            comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out,
+            ctx.cam_params, ctx.spacetime_params, sky.sky_params,
+            width, height, lw, lh)
     end
     kern = _COMPOSITE_KERNEL[]
     n = width * height
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
-    kern(comp_out, ctx.bg_gpu, sky.fan, layer_out, ctx.cam_params,
+    kern(comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out, ctx.cam_params,
          ctx.spacetime_params, sky.sky_params, width, height, lw, lh;
          threads=threads, groups=cld(n, threads))
     return nothing
