@@ -972,7 +972,7 @@ function viewfinder(cam::AbstractCamera, spacetime::Schwarzschild, background;
     colgap!(controls, 20)
 
     # -------------------------------------------------------------------------
-    # Hectic preset: the demonstration.jl "COOL SCENE" composition
+    # Hectic preset: the "COOL SCENE" composition (see examples/hero_shot.jl)
     # -------------------------------------------------------------------------
     on(hectic_btn.clicks) do _
         world_up = SVector(0.0, 0.0, 1.0)

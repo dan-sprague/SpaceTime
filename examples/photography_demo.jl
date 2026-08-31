@@ -14,7 +14,7 @@ const RGBf = RGB{Float32}
 # Basic scene
 # -----------------------------------------------------------------------------
 bh = Schwarzschild(1.0)
-bg = load(joinpath(dirname(@__DIR__), "starmap_g4k.jpg"))
+bg = load(joinpath(dirname(@__DIR__), "assets", "starmap_g4k.jpg"))
 
 disc = AccretionDisc(
     inner_radius=3.0,

@@ -1,4 +1,5 @@
 .*
+!.gitignore
 renders/
 *.mp4
 *.png
@@ -7,3 +8,5 @@ renders/
 *.tiff
 *.gif
 *.tiff.toml
+!assets/starmap_g4k.jpg
+!docs/assets/*.jpg

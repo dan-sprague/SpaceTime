@@ -24,7 +24,7 @@ using Images: clamp01nan
 lowres = get(ENV, "SKIM_LOWRES", "0") == "1"
 W, H, S = lowres ? (480, 270, 1) : (3840, 2160, 4)
 
-bg = load(joinpath(@__DIR__, "..", "starmap_g4k.jpg"))
+bg = load(joinpath(dirname(@__DIR__), "assets", "starmap_g4k.jpg"))
 bh = Schwarzschild(1.0)
 disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
                      blackbody=Blackbody(wb_temperature=10000.0),

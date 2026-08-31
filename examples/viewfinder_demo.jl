@@ -1,7 +1,7 @@
 # Black-hole viewfinder demo.
 #
 # Run with:
-#     julia -t auto,1 --project viewfinder_demo.jl
+#     julia -t auto,1 --project examples/viewfinder_demo.jl
 #
 # The `-t auto,1` launch matters: the final render runs on default-pool worker
 # threads while the main thread stays on the interactive pool driving the UI.
@@ -19,7 +19,7 @@ using LinearAlgebra
 using FileIO
 
 # Load the same background used in demonstration.jl.
-bg = load("starmap_g4k.jpg")
+bg = load(joinpath(dirname(@__DIR__), "assets", "starmap_g4k.jpg"))
 
 spacetime = Schwarzschild(1.0)
 disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,

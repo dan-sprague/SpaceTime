@@ -1,6 +1,6 @@
 using SpaceTime
 using StaticArrays
-using LinearAlgebra: norm
+using LinearAlgebra: norm, dot, cross, normalize, Diagonal
 using Random
 using Colors
 using Test
@@ -57,6 +57,71 @@ end
     img2 = fill(0.5, 10, 10)
     sensor_expose!(img2; iso=200.0, t_exp=2.0, add_noise=false)
     @test img2[1, 1] ≈ 0.5 * 4.0
+end
+
+# The camera tetrad in Kerr–Schild coordinates, optionally Lorentz-boosted by
+# the camera's 3-velocity `beta`. These tests are executable statements of the
+# theory: the tetrad must be orthonormal under the KS metric (g(e_a, e_b) =
+# η_ab), and in flat space the per-ray frequency shift must reproduce the
+# exact relativistic Doppler factor γ(1 + β).
+@testset "Boosted camera tetrad" begin
+    ks_metric(pos, M) = begin
+        r = norm(pos)
+        l = SVector(1.0, (pos / r)...)
+        Matrix(Diagonal(SVector(-1.0, 1.0, 1.0, 1.0))) + (2M / r) * (l * l')
+    end
+    η = Diagonal([-1.0, 1.0, 1.0, 1.0])
+    for (r, β) in [(30.0, SVector(0.5, 0.0, 0.0)),
+                   (5.0, SVector(-0.6, 0.2, 0.1)),
+                   (2.6, SVector(0.3, -0.3, 0.2)),
+                   (100.0, SVector(0.0, 0.0, 0.9))]
+        pos = r * normalize(SVector(1.0, 0.3, -0.2))
+        fwd = normalize(-pos)
+        right = normalize(cross(fwd, SVector(0.0, 0.0, 1.0)))
+        upl = cross(right, fwd)
+        u, Ef, Er, Eu = SpaceTime.ks_camera_tetrad(pos, fwd, right, upl, 1.0; beta=β)
+        T = [u Ef Er Eu]
+        @test maximum(abs.(T' * ks_metric(pos, 1.0) * T - η)) < 1.0e-12
+    end
+
+    # Flat-space Doppler through the kernel's ray-initialisation algebra.
+    pos = SVector(1.0e6, 0.0, 0.0)
+    fwd = SVector(-1.0, 0.0, 0.0)
+    right = SVector(0.0, -1.0, 0.0)
+    upl = SVector(0.0, 0.0, 1.0)
+    for βf in (0.5, -0.5)
+        u, Ef, _, _ = SpaceTime.ks_camera_tetrad(pos, fwd, right, upl, 1.0;
+                                                 beta=SVector(βf, 0.0, 0.0))
+        q = Ef - u                       # backward-traced centre-pixel ray
+        x̂ = pos / norm(pos)
+        p_t = -q[1] + (2.0 / norm(pos)) * (q[1] + dot(x̂, q[2:4]))
+        γ = 1.0 / sqrt(1.0 - βf^2)
+        @test 1.0 / abs(p_t) ≈ γ * (1.0 + βf) atol = 1.0e-5
+    end
+
+    # beta = 0 must reproduce the unboosted tetrad exactly.
+    pos = SVector(10.0, 1.0, 0.5)
+    fwd = normalize(-pos)
+    right = normalize(cross(fwd, SVector(0.0, 0.0, 1.0)))
+    upl = cross(right, fwd)
+    t0 = SpaceTime.ks_camera_tetrad(pos, fwd, right, upl, 1.0)
+    t1 = SpaceTime.ks_camera_tetrad(pos, fwd, right, upl, 1.0;
+                                    beta=SVector(0.0, 0.0, 0.0))
+    @test all(map((a, b) -> a == b, t0, t1))
+end
+
+@testset "Shadow radius" begin
+    bh1 = Schwarzschild(1.0)
+    # Far away, the shadow's angular radius approaches the critical impact
+    # parameter over distance: α ≈ 3√3 M / r.
+    far = Camera(SVector(0.0, -1.0e6, 0.0), SVector(0.0, 1.0, 0.0),
+                 SVector(0.0, 0.0, 1.0))
+    @test shadow_radius(far, bh1) * far.fov_factor ≈ 3.0 * sqrt(3.0) / 1.0e6 rtol = 1.0e-6
+    # Closer than r = 3√3 M every rearward escape direction is cut off: the
+    # shadow wraps the whole sky.
+    near = Camera(SVector(0.0, -5.0, 0.0), SVector(0.0, 1.0, 0.0),
+                  SVector(0.0, 0.0, 1.0))
+    @test shadow_radius(near, bh1) == Inf
 end
 
 @testset "Post-processing effects" begin

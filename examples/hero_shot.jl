@@ -19,7 +19,7 @@ using Images: clamp01nan
 lowres = get(ENV, "HERO_LOWRES", "0") == "1"
 W, H, S, TS = lowres ? (480, 270, 1, 2) : (3840, 2160, 4, 6)
 
-bg = load(joinpath(@__DIR__, "..", "starmap_g4k.jpg"))
+bg = load(joinpath(dirname(@__DIR__), "assets", "starmap_g4k.jpg"))
 bh = Schwarzschild(1.0)
 disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
                      blackbody=Blackbody(wb_temperature=10000.0),
@@ -28,7 +28,7 @@ disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
 # Volumetric turbulent gas disc (comment out to fall back to the thin plane).
 volume = DiscVolume(disc; M=1.0)
 
-# Composition from demonstration.jl's "COOL SCENE": just above the disc plane,
+# The "COOL SCENE" composition: just above the disc plane,
 # rolled 20°, looking through the disc at the shadow.
 world_up = SVector(0.0, 0.0, 1.0)
 world_right = SVector(0.0, 1.0, 0.0)

@@ -15,7 +15,7 @@ Auto balance — with a live preview on a ≤960-wide proxy and an
 "Export PNG" button that runs the full-resolution pipeline and writes
 `<raw>_graded.png`.
 
-Launch with `julia -t auto,1 --project post_demo.jl <raw.tiff>` so grading
+Launch with `julia -t auto,1 --project examples/postprocess_demo.jl <raw.tiff>` so grading
 runs on a worker thread. Returns the `Figure`.
 """
 function postprocessor(rawpath::AbstractString; title::String=basename(rawpath))

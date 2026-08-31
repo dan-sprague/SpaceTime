@@ -2,7 +2,7 @@
 # flythrough's "Save raw" button (or save_raw).
 #
 # Run with:
-#     julia -t auto,1 --project post_demo.jl <raw.tiff>
+#     julia -t auto,1 --project examples/postprocess_demo.jl <raw.tiff>
 
 using Pkg
 Pkg.activate(".")
@@ -11,7 +11,7 @@ using SpaceTime
 using GLMakie
 
 isempty(ARGS) &&
-    error("usage: julia -t auto,1 --project post_demo.jl <raw.tiff>")
+    error("usage: julia -t auto,1 --project examples/postprocess_demo.jl <raw.tiff>")
 
 fig = postprocessor(ARGS[1])
 isinteractive() || wait(Makie.getscreen(fig.scene))

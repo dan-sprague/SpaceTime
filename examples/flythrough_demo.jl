@@ -2,7 +2,7 @@
 # Schwarzschild black hole with a volumetric accretion disc.
 #
 # Run with:
-#     julia -t auto,1 --project fly_demo.jl
+#     julia -t auto,1 --project examples/flythrough_demo.jl
 #
 # Controls: drag to look, scroll to dolly, WASD to move, Q/E down/up,
 # Z/C to roll, Shift for 5× speed. Auto speed slows you down near the
@@ -17,7 +17,7 @@ using GLMakie
 using StaticArrays
 using FileIO
 
-bg = load("starmap_g4k.jpg")
+bg = load(joinpath(dirname(@__DIR__), "assets", "starmap_g4k.jpg"))
 
 spacetime = Schwarzschild(1.0)
 disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,

@@ -41,10 +41,10 @@ frames = joinpath(ROOT, "renders", "escape$(tag)", RES)
 mkpath(joinpath(frames, "png"))
 SAVE_TIFF && mkpath(joinpath(frames, "linear"))
 outmp4 = get(ENV, "OUT",
-    joinpath(ROOT, FINAL ? "porthole_escape$(tag)_1080p.mp4" :
+    joinpath(ROOT, "renders", FINAL ? "porthole_escape$(tag)_1080p.mp4" :
                            "porthole_escape$(tag)_proxy_360p.mp4"))
 
-bg = load(joinpath(ROOT, "starmap_g4k.jpg"))
+bg = load(joinpath(ROOT, "assets", "starmap_g4k.jpg"))
 st = Schwarzschild(1.0)
 disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
                      blackbody=Blackbody(wb_temperature=10000.0), density_falloff=0.8)

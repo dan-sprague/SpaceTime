@@ -484,7 +484,7 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
             rendering[] = false
             gpu_btn.label[] = "GPU render"
             status_obs[] = res[1] === :ok ?
-                "Saved: $(res[2]) (+ .toml) — grade with post_demo.jl" :
+                "Saved: $(res[2]) (+ .toml) — grade with examples/postprocess_demo.jl" :
                 "GPU render error (see terminal)"
         end
     end
@@ -543,7 +543,7 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
             rendering[] = false
             cpu_btn.label[] = "CPU render"
             status_obs[] = res[1] === :ok ?
-                "Saved: $(res[2]) (+ .toml) — grade with post_demo.jl" :
+                "Saved: $(res[2]) (+ .toml) — grade with examples/postprocess_demo.jl" :
                 "CPU render error (see terminal)"
         end
     end
