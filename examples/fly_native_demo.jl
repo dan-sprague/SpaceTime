@@ -29,5 +29,9 @@ volume = DiscVolume(disc; M=spacetime.M)
 cam = SpaceTime.Camera(SVector(30.0, 1.1, 1.6), SVector(0.0, 0.0, 0.0),
                        SVector(0.0, 0.0, 1.0), Lens(24.0))
 
+# RES=1080|1440|2160 selects the render resolution (default 1440).
+res = get(Dict("1080" => (1920, 1080), "1440" => (2560, 1440),
+               "2160" => (3840, 2160)), get(ENV, "RES", "1440"), (2560, 1440))
 fly_native(cam, spacetime, bg; disc=disc, volume=volume,
+           width=res[1], height=res[2],
            max_seconds=haskey(ENV, "SPACETIME_SMOKE") ? 8.0 : Inf)
