@@ -47,6 +47,12 @@ constant radius.*
   tetrad is Lorentz-boosted: aberration crowds the sky forward, the forward
   view blueshifts and beams (g⁴), the rear view dims toward black. Every
   black-hole video you've seen is falling; this one is flying.
+- **A camera with mass** — in the flight simulator the camera rides a
+  timelike worldline integrated with the same geodesic equations as the
+  light: engines off is exact free fall (orbits, plunges, accelerometer at
+  zero), thrust is proper acceleration in the ship's own frame, and the
+  ship's velocity feeds the boosted tetrad, so aberration and Doppler build
+  as you burn.
 - **Time dilation telemetry** — video renders can burn in a HUD comparing the
   ship's proper time (dτ = dt·√(1−2M/r)/γ) against coordinate time at
   infinity.
@@ -159,6 +165,25 @@ down to 2.6M and speeds up to 0.9c; the per-ray frequency shift reproduces
 the exact relativistic Doppler factor γ(1+β); the far-field shadow matches
 the critical impact parameter 3√3 M. The CPU and GPU renderers are kept as
 mutual references — same scene, two independent formulations.
+
+## How this was built, and why it's free
+
+<!-- TODO(dan): write this section. Notes:
+- Built with AI (Anthropic's Claude); state it plainly, up front.
+- Nobody yet knows what the scientific community's norms for AI-assisted
+  work should be — the tools arrived before the culture.
+- This repo's answer is a standard that doesn't ask for trust: every physics
+  claim is executable (tetrad orthonormality vs the metric at machine
+  precision, exact Doppler γ(1+β), shadow pinned to 3√3 M; independent CPU
+  and GPU implementations must agree).
+- Hope: this package as an example of the good that can come from these
+  tools.
+- The pledge: MIT forever; no CLA ever (contributors keep copyright — the
+  structural guarantee against relicensing); no future version under a more
+  restrictive license; any commercial work built on this package, never
+  instead of it; nothing scientific ever paywalled.
+- Free, for everyone, forever.
+-->
 
 ## Credits
 

@@ -4,9 +4,11 @@
 # Run with:
 #     julia -t auto,1 --project examples/flythrough_demo.jl
 #
-# Controls: drag to look, scroll to dolly, WASD to move, Q/E down/up,
-# Z/C to roll, Shift for 5× speed. Auto speed slows you down near the
-# horizon — try flying inside the photon sphere (r < 3M).
+# The camera is a ship with mass on a true GR worldline: W/S A/D Q/E thrust
+# in the ship frame, Space retro-burns to rest, Shift is a 4× burn, drag to
+# look, Z/C to roll. Let go of the keys and you free-fall — try burning
+# sideways near r = 8M and cutting the engines to enter an orbit, and watch
+# the telemetry: the accelerometer reads zero while you fall.
 
 using Pkg
 Pkg.activate(".")

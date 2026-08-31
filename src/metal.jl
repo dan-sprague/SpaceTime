@@ -105,7 +105,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
                                nmax, Float32(r_escape_factor),
                                !isnothing(volume),
                                Base.RefValue{Bool}(!isnothing(volume)),
-                               Base.RefValue{Any}(Dict{Bool,Any}()))
+                               Base.RefValue{Any}(Dict{Any,Any}()))
 end
 
 """
@@ -297,7 +297,7 @@ several short dispatches.
 function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                            spacetime_params, disc_params, width, height,
                            nmax, dt, jitter_u, jitter_v, weight, row0, rows,
-                           ::Val{VOL}) where {VOL}
+                           ::Val{VOL}, ::Val{NB}) where {VOL, NB}
     idx = thread_position_in_grid().x
     total = width * rows
     if idx > total
@@ -441,6 +441,13 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     acc_b = 0.0f0
     alpha = 1.0f0
 
+    # Depth bucketing (NB > 0): emission is written directly into `out`'s
+    # 3·NB channels, binned by integrated path length `ell` — log-spaced bins
+    # over [1.5M, 120M], last bucket reserved for the escaped background.
+    # Enables physically-based depth of field as a post operation.
+    ell = 0.0f0
+    bscale = NB > 2 ? Float32(NB - 2) * 0.22820f0 : 1.0f0   # 1/(ln120 − ln1.5)
+
     # Fixed-step RK4 integration. Backward-traced rays exit the horizon
     # freely (camera inside: r strictly increases) but can never legally
     # enter it — a ray reaching the band just above r = 2M while moving
@@ -484,6 +491,9 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
         pxp = px; pyp = py; pzp = pz
 
         k1 = ks_rhs_mtl(x, y, z, px, py, pz, p_t, M)
+        if NB > 0
+            ell += h * sqrt(k1[1] * k1[1] + k1[2] * k1[2] + k1[3] * k1[3])
+        end
 
         # Volumetric disc: sample the density grid and accumulate
         # Doppler-shaded emission/absorption. Sampled every 2nd step (with
@@ -525,9 +535,19 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                         tau = vol_opac * ρ * ds
                         a = 1.0f0 - exp(-tau)
                         w = alpha * a * inten * vol_emis
-                        acc_r += w * col_r
-                        acc_g += w * col_g
-                        acc_b += w * col_b
+                        if NB > 0
+                            bi = ell <= 1.5f0 ? Int32(1) :
+                                 clamp(unsafe_trunc(Int32,
+                                           (log(ell) - 0.405465f0) * bscale) +
+                                       Int32(1), Int32(1), Int32(NB - 1))
+                            out[3 * (bi - 1) + 1, i, j] += weight * w * col_r
+                            out[3 * (bi - 1) + 2, i, j] += weight * w * col_g
+                            out[3 * (bi - 1) + 3, i, j] += weight * w * col_b
+                        else
+                            acc_r += w * col_r
+                            acc_g += w * col_g
+                            acc_b += w * col_b
+                        end
                         alpha *= (1.0f0 - a)
                         if alpha < 0.003f0
                             break   # transmittance exhausted
@@ -617,9 +637,19 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                 opacity = iscotaper * outertaper * dpow
 
                 w = alpha * opacity * inten
-                acc_r += w * col_r
-                acc_g += w * col_g
-                acc_b += w * col_b
+                if NB > 0
+                    bi = ell <= 1.5f0 ? Int32(1) :
+                         clamp(unsafe_trunc(Int32,
+                                   (log(ell) - 0.405465f0) * bscale) +
+                               Int32(1), Int32(1), Int32(NB - 1))
+                    out[3 * (bi - 1) + 1, i, j] += weight * w * col_r
+                    out[3 * (bi - 1) + 2, i, j] += weight * w * col_g
+                    out[3 * (bi - 1) + 3, i, j] += weight * w * col_b
+                else
+                    acc_r += w * col_r
+                    acc_g += w * col_g
+                    acc_b += w * col_b
+                end
                 alpha *= (1.0f0 - opacity)
             end
         end
@@ -632,9 +662,11 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     # (near-)critical or horizon-hugging: treat them as black too.
     rf = max(sqrt(x * x + y * y + z * z), 1.0f-6)
     if hit_horizon || rf < 4.0f0 * M
-        out[1, i, j] += weight * acc_r
-        out[2, i, j] += weight * acc_g
-        out[3, i, j] += weight * acc_b
+        if NB == 0   # bucketed emission was already written during the march
+            out[1, i, j] += weight * acc_r
+            out[2, i, j] += weight * acc_g
+            out[3, i, j] += weight * acc_b
+        end
     else
         # Escaped rays show the background sky attenuated by any disc gas
         # along the way. Sample by the asymptotic momentum direction, not the
@@ -659,9 +691,15 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
             g_col *= 90.2f0 / (exp(4.513f0 / scam) - 1.0f0)
             b_col *= 206.5f0 / (exp(5.335f0 / scam) - 1.0f0)
         end
-        out[1, i, j] += weight * (acc_r + alpha * r_col)
-        out[2, i, j] += weight * (acc_g + alpha * g_col)
-        out[3, i, j] += weight * (acc_b + alpha * b_col)
+        if NB > 0   # background lives in the last (infinity) bucket
+            out[3 * (NB - 1) + 1, i, j] += weight * alpha * r_col
+            out[3 * (NB - 1) + 2, i, j] += weight * alpha * g_col
+            out[3 * (NB - 1) + 3, i, j] += weight * alpha * b_col
+        else
+            out[1, i, j] += weight * (acc_r + alpha * r_col)
+            out[2, i, j] += weight * (acc_g + alpha * g_col)
+            out[3, i, j] += weight * (acc_b + alpha * b_col)
+        end
     end
 
     return nothing
@@ -706,18 +744,22 @@ allocates nothing per frame.
 """
 function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
                             spacetime::Schwarzschild; fisheye_deg::Real=0.0,
-                            relativistic::Bool=false)
+                            relativistic::Bool=false,
+                            beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
     img = Matrix{RGBf}(undef, ctx.width, ctx.height)
     host = Array{Float32,3}(undef, 3, ctx.width, ctx.height)
     return render_preview_mtl!(img, host, ctx, cam, spacetime;
                                fisheye_deg=fisheye_deg,
-                               relativistic=relativistic)
+                               relativistic=relativistic, beta=beta)
 end
 
 function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              ctx::MetalPreviewContext, cam::Camera,
                              spacetime::Schwarzschild; fisheye_deg::Real=0.0,
-                             relativistic::Bool=false)
+                             relativistic::Bool=false,
+                             beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
+                             band_rows::Int=0,
+                             on_band::Union{Nothing,Function}=nothing)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -733,14 +775,31 @@ function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
 
     # Update reusable GPU parameter buffers with a single host-to-device copy.
     copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
-                                           fisheye_deg=fisheye_deg))
+                                           fisheye_deg=fisheye_deg, beta=beta))
     copyto!(ctx.spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
 
     fill!(ctx.out_gpu, 0.0f0)
-    _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params, ctx.spacetime_params,
-                   ctx.width, ctx.height, nmax, dt,
-                   0.5f0, 0.5f0, 1.0f0, 0, ctx.height)
+    if band_rows <= 0 || on_band === nothing
+        _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params, ctx.spacetime_params,
+                       ctx.width, ctx.height, nmax, dt,
+                       0.5f0, 0.5f0, 1.0f0, 0, ctx.height)
+    else
+        # Banded dispatch: split the frame into row bands and call `on_band`
+        # after each one, so a flight loop can slot cheap reprojection
+        # frames between bands — the display keeps responding while a slow
+        # full trace assembles (a monolithic dispatch would occupy the GPU
+        # for its whole duration; Apple GPUs don't preempt mid-dispatch).
+        row0 = 0
+        while row0 < ctx.height
+            rows = min(band_rows, ctx.height - row0)
+            _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params,
+                           ctx.spacetime_params, ctx.width, ctx.height,
+                           nmax, dt, 0.5f0, 0.5f0, 1.0f0, row0, rows)
+            row0 += rows
+            row0 < ctx.height && on_band()
+        end
+    end
     copyto!(host, ctx.out_gpu)
     @inbounds for j in 1:ctx.height, i in 1:ctx.width
         img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
@@ -756,24 +815,75 @@ concurrently with preview frames that update the context's buffers.
 function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         spacetime_params, width::Int, height::Int,
                         nmax::Int, dt::Float32, ju::Float32, jv::Float32,
-                        weight::Float32, row0::Int, rows::Int)
+                        weight::Float32, row0::Int, rows::Int; nb::Int=0)
     von = ctx.vol_on[]
-    kernels = ctx.kernel[]::Dict{Bool,Any}
-    if !haskey(kernels, von)
-        kernels[von] = @metal launch=false trace_kernel_mtl!(
+    kernels = ctx.kernel[]::Dict{Any,Any}
+    key = (von, nb)
+    if !haskey(kernels, key)
+        kernels[key] = @metal launch=false trace_kernel_mtl!(
             out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
             cam_params, spacetime_params, ctx.disc_params, width, height,
-            nmax, dt, ju, jv, weight, row0, rows, Val(von))
+            nmax, dt, ju, jv, weight, row0, rows, Val(von), Val(nb))
     end
-    kernel = kernels[von]
+    kernel = kernels[key]
     n = width * rows
     threads = min(kernel.pipeline.maxTotalThreadsPerThreadgroup, n)
     groups = cld(n, threads)
     kernel(out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
            cam_params, spacetime_params, ctx.disc_params, width, height,
-           nmax, dt, ju, jv, weight, row0, rows, Val(von);
+           nmax, dt, ju, jv, weight, row0, rows, Val(von), Val(nb);
            threads=threads, groups=groups)
     return nothing
+end
+
+"""
+    render_depth_mtl(ctx, cam, spacetime; width, height, samples=2, dt=0.02,
+                     nbuckets=10, fisheye_deg=0.0, relativistic=false, beta=0)
+
+Pinhole draft render with emission separated into `nbuckets` path-length
+buckets (log-spaced over 1.5M–120M; the last bucket holds the escaped
+background at infinity). Returns a `(3*nbuckets, width, height)`
+`Array{Float32,3}` — feed to [`lens_post`](@ref) for depth-of-field as a post
+operation at any aperture/focus, without re-rendering.
+"""
+function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
+                          spacetime::Schwarzschild;
+                          width::Int=1920, height::Int=1080,
+                          samples::Int=2, dt::Real=0.02,
+                          nbuckets::Int=10, fisheye_deg::Real=0.0,
+                          rng::Random.AbstractRNG=Random.default_rng(),
+                          relativistic::Bool=false,
+                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
+    nbuckets >= 3 || throw(ArgumentError("nbuckets must be ≥ 3"))
+    dt32 = Float32(dt)
+    M = Float32(spacetime.M)
+    r_band = Float32(2.05 * spacetime.M)
+    r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
+                                                 15.0 * spacetime.M))
+    nmax = min(max(ctx.nmax,
+                   ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt32)),
+               40_000)
+    cam_params = MtlVector{Float32}(undef, 28)
+    spacetime_params = MtlVector{Float32}(undef, 4)
+    copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
+                                       fisheye_deg=fisheye_deg, beta=beta))
+    copyto!(spacetime_params,
+            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
+    out = MtlArray{Float32,3}(undef, 3 * nbuckets, width, height)
+    fill!(out, 0.0f0)
+    rows_per_tile = clamp(ceil(Int, 2.0e9 / (width * nmax)), 16, height)
+    ntiles = cld(height, rows_per_tile)
+    weight = Float32(1.0 / samples^2)
+    offsets = jittered_grid(samples; rng=rng)
+    for off in offsets, tile in 0:(ntiles - 1)
+        row0 = tile * rows_per_tile
+        rows = min(rows_per_tile, height - row0)
+        _launch_trace!(ctx, out, cam_params, spacetime_params, width, height,
+                       nmax, dt32, Float32(off[1]), Float32(off[2]), weight,
+                       row0, rows; nb=nbuckets)
+    end
+    Metal.synchronize()
+    return Array(out)
 end
 
 """Copy a `(3, W, H)` GPU buffer back as a `Matrix{RGBf}`."""

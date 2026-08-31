@@ -33,6 +33,7 @@ using Random
 using Metal
 using TOML
 using Dates
+using Printf
 
 # Physics: metric, blackbody radiation, disc models
 include("gr.jl")
@@ -55,10 +56,12 @@ include("rawio.jl")
 # GPU renderer (Metal, Kerr–Schild) and interactive apps
 include("utils.jl")
 include("viewfinder.jl")
+include("ship.jl")       # GR flight dynamics; uses the viewfinder integrator
 include("metal.jl")
 include("disc_sim.jl")   # live fluid disc; dispatches on MetalPreviewContext
 include("flythrough.jl")
 include("postapp.jl")
+include("app.jl")        # julia_main: standalone-app entry point (create_app)
 
 # --- Spacetimes and geodesics
 export AbstractSpacetime, Schwarzschild, Kerr, metric_inverse, hamiltonian
@@ -84,8 +87,9 @@ export render, render_no_doppler, render_motion
 export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
        render_draft_mtl, set_volume_enabled!, set_disc_enabled!
 
-# --- Interactive apps
+# --- Interactive apps and flight dynamics
 export PreviewSettings, render_preview, viewfinder, flythrough, postprocessor
+export ShipState, step_ship!, ship_velocity
 
 # --- Image pipeline
 export postprocess, airy_convolve, generate_psf, fft_convolve, aces_tonemap,

@@ -10,6 +10,7 @@ const _FLY_RESOLUTIONS = [
     ("960 × 540", (960, 540)),
     ("1280 × 720", (1280, 720)),
     ("1920 × 1080", (1920, 1080)),
+    ("2560 × 1440", (2560, 1440)),
 ]
 
 """
@@ -44,17 +45,33 @@ end
                settings=PreviewSettings(width=960, height=540),
                title="Black Hole Flythrough")
 
-A minimal real-time flight app: one full-window ray-traced view of the black
-hole (Metal GPU, Kerr–Schild geodesics) and a thin control bar. No photo
-controls — the only purpose is to fly.
+A real-time flight app: one full-window ray-traced view of the black hole
+(Metal GPU, Kerr–Schild geodesics) and a thin control bar.
 
-- **Drag** to look, **scroll** to dolly, **W/A/S/D** to move, **Q/E** for
-  world-vertical, **Z/C** to roll, **Shift** for 5× speed. Keys act while the
-  mouse is over the view.
+The camera has mass. In **Flight** mode (the default) it rides a
+[`ShipState`](@ref) — a timelike worldline integrated with the same
+Kerr–Schild geodesic equations the renderer uses. Engines off is exact free
+fall: release the keys near the hole and you orbit, or plunge, with the
+accelerometer reading zero. Thrust keys apply a proper acceleration in the
+ship's own frame, and the ship's velocity relative to the local reference
+observer Lorentz-boosts the camera tetrad, so aberration, motion Doppler,
+and beaming develop as you accelerate.
+
+- **Drag** to look, **W/S · A/D · Q/E** to thrust (forward/right/up in the
+  ship frame), **Space** to retro-burn to rest, **Shift** for a 4× burn,
+  **Z/C** to roll. Keys act while the mouse is over the view.
+- **Thrust** sets the maximum proper acceleration (c²/M — what the ship's
+  accelerometer reads under full burn); **Time warp** sets how much proper
+  time passes per wall second (0 pauses the dynamics). Hovering at the
+  photon sphere needs ≈ 0.2 c²/M.
+- The telemetry row shows speed `β`, `γ`, the accelerometer, and the ship's
+  proper time `τ` against far-away coordinate time `t` (seconds for a
+  1e5 M☉ hole).
+- **Flight off** restores the kinematic ghost camera (scroll dollies,
+  Auto speed scales movement with altitude).
 - **Resolution** dropdown switches the render size live (contexts share the
-  GPU background/volume, so switching is instant).
-- **Auto speed** scales movement with altitude above the horizon, so the
-  approach slows as you dive toward — and inside — the photon sphere.
+  GPU background/volume, so switching is instant); **Reproject** (default
+  on) fills between full traces with rotation-warped frames.
 - The readout shows `r` in units of M and flags horizon / photon-sphere /
   ISCO crossings.
 
@@ -92,12 +109,28 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # beyond any rectilinear focal length.
     fisheye_obs = Observable(0.0)
     # Relativistic shading: gravitational blueshift + Doppler of the camera
-    # applied to the sky (Planck-locus tint + brightness) and disc.
-    rel_obs = Observable(false)
+    # applied to the sky (Planck-locus tint + brightness) and disc. Defaults
+    # on: in flight mode the ship reaches speeds where it matters.
+    rel_obs = Observable(true)
     focal_obs = Observable(24.0)
     move_speed_obs = Observable(2.0)
     auto_speed_obs = Observable(true)
     status_obs = Observable("Starting Metal preview…")
+
+    # ------------------------------------------------------------------
+    # Flight dynamics: the camera rides a ShipState — a true GR worldline
+    # (covariant 4-momentum, Kerr–Schild RK4). Engines off is exact free
+    # fall; thrust is proper acceleration in the ship's own frame. The
+    # ship's velocity relative to the local reference observer is fed to
+    # the renderer as `beta`, so aberration/Doppler/beaming track flight.
+    # ------------------------------------------------------------------
+    spawn_pos = SVector{3,Float64}(cam.pos)
+    ship = Ref(ShipState(spawn_pos, M))
+    flight_obs = Observable(true)
+    thrust_obs = Observable(0.05)    # max proper acceleration, c²/M
+    twarp_obs = Observable(2.0)      # M of proper time per wall second
+    beta_ref = Ref(SVector(0.0, 0.0, 0.0))   # renderer beta; under state_lock
+    telem_obs = Observable("engines idle — W/A/S/D/Q/E thrust, Space brake")
 
     base_ctx = MetalPreviewContext(background, settings.width, settings.height;
                                    dt=settings.dt, nmax=settings.nmax,
@@ -112,13 +145,21 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     end
 
     # Pre-compile both kernel variants (the cache is shared by every
-    # resolution) so the first volumetric-toggle flip doesn't hitch mid-flight.
+    # resolution) so the first volumetric-toggle flip doesn't hitch mid-flight,
+    # and the warp kernel so the first reprojected frame doesn't stall a trace.
     if base_ctx.has_volume
         set_volume_enabled!(base_ctx, false)
         render_preview_mtl(base_ctx, build_camera(), spacetime)
         set_volume_enabled!(base_ctx, true)
     end
     render_preview_mtl(base_ctx, build_camera(), spacetime)
+    let w = settings.width, h = settings.height, cam0 = build_camera()
+        warp_preview_mtl!(Matrix{RGBf}(undef, w, h),
+                          Array{Float32,3}(undef, 3, w, h), base_ctx,
+                          MtlArray{Float32}(undef, 3, w, h),
+                          copy(base_ctx.out_gpu),
+                          MtlVector{Float32}(undef, 22), cam0, cam0)
+    end
 
     # Latest-wins request coalescing (same pattern as the viewfinder): the UI
     # bumps a version and pokes the worker; the worker re-renders until it has
@@ -141,7 +182,7 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # traced frame warped by the camera rotation since it was traced (exact
     # for rotation; translation error is corrected by the next full trace,
     # forced at least every FULL_TRACE_PERIOD).
-    reproj_flag = Ref(false)
+    reproj_flag = Ref(true)
     FULL_TRACE_PERIOD = 0.1
 
     function request_render()
@@ -159,14 +200,22 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
         BufT = Tuple{Array{Float32,3},Matrix{RGBf},Matrix{RGBf}}
         bufs = Dict{Tuple{Int,Int},BufT}()
         # Reprojection state: retained copy of the last traced frame plus the
-        # camera/lens it was traced with, and the warp scratch buffers.
-        WBufT = Tuple{MtlArray{Float32,3},MtlArray{Float32,3},MtlVector{Float32}}
+        # camera/lens it was traced with, the warp scratch buffers, and a
+        # separate image ping-pong for warped frames (full frames and warps
+        # alternate independently, so no publish ever rewrites the matrix
+        # GL most recently uploaded).
+        WBufT = Tuple{MtlArray{Float32,3},MtlArray{Float32,3},
+                      MtlVector{Float32},Matrix{RGBf},Matrix{RGBf}}
         wbufs = Dict{Tuple{Int,Int},WBufT}()
         prev_cam = Ref{Any}(nothing)
         prev_fe = Ref(0.0)
+        prev_beta = Ref(SVector(0.0, 0.0, 0.0))
         prev_dims = Ref((0, 0))
         last_full = Ref(0.0)
+        last_trace_cost = Ref(0.05)
+        last_pub_look = Ref{Any}(nothing)
         flip = false
+        wflip = false
         min_period = 1 / 40   # rendering faster than this only floods thread 1
         warp_period = 1 / 60  # warped frames are cheap; let them run faster
         try
@@ -175,18 +224,24 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                 while done < render_version[]
                     v = render_version[]
                     cam_now = build_camera()
-                    ctx_now = lock(state_lock) do
-                        ctx_ref[]
+                    ctx_now, beta_now = lock(state_lock) do
+                        (ctx_ref[], beta_ref[])
                     end
                     t0 = time()
                     fe_now = fisheye_obs[]
                     dims = (ctx_now.width, ctx_now.height)
-                    # Warp when reprojection is on, the retained frame is
-                    # fresh (< FULL_TRACE_PERIOD) and compatible (same lens
-                    # and resolution); otherwise trace and retain.
-                    warped = reproj_flag[] && prev_cam[] !== nothing &&
-                             t0 - last_full[] < FULL_TRACE_PERIOD &&
-                             fe_now == prev_fe[] && dims == prev_dims[]
+                    # A retained frame is usable for warping while it is
+                    # compatible (same lens, resolution, near-identical
+                    # aberration — the warp is rotation-only, so a changing
+                    # beta must retrace). Serve pure rotation from warps
+                    # while the frame is also fresh; the freshness window
+                    # scales with the measured trace cost so high
+                    # resolutions don't retrace on every mouse move.
+                    compat = reproj_flag[] && prev_cam[] !== nothing &&
+                             fe_now == prev_fe[] && dims == prev_dims[] &&
+                             norm(beta_now - prev_beta[]) < 0.02
+                    warped = compat && t0 - last_full[] <
+                             max(FULL_TRACE_PERIOD, 1.5 * last_trace_cost[])
                     img = try
                         if !warped && live_flag[] && !isnothing(fluid_sim) &&
                            ctx_now.vol_on[]
@@ -205,30 +260,72 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                              Matrix{RGBf}(undef, ctx_now.width, ctx_now.height),
                              Matrix{RGBf}(undef, ctx_now.width, ctx_now.height))
                         end
-                        flip = !flip
+                        wbuf() = get!(wbufs, dims) do
+                            (MtlArray{Float32}(undef, 3, dims...),
+                             MtlArray{Float32}(undef, 3, dims...),
+                             MtlVector{Float32}(undef, 22),
+                             Matrix{RGBf}(undef, dims...),
+                             Matrix{RGBf}(undef, dims...))
+                        end
                         if warped
-                            prev_gpu, wout, wpar = wbufs[dims]
-                            warp_preview_mtl!(flip ? ia : ib, host, ctx_now,
-                                              wout, prev_gpu, wpar, cam_now,
-                                              prev_cam[]; fisheye_deg=fe_now)
+                            prev_gpu, wout, wpar, wa, wb = wbuf()
+                            wflip = !wflip
+                            wimg = warp_preview_mtl!(wflip ? wa : wb, host,
+                                                     ctx_now, wout, prev_gpu,
+                                                     wpar, cam_now, prev_cam[];
+                                                     fisheye_deg=fe_now)
+                            last_pub_look[] = (cam_now.fwd, cam_now.up_local)
+                            wimg
                         else
-                            frame = render_preview_mtl!(flip ? ia : ib, host,
-                                                        ctx_now, cam_now,
-                                                        spacetime;
-                                                        fisheye_deg=fe_now,
-                                                        relativistic=rel_obs[])
-                            if reproj_flag[]
-                                prev_gpu, _, _ = get!(wbufs, dims) do
-                                    (MtlArray{Float32}(undef, 3, dims...),
-                                     MtlArray{Float32}(undef, 3, dims...),
-                                     MtlVector{Float32}(undef, 22))
+                            # Interleaved reprojection: while a slow trace
+                            # assembles in row bands, publish warp frames of
+                            # the previous trace at the freshest camera
+                            # orientation, so mouse-look never freezes even
+                            # at resolutions where a trace takes 100s of ms.
+                            on_band = nothing
+                            if compat
+                                prev_gpu, wout, wpar, wa, wb = wbuf()
+                                on_band = function ()
+                                    camw = build_camera()
+                                    look = (camw.fwd, camw.up_local)
+                                    look == last_pub_look[] && return
+                                    tw = time()
+                                    wflip = !wflip
+                                    wimg = warp_preview_mtl!(
+                                        wflip ? wa : wb, host, ctx_now, wout,
+                                        prev_gpu, wpar, camw, prev_cam[];
+                                        fisheye_deg=fe_now)
+                                    last_pub_look[] = look
+                                    while isready(img_chan)
+                                        take!(img_chan)
+                                    end
+                                    put!(img_chan, (wimg, time() - tw,
+                                                    norm(camw.pos)))
+                                    return
                                 end
+                            end
+                            flip = !flip
+                            frame = render_preview_mtl!(
+                                flip ? ia : ib, host, ctx_now, cam_now,
+                                spacetime; fisheye_deg=fe_now,
+                                relativistic=rel_obs[], beta=beta_now,
+                                band_rows=on_band === nothing ? 0 :
+                                          cld(ctx_now.height,
+                                              clamp(round(Int,
+                                                  last_trace_cost[] / 0.012),
+                                                    4, 24)),
+                                on_band=on_band)
+                            if reproj_flag[]
+                                prev_gpu, _, _, _, _ = wbuf()
                                 copyto!(prev_gpu, ctx_now.out_gpu)
                                 prev_cam[] = cam_now
                                 prev_fe[] = fe_now
+                                prev_beta[] = beta_now
                                 prev_dims[] = dims
                             end
                             last_full[] = time()
+                            last_trace_cost[] = last_full[] - t0
+                            last_pub_look[] = (cam_now.fwd, cam_now.up_local)
                             frame
                         end
                     catch e
@@ -314,6 +411,8 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
 
     on(events(ax.scene).scroll) do sc
         (_Makie.is_mouseinside(ax.scene) && sc[2] != 0) || return _Makie.Consume(false)
+        # Flight mode: no dolly — position belongs to the ship's worldline.
+        flight_obs[] && return _Makie.Consume(true)
         lock(state_lock) do
             fwd = _flycam_basis(state)[1]
             step = 0.05 * sc[2] * max(norm(state.pos) - 1.9 * M, 0.2)
@@ -419,7 +518,7 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     focus_sl = Slider(bar[2, 6]; range=0.5:0.5:60.0, startvalue=27.0, width=110)
     gpu_btn = Button(bar[2, 7]; label="GPU render")
     cpu_btn = Button(bar[2, 8]; label="CPU render")
-    rel_toggle = Toggle(bar[2, 9]; active=false)
+    rel_toggle = Toggle(bar[2, 9]; active=rel_obs[])
     Label(bar[2, 10], "Rel. shading"; halign=:left)
     on(rel_toggle.active) do a
         rel_obs[] = a
@@ -451,6 +550,9 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
         rendering[] && return
         rendering[] = true
         cam_now = build_camera()
+        beta_now = lock(state_lock) do
+            beta_ref[]
+        end
         fe = fisheye_obs[]
         ap = tl_toggle.active[] ? focus_sl.value[] / fnum_sl.value[] : 0.0
         tl_toggle.active[] && fe > 0.0 &&
@@ -467,12 +569,13 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                                        width=3840, height=2160, samples=smp,
                                        dt=0.02, fisheye_deg=fe,
                                        aperture_world=ap, focus_dist=focusd,
-                                       relativistic=rel_obs[])
+                                       relativistic=rel_obs[], beta=beta_now)
                 save_raw(fname, img; metadata=render_metadata(cam_now, fe, ap,
                     Dict{String,Any}("renderer" => "gpu_draft",
                                      "width" => 3840, "height" => 2160,
                                      "samples" => smp, "dt" => 0.02,
-                                     "relativistic" => rel_obs[])))
+                                     "relativistic" => rel_obs[],
+                                     "beta" => collect(beta_now))))
                 put!(result, (:ok, fname))
             catch e
                 @error "GPU render failed" exception=(e, catch_backtrace())
@@ -548,9 +651,37 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
         end
     end
 
-    Label(bar[3, 1:8], status_obs; halign=:left, fontsize=13, color=:gray)
-    Label(bar[4, 1:8],
-          "Drag: look · Scroll: dolly · WASD: move · Q/E: down/up · Z/C: roll · Shift: fast";
+    # Flight row: the physical-camera controls. Thrust is the ship's maximum
+    # proper acceleration (what its accelerometer reads under full burn);
+    # time warp scales how much proper time passes per wall second.
+    flight_toggle = Toggle(bar[3, 1]; active=flight_obs[])
+    Label(bar[3, 2], "Flight"; halign=:left)
+    Label(bar[3, 3], "Thrust (c²/M)"; halign=:right)
+    thrust_sl = Slider(bar[3, 4]; range=0.005:0.005:0.5,
+                       startvalue=thrust_obs[], width=110)
+    connect!(thrust_obs, thrust_sl.value)
+    Label(bar[3, 5], "Time warp (M/s)"; halign=:right)
+    twarp_sl = Slider(bar[3, 6]; range=0.0:0.25:30.0,
+                      startvalue=twarp_obs[], width=110)
+    connect!(twarp_obs, twarp_sl.value)
+    Label(bar[3, 7:16], telem_obs; halign=:left, fontsize=13,
+          color=RGBf(0.35, 0.55, 0.75))
+    on(flight_toggle.active) do a
+        flight_obs[] = a
+        lock(state_lock) do
+            # Entering flight: hand the ghost camera to a fresh ship at rest
+            # relative to the local reference observer. Leaving: freeze it.
+            a && (ship[] = ShipState(state.pos, M))
+            beta_ref[] = SVector(0.0, 0.0, 0.0)
+        end
+        telem_obs[] = a ? "engines idle — W/A/S/D/Q/E thrust, Space brake" :
+                          "ghost camera (no inertia)"
+        request_render()
+    end
+
+    Label(bar[4, 1:16], status_obs; halign=:left, fontsize=13, color=:gray)
+    Label(bar[5, 1:16],
+          "Drag: look · W/S A/D Q/E: thrust · Space: brake · Shift: burn ×4 · Z/C: roll · Flight off = ghost cam (scroll dollies)";
           halign=:left, fontsize=12, color=:gray)
 
     on(res_menu.selection) do res
@@ -569,62 +700,147 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     display(fig)
     request_render()
 
-    # Keyboard fly loop (thread 1, 30 Hz): moves while keys are held and the
-    # mouse is over the view, rendering only when something changed. The
+    # ------------------------------------------------------------------
+    # Physics ticker (thread 1, 60 Hz)
+    # ------------------------------------------------------------------
+    # Flight mode integrates the ship's GR worldline every tick, so the
+    # camera drifts — falls, orbits, coasts — with no input, and this loop
+    # drives rendering whenever it moved. Ghost mode is the old kinematic
+    # camera. Thrust keys act while the mouse is over the view; the
     # try/catch keeps a transient error (e.g. during window teardown) from
-    # silently killing the loop.
+    # silently killing the loop. Seconds/g conversions assume 1e5 M☉.
+    TUNIT = 0.49255       # seconds per M of time, 1e5 M☉
+    GEE = 6.21e7          # g per c²/M of proper acceleration, 1e5 M☉
+    last_wall = Ref(time())
+    last_telem = Ref(0.0)
     @async while events(fig.scene).window_open[]
         try
-        if _Makie.is_mouseinside(ax.scene)
-            moved = false
-            v = move_speed_obs[] / 30.0
-            ispressed(fig, Keyboard.left_shift) && (v *= 5.0)
-            lock(state_lock) do
-                # Auto speed: scale with altitude above the horizon so the
-                # dive through the photon sphere is flyable, not a teleport;
-                # inside the horizon scale with radius instead, so motion
-                # never freezes.
-                if auto_speed_obs[]
+            wall = time()
+            dwall = clamp(wall - last_wall[], 0.0, 0.1)
+            last_wall[] = wall
+            inside = _Makie.is_mouseinside(ax.scene)
+            key(k) = inside && ispressed(fig, k)
+            droll = ((key(Keyboard.c) ? 1.0 : 0.0) -
+                     (key(Keyboard.z) ? 1.0 : 0.0)) * 1.5 * dwall
+            if flight_obs[]
+                dτ = twarp_obs[] * dwall
+                acc = SVector(
+                    (key(Keyboard.w) ? 1.0 : 0.0) - (key(Keyboard.s) ? 1.0 : 0.0),
+                    (key(Keyboard.d) ? 1.0 : 0.0) - (key(Keyboard.a) ? 1.0 : 0.0),
+                    (key(Keyboard.e) ? 1.0 : 0.0) - (key(Keyboard.q) ? 1.0 : 0.0))
+                na = norm(acc)
+                na > 1.0 && (acc = acc / na)
+                amax = thrust_obs[] * (key(Keyboard.left_shift) ? 4.0 : 1.0)
+                brake = key(Keyboard.space)
+                moved = false
+                telem = nothing
+                lock(state_lock) do
+                    droll != 0.0 && (state.roll += droll; moved = true)
+                    s = ship[]
+                    fwd, right, _ = _flycam_basis(state)
+                    upr = _flycam_up(state)
+                    β, _ = ship_velocity(s, M, fwd, right, upr)
+                    sp = norm(β)
+                    if brake && sp > 0.0
+                        # Retro-burn straight against the velocity; snap to
+                        # rest (relative to the local reference observer)
+                        # once a tick of burn would overshoot zero.
+                        if sp < 1.5 * amax * dτ
+                            τ0, t0 = s.τ, s.t
+                            s = ShipState(s.x, M)
+                            s.τ, s.t = τ0, t0
+                            ship[] = s
+                            acc = SVector(0.0, 0.0, 0.0)
+                        else
+                            acc = -β / sp
+                        end
+                    end
+                    a_vec = acc * amax
+                    a_mag = norm(a_vec)
+                    if dτ > 0.0
+                        if a_mag > 0.0
+                            # Thrust acts along the ship's own (boosted)
+                            # frame axes — W burns toward screen centre.
+                            tetb = ks_camera_tetrad(s.x, fwd, right, upr, M;
+                                                    beta=β)
+                            step_ship!(s, M, dτ; accel=a_vec,
+                                       axes=(tetb[2], tetb[3], tetb[4]))
+                        else
+                            step_ship!(s, M, dτ)
+                        end
+                    end
+                    if norm(s.x) < 0.5 * M
+                        # The tidal field won: reset at the spawn point.
+                        s = ShipState(spawn_pos, M)
+                        ship[] = s
+                        telem = "SINGULARITY — ship reset"
+                    end
+                    if norm(s.x - state.pos) > 1.0e-9
+                        state.pos = s.x
+                        moved = true
+                    end
+                    β2, γ2 = ship_velocity(s, M, fwd, right, upr)
+                    sp2 = norm(β2)
+                    beta_ref[] = sp2 > 0.99 ? β2 * (0.99 / sp2) : β2
+                    if telem === nothing && wall - last_telem[] > 0.15
+                        gtxt = a_mag > 0.0 ?
+                            @sprintf("%.2f c²/M (%.1e g)", a_mag, a_mag * GEE) :
+                            "0 — free fall"
+                        telem = @sprintf(
+                            "β %.3f c · γ %.2f · accel %s · τ %.1f s · t %.1f s",
+                            sp2, γ2, gtxt, s.τ * TUNIT, s.t * TUNIT)
+                    end
+                end
+                if telem !== nothing
+                    last_telem[] = wall
+                    telem_obs[] = telem
+                end
+                moved && request_render()
+            elseif inside
+                moved = false
+                v = move_speed_obs[] * dwall
+                ispressed(fig, Keyboard.left_shift) && (v *= 5.0)
+                lock(state_lock) do
+                    droll != 0.0 && (state.roll += droll; moved = true)
+                    # Auto speed: scale with altitude above the horizon so
+                    # the dive through the photon sphere is flyable, not a
+                    # teleport; inside the horizon scale with radius
+                    # instead, so motion never freezes.
+                    if auto_speed_obs[]
+                        rn = norm(state.pos)
+                        v *= clamp(0.12 * max(rn - 1.9 * M, 0.25 * rn), 0.02, 8.0)
+                    end
+                    fwd, right, _ = _flycam_basis(state)
+                    world_z = SVector(0.0, 0.0, 1.0)
+                    if ispressed(fig, Keyboard.w)
+                        state.pos += v * fwd; moved = true
+                    end
+                    if ispressed(fig, Keyboard.s)
+                        state.pos -= v * fwd; moved = true
+                    end
+                    if ispressed(fig, Keyboard.a)
+                        state.pos -= v * right; moved = true
+                    end
+                    if ispressed(fig, Keyboard.d)
+                        state.pos += v * right; moved = true
+                    end
+                    if ispressed(fig, Keyboard.q)
+                        state.pos -= v * world_z; moved = true
+                    end
+                    if ispressed(fig, Keyboard.e)
+                        state.pos += v * world_z; moved = true
+                    end
+                    # Keep clear of the singularity (the integrator's safety
+                    # kill radius is 0.3M).
                     rn = norm(state.pos)
-                    v *= clamp(0.12 * max(rn - 1.9 * M, 0.25 * rn), 0.02, 8.0)
+                    rn < 0.45 * M && (state.pos *= 0.45 * M / rn)
                 end
-                fwd, right, _ = _flycam_basis(state)
-                world_z = SVector(0.0, 0.0, 1.0)
-                if ispressed(fig, Keyboard.w)
-                    state.pos += v * fwd; moved = true
-                end
-                if ispressed(fig, Keyboard.s)
-                    state.pos -= v * fwd; moved = true
-                end
-                if ispressed(fig, Keyboard.a)
-                    state.pos -= v * right; moved = true
-                end
-                if ispressed(fig, Keyboard.d)
-                    state.pos += v * right; moved = true
-                end
-                if ispressed(fig, Keyboard.q)
-                    state.pos -= v * world_z; moved = true
-                end
-                if ispressed(fig, Keyboard.e)
-                    state.pos += v * world_z; moved = true
-                end
-                if ispressed(fig, Keyboard.z)
-                    state.roll -= 1.5 / 30; moved = true
-                end
-                if ispressed(fig, Keyboard.c)
-                    state.roll += 1.5 / 30; moved = true
-                end
-                # Keep clear of the singularity (the integrator's safety
-                # kill radius is 0.3M).
-                rn = norm(state.pos)
-                rn < 0.45 * M && (state.pos *= 0.45 * M / rn)
+                moved && request_render()
             end
-            moved && request_render()
-        end
         catch e
-            @error "Flythrough key loop error" exception=(e, catch_backtrace())
+            @error "Flythrough physics loop error" exception=(e, catch_backtrace())
         end
-        sleep(1 / 30)
+        sleep(1 / 60)
     end
 
     return fig

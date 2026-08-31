@@ -134,3 +134,70 @@ end
     apply_lens_distortion!(img2; k1=0.0)
     @test size(img2) == (20, 20)
 end
+
+@testset "Ship dynamics" begin
+    M = 1.0
+
+    # At rest far from the hole: β = 0 against the reference observer, and
+    # the conserved energy is the static observer's −p_t = √(1 − 2M/r).
+    pos = SVector(10.0, 2.0, 1.0)
+    ship = ShipState(pos, M)
+    fwd = normalize(-pos)
+    right = normalize(cross(fwd, SVector(0.0, 0.0, 1.0)))
+    upl = cross(right, fwd)
+    β, γ = ship_velocity(ship, M, fwd, right, upl)
+    @test norm(β) < 1.0e-12
+    @test γ ≈ 1.0 atol = 1.0e-12
+    @test -ship.p_t ≈ sqrt(1.0 - 2.0 / norm(pos)) atol = 1.0e-12
+
+    # Free fall is a geodesic: a circular orbit at r = 8M closes on itself,
+    # holds its radius, and conserves p_t to machine precision.
+    r0 = 8.0
+    Ω = sqrt(M / r0^3)
+    ut = 1.0 / sqrt(1.0 - 3.0 * M / r0)
+    x0 = SVector(r0, 0.0, 0.0)
+    u = SVector(ut, 0.0, r0 * Ω * ut, 0.0)
+    p_t, p = SpaceTime.ks_lower(x0, M, u)
+    orb = ShipState(x0, p, p_t, 0.0, 0.0)
+    @test SpaceTime.ks_gdot(x0, M, u, u) ≈ -1.0 atol = 1.0e-12
+    τ_orbit = 2π / Ω / ut          # one coordinate-time period, in proper time
+    pt0 = orb.p_t
+    for _ in 1:100
+        step_ship!(orb, M, τ_orbit / 100)
+    end
+    @test norm(orb.x) ≈ r0 atol = 1.0e-6
+    @test norm(orb.x - x0) < 1.0e-4          # closed after one full lap
+    @test orb.p_t ≈ pt0 atol = 1.0e-10
+    @test orb.t ≈ 2π / Ω rtol = 1.0e-4       # coordinate clock: one period
+
+    # Hovering: radial thrust a = (M/r²)/√(1−2M/r) balances gravity. Step
+    # with the ship-frame axes recomputed every tick, like the flight loop.
+    rh = 6.0
+    hov = ShipState(SVector(rh, 0.0, 0.0), M)
+    a_hover = (M / rh^2) / sqrt(1.0 - 2.0 * M / rh)
+    f_h = SVector(1.0, 0.0, 0.0)             # camera looks radially outward
+    r_h = SVector(0.0, 1.0, 0.0)
+    u_h = SVector(0.0, 0.0, 1.0)
+    for _ in 1:400
+        βh, _ = ship_velocity(hov, M, f_h, r_h, u_h)
+        tet = SpaceTime.ks_camera_tetrad(hov.x, f_h, r_h, u_h, M; beta=βh)
+        step_ship!(hov, M, 0.05; accel=SVector(a_hover, 0.0, 0.0),
+                   axes=(tet[2], tet[3], tet[4]))
+    end
+    @test norm(hov.x) ≈ rh atol = 2.0e-3
+    βh, _ = ship_velocity(hov, M, f_h, r_h, u_h)
+    @test norm(βh) < 2.0e-3
+
+    # Mass shell after a hard burn: g(u, u) = −1 is maintained, and the
+    # velocity decomposition round-trips through the boosted tetrad.
+    burn = ShipState(pos, M)
+    tet = SpaceTime.ks_camera_tetrad(pos, fwd, right, upl, M)
+    step_ship!(burn, M, 2.0; accel=SVector(0.4, 0.1, 0.0),
+               axes=(tet[2], tet[3], tet[4]))
+    ub = SpaceTime.ks_raise(burn.x, M, burn.p_t, burn.p)
+    @test SpaceTime.ks_gdot(burn.x, M, ub, ub) ≈ -1.0 atol = 1.0e-10
+    βb, γb = ship_velocity(burn, M, fwd, right, upl)
+    tb = SpaceTime.ks_camera_tetrad(burn.x, fwd, right, upl, M; beta=βb)
+    @test norm(tb[1] - ub) < 1.0e-8 * γb
+    @test γb > 1.1                            # the burn actually moved us
+end
