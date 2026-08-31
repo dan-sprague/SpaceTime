@@ -10,3 +10,4 @@ renders/
 *.tiff.toml
 !assets/starmap_g4k.jpg
 !docs/assets/*.jpg
+build/

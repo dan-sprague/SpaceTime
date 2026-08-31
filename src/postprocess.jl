@@ -373,3 +373,50 @@ function apply_lens_distortion!(image::Matrix{T}; k1::Real=-0.05, k2::Real=0.0) 
     image .= out
     return image
 end
+"""
+    lens_post(buckets; f_number, focus, fov_factor=0.55, fisheye_deg=0.0)
+
+Depth-of-field as a post operation: composite the path-length buckets from
+[`render_depth_mtl`](@ref), blurring each by its thin-lens circle of confusion
+for the given aperture and focus distance. Aperture and focus become grading
+dials — re-run at any f-stop without re-rendering. Returns a `Matrix{RGBf}`
+in the renderer's `[width, height]` convention, ready for `postprocess`.
+
+Approximation notes: blur is applied in image space per depth bucket, so
+aperture rays are not re-traced — accurate for moderate apertures (~f/4 and
+smaller); the exact-lens renderer remains the reference for fast glass near
+the shadow edge.
+"""
+function lens_post(buckets::Array{Float32,3};
+                   f_number::Real=8.0, focus::Real=30.0,
+                   fov_factor::Real=0.55, fisheye_deg::Real=0.0)
+    nb3, w, h = size(buckets)
+    nb = nb3 ÷ 3
+    ppr = fisheye_deg > 0 ? (h / 2) / deg2rad(fisheye_deg) :
+                            (h / 2) / fov_factor      # pixels per radian
+    A = focus / f_number                              # aperture diameter (M)
+    s = (log(120.0) - log(1.5)) / (nb - 2)            # log bin width
+    img = zeros(Float32, w, h, 3)
+    for b in 1:nb
+        d = b == nb ? Inf : 1.5 * exp((b - 0.5) * s)  # bucket centre distance
+        θ = (A / 2) * abs(1.0 / d - 1.0 / focus)      # CoC angular radius
+        rpx = θ * ppr
+        if rpx < 0.6
+            for c in 1:3
+                img[:, :, c] .+= @view buckets[3 * (b - 1) + c, :, :]
+            end
+        else
+            R = max(round(Int, rpx), 1)
+            kmat = Float32[(x^2 + y^2) <= rpx^2 + 0.25 ? 1.0f0 : 0.0f0
+                           for x in -R:R, y in -R:R]
+            kmat ./= sum(kmat)
+            kc = centered(kmat)
+            for c in 1:3
+                img[:, :, c] .+= imfilter(Array{Float32}(
+                    @view buckets[3 * (b - 1) + c, :, :]), kc, "replicate")
+            end
+        end
+    end
+    return [RGBf(img[i, j, 1], img[i, j, 2], img[i, j, 3])
+            for i in 1:w, j in 1:h]
+end

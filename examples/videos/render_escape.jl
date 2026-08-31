@@ -17,6 +17,14 @@
 #                     frames (default = REL): radius + regime, speed in c, ship
 #                     proper time vs earth (infinity) time for a 1e5 Msun hole.
 #                     Linear TIFF masters stay clean.
+#   GAS=live|static|smooth  disc gas: live fluid simulation stepped through the
+#                     flight (default), frozen fBm filaments, or smooth slab.
+#   BETA_SMOOTH=h     half-width (in path time) of the velocity smoothing
+#                     window (default 0.015). The braking turn at t≈0.72
+#                     sweeps beta through zero; small h makes the aberration
+#                     "wobble" of the hole's apparent size abrupt.
+#   ONLY=n            render just frame n at full settings and exit (no mp4) —
+#                     the approval frame before committing to a long render.
 
 using SpaceTime, StaticArrays, LinearAlgebra, FileIO, Random, Printf
 using Images: clamp01nan
@@ -35,6 +43,9 @@ const NFRAMES = parse(Int, get(ENV, "NFRAMES", "900"))
 const REL = get(ENV, "REL", "0") == "1"
 const T_M = parse(Float64, get(ENV, "T_M", "140.0"))
 const HUD = get(ENV, "HUD", REL ? "1" : "0") == "1"
+const GAS = get(ENV, "GAS", "live")
+const BETA_SMOOTH = parse(Float64, get(ENV, "BETA_SMOOTH", "0.015"))
+const ONLY = parse(Int, get(ENV, "ONLY", "0"))   # 0 = full sequence
 
 tag = REL ? "_rel" : ""
 frames = joinpath(ROOT, "renders", "escape$(tag)", RES)
@@ -49,13 +60,20 @@ st = Schwarzschild(1.0)
 disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
                      blackbody=Blackbody(wb_temperature=10000.0), density_falloff=0.8)
 vol = DiscVolume(disc; M=1.0, emission_scale=0.35, opacity_scale=0.3,
-                 scale_height=0.18, turbulence=0.0, rng=Xoshiro(7))   # smooth gas
+                 scale_height=0.18, turbulence=(GAS == "smooth" ? 0.0 : 1.0),
+                 rng=Xoshiro(7))
 ctx = MetalPreviewContext(bg, 480, 270; dt=0.1, nmax=1000, disc=disc, volume=vol)
+sim = GAS == "live" ? DiscFluidSim(vol, disc; M=1.0) : nothing
+if sim !== nothing
+    for _ in 1:150   # warm the eddies up before frame 1
+        step_sim!(sim, ctx; dt=0.08)
+    end
+end
 
 # Ship velocity from the path: wide central difference (low-passes keyframe
 # acceleration kinks), smooth tanh speed limit, smoothstep taper to zero at
 # the r = 2.5M porthole (the observer there is the static porthole frame).
-function escape_beta(t; h=8.0e-3)
+function escape_beta(t; h=BETA_SMOOTH)
     ta, tb = clamp(t - h, 0.0, 1.0), clamp(t + h, 0.0, 1.0)
     pa, _, _, _ = path_at(ta)
     pb, _, _, _ = path_at(tb)
@@ -79,6 +97,8 @@ for f in 1:NFRAMES
     t = (f - 1) / (NFRAMES - 1)
     pos, tgt, up, fe = path_at(t)
     cam = SpaceTime.Camera(pos, tgt, up, 0.55)
+    sim !== nothing && step_sim!(sim, ctx; dt=2.5 / 30)   # gas at 2.5x time-lapse
+    ONLY > 0 && f != ONLY && continue   # sim still steps: frame ONLY is exact
     v = REL ? escape_beta(t) : SVector(0.0, 0.0, 0.0)
     βl = SVector(dot(v, cam.fwd), dot(v, cam.right), dot(v, cam.up_local))
     img = render_draft_mtl(ctx, cam, st; width=W, height=H, samples=SAMPLES,
@@ -108,6 +128,10 @@ for f in 1:NFRAMES
         round((time() - t0) / 60, digits=1), " min"); flush(stdout))
 end
 
-pngpat = joinpath(frames, "png", "f%04d.png")
-run(`$(ffmpeg()) -y -framerate 30 -i $pngpat -c:v libx264 -pix_fmt yuv420p -crf 17 -preset medium $outmp4`)
-println("ESCAPE_DONE ", outmp4)
+if ONLY > 0
+    println("APPROVAL_FRAME ", joinpath(frames, "png", @sprintf("f%04d.png", ONLY)))
+else
+    pngpat = joinpath(frames, "png", "f%04d.png")
+    run(`$(ffmpeg()) -y -framerate 30 -i $pngpat -c:v libx264 -pix_fmt yuv420p -crf 17 -preset medium $outmp4`)
+    println("ESCAPE_DONE ", outmp4)
+end
