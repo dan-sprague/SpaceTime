@@ -554,10 +554,11 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
 
         # Radius-adaptive affine step: curvature ~ M/r³, so scaling h with r
         # keeps the per-step bending error uniform while collapsing the
-        # nearly-flat travel legs. Inside the gas volume the cap follows the
-        # march stride (2 at full quality — turbulence feature scale; larger
-        # when a coarse rung trades gas detail for speed), 8× outside.
-        hcap = (VOL && r2 < vol_rb2) ? Float32(vol_mstep) : 8.0f0
+        # nearly-flat travel legs. Capped at 2× inside the gas volume: the
+        # bounding sphere contains the strong field, where the shadow-kill
+        # criteria need small steps (a larger cap makes near-critical rays
+        # wander to the step limit — slower AND wrong).
+        hcap = (VOL && r2 < vol_rb2) ? 2.0f0 : 8.0f0
         h = dt * min(max(0.16f0 * r / M, 1.0f0), hcap)
 
         xp = x; yp = y; zp = z
