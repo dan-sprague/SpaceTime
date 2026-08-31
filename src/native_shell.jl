@@ -207,8 +207,15 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     sky = SkyFanState(n=fan_n)
     layer_on = disc !== nothing || volume !== nothing
     L = MtlArray{Float32,3}(undef, 4, width, height)          # rest: native
-    Lh = MtlArray{Float32,3}(undef, 4, width ÷ 2, height ÷ 2) # moving
-    Lq = MtlArray{Float32,3}(undef, 4, width ÷ 4, height ÷ 4) # moving, hot
+    # Moving rungs: gas layer resolution ladder, walked by a hysteresis
+    # controller (dwell + separate up/down thresholds — flip-flopping
+    # between rungs every few frames is worse than either rung).
+    rungs = [MtlArray{Float32,3}(undef, 4, cld(width, s), cld(height, s))
+             for s in (2, 3, 4)]
+    rung = 2
+    last_rung_change = time()
+    last_move_time = time()
+    cur_stride = 2          # volumetric march stride currently set on ctx
     if !layer_on
         empty_layer = zeros(Float32, 4, width, height)
         empty_layer[4, :, :] .= 1.0f0    # fully transparent: sky only
@@ -391,10 +398,29 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             t0 = time()
             update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
             if layer_on
-                # Fresh gas every frame — half display resolution, dropping
-                # a rung when the frame budget runs hot. No history: nothing
-                # to echo.
-                render_layered_gpu!(ctx.out_gpu, frame_ms > 20.0 ? Lq : Lh,
+                # Fresh gas every frame at the current rung — no history:
+                # nothing to echo. The rung controller walks the ladder with
+                # dwell and hysteresis: down fast when over budget, up
+                # slowly when there is clear headroom.
+                if frame_ms > 22.0 && rung < length(rungs) &&
+                   wall - last_rung_change > 0.25
+                    rung += 1
+                    last_rung_change = wall
+                    frame_ms = 16.0    # reseed the EMA at the new rung
+                elseif frame_ms < 11.0 && rung > 1 &&
+                       wall - last_rung_change > 1.0
+                    rung -= 1
+                    last_rung_change = wall
+                    frame_ms = 16.0
+                end
+                # Coarser rungs also march the gas more coarsely — the
+                # in-slab flythrough cost is dominated by volume sampling.
+                want = rung == 1 ? 2 : 4
+                if want != cur_stride
+                    set_march_stride!(ctx, want)
+                    cur_stride = want
+                end
+                render_layered_gpu!(ctx.out_gpu, rungs[rung],
                                     ctx, sky, cam_now, spacetime;
                                     fisheye_deg=fisheye,
                                     relativistic=relativistic)
@@ -406,8 +432,9 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             end
             present!(presenter, ctx.out_gpu; exposure=exposure, filmic=filmic)
             frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
+            last_move_time = wall
             nframes += 1
-        elseif passes < REFINE_PASSES
+        elseif passes < REFINE_PASSES && wall - last_move_time > 0.15
             # At rest: time-sliced progressive refinement. Full-resolution
             # jittered passes (R2 low-discrepancy sequence) keep summing
             # into `accum` — every pass is real rays, so the still image
@@ -417,6 +444,10 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             # bands. Presented at pass boundaries; the presenter's exposure
             # factor divides by the pass count.
             t0 = time()
+            if cur_stride != 2
+                set_march_stride!(ctx, 2)   # stills refine at full quality
+                cur_stride = 2
+            end
             ju = passes == 0 ? 0.5 : mod(0.5 + 0.7548776662466927 * passes, 1.0)
             jv = passes == 0 ? 0.5 : mod(0.5 + 0.5698402909980532 * passes, 1.0)
             band = clamp(round(Int, 0.007 / mpr), 16, height - refine_row)

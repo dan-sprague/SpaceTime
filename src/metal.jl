@@ -97,7 +97,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
         copyto!(vol_params, Float32[volume.log_s_in, volume.log_s_out,
                                     volume.z_max, nr, nphi, nz,
                                     volume.emission_scale,
-                                    volume.opacity_scale, 1.0f0])
+                                    volume.opacity_scale, 2.0f0])  # march stride
     end
     return MetalPreviewContext(bg_gpu, out_gpu, cam_params, spacetime_params,
                                disc_params, bb_lut, vol_gpu, vol_params,
@@ -137,6 +137,19 @@ function set_disc_enabled!(ctx::MetalPreviewContext, disc::AccretionDisc,
             Float32[enabled ? disc.inner_radius : 0.0, disc.outer_radius,
                     disc.density_falloff, bb.table_min, bb.table_max,
                     bb.table_size])
+    return nothing
+end
+
+"""
+    set_march_stride!(ctx, s)
+
+Set the volumetric march stride (gas sampled every `s` integration steps
+with `s`× path weight; default 2). Coarser strides trade gas detail for
+speed when the camera is inside the slab; geodesics are unaffected.
+"""
+function set_march_stride!(ctx::MetalPreviewContext, s::Int)
+    ctx.has_volume || return nothing
+    Metal.@allowscalar ctx.vol_params[9] = Float32(s)
     return nothing
 end
 
@@ -474,6 +487,10 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     vol_zmax = vol_params[3]
     vol_emis = vol_params[7]
     vol_opac = vol_params[8]
+    # Volume march stride: sample the gas every Nth integration step with
+    # N× path weight (default 2). Coarser strides are the quality/speed
+    # knob for cameras inside the slab — geodesics stay exact.
+    vol_mstep = clamp(unsafe_trunc(Int32, vol_params[9]), Int32(1), Int32(16))
     vol_s_out = exp(vol_params[2])
     vol_rb2 = vol_s_out * vol_s_out + vol_zmax * vol_zmax
     disc_plane = disc_enabled && !VOL
@@ -554,7 +571,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
         # Doppler-shaded emission/absorption. Sampled every 2nd step (with
         # doubled path weight) — gas structure is much coarser than the
         # integration step.
-        if VOL && alpha > 0.003f0 && stepi % 2 == 0 && r2 < vol_rb2
+        if VOL && alpha > 0.003f0 && stepi % vol_mstep == 0 && r2 < vol_rb2
             if abs(z) < vol_zmax
                 s_cyl = sqrt(x * x + y * y)
                 if s_cyl > 1.0f-6
@@ -563,7 +580,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                     if ρ > 1.0f-4
                         vlen = max(sqrt(k1[1] * k1[1] + k1[2] * k1[2] +
                                         k1[3] * k1[3]), 1.0f-20)
-                        ds = 2.0f0 * h * vlen
+                        ds = Float32(vol_mstep) * h * vlen
 
                         R = s_cyl / (2.0f0 * M)
                         T_emit = exp(10.034259f0 - 0.375f0 * log(max(R * R, 1.0f-6)))
