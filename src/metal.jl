@@ -295,9 +295,11 @@ and `rows` select a horizontal tile so large frames can be split across
 several short dispatches.
 """
 function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
-                           spacetime_params, disc_params, width, height,
-                           nmax, dt, jitter_u, jitter_v, weight, row0, rows,
-                           ::Val{VOL}, ::Val{NB}) where {VOL, NB}
+                           spacetime_params, disc_params, fan, sky_params,
+                           width, height, nmax, dt, jitter_u, jitter_v,
+                           weight, row0, rows,
+                           ::Val{VOL}, ::Val{NB},
+                           ::Val{LAYER}) where {VOL, NB, LAYER}
     idx = thread_position_in_grid().x
     total = width * rows
     if idx > total
@@ -416,6 +418,32 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     scam = spacetime_params[4] > 0.5f0 ?
            1.0f0 / clamp(abs(p_t), 0.05f0, 20.0f0) : 1.0f0
 
+    # Layered mode: this pass renders only the disc/gas layer (premultiplied
+    # RGB + transmittance in a 4-channel `out`; the sky is composited later
+    # from the exact deflection fan). A pixel whose geodesic provably stays
+    # outside the gas gate radius — periapsis from the fan, by the local
+    # angle ψ to the radial tetrad axis ê_r in `sky_params[1:4]` — writes
+    # pure transparency and exits without integrating a single step.
+    gate = 0.0f0
+    if LAYER
+        gate = sky_params[7]
+        if r > gate
+            cψ = clamp(p_t * sky_params[1] + px * sky_params[2] +
+                       py * sky_params[3] + pz * sky_params[4],
+                       -1.0f0, 1.0f0)
+            Nf = Float32(size(fan, 2))
+            tf = acos(cψ) * (Nf - 1.0f0) / Float32(pi)
+            k0 = clamp(unsafe_trunc(Int32, tf), Int32(0), unsafe_trunc(Int32, Nf) - Int32(2))
+            frac_f = tf - Float32(k0)
+            esc = fan[1, k0 + 1] + frac_f * (fan[1, k0 + 2] - fan[1, k0 + 1])
+            rmin = fan[4, k0 + 1] + frac_f * (fan[4, k0 + 2] - fan[4, k0 + 1])
+            if esc > 0.999f0 && rmin > gate
+                out[4, i, j] += weight
+                return nothing
+            end
+        end
+    end
+
     disc_inner = disc_params[1]
     disc_outer = disc_params[2]
     disc_falloff = disc_params[3]
@@ -459,9 +487,19 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     # floor is the near-singularity safety net.
     r_floor = r > 2.05f0 * M ? 2.0f0 * M : 0.3f0 * M
     r_prev = -1.0f0
+    r_layer_prev = -1.0f0
     for stepi in 1:nmax
         r2 = x * x + y * y + z * z
         r = sqrt(r2)
+        if LAYER
+            # Outbound beyond the gas gate: a null geodesic has at most one
+            # radial turning point, so once r exceeds the gate and grows the
+            # ray can never re-enter — and the sky is not this pass's job.
+            if r > gate && r_layer_prev > 0.0f0 && r > r_layer_prev
+                break
+            end
+            r_layer_prev = r
+        end
         if r < 3.2f0 * M   # strong-field zone: kill checks live only here
             # Exact criterion: an escaping null geodesic never has a turning
             # point below the photon sphere (periapsis > 3M requires
@@ -658,6 +696,17 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     W = size(bg, 2)
     H = size(bg, 3)
 
+    if LAYER
+        # Disc/gas layer output: premultiplied emission + transmittance to
+        # the sky. Capture blackness is not written here — the sky pass owns
+        # the shadow (at native resolution, from the exact fan).
+        out[1, i, j] += weight * acc_r
+        out[2, i, j] += weight * acc_g
+        out[3, i, j] += weight * acc_b
+        out[4, i, j] += weight * alpha
+        return nothing
+    end
+
     # Rays that ran out of steps while still deep in the strong field are
     # (near-)critical or horizon-hugging: treat them as black too.
     rf = max(sqrt(x * x + y * y + z * z), 1.0f-6)
@@ -832,23 +881,28 @@ concurrently with preview frames that update the context's buffers.
 function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         spacetime_params, width::Int, height::Int,
                         nmax::Int, dt::Float32, ju::Float32, jv::Float32,
-                        weight::Float32, row0::Int, rows::Int; nb::Int=0)
+                        weight::Float32, row0::Int, rows::Int; nb::Int=0,
+                        fan=nothing, sky_params=nothing, layer::Bool=false)
     von = ctx.vol_on[]
+    fan_b = fan === nothing ? _dummy_fan() : fan
+    skyp_b = sky_params === nothing ? _dummy_skyp() : sky_params
     kernels = ctx.kernel[]::Dict{Any,Any}
-    key = (von, nb)
+    key = (von, nb, layer)
     if !haskey(kernels, key)
         kernels[key] = @metal launch=false trace_kernel_mtl!(
             out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
-            cam_params, spacetime_params, ctx.disc_params, width, height,
-            nmax, dt, ju, jv, weight, row0, rows, Val(von), Val(nb))
+            cam_params, spacetime_params, ctx.disc_params, fan_b, skyp_b,
+            width, height, nmax, dt, ju, jv, weight, row0, rows,
+            Val(von), Val(nb), Val(layer))
     end
     kernel = kernels[key]
     n = width * rows
     threads = min(kernel.pipeline.maxTotalThreadsPerThreadgroup, n)
     groups = cld(n, threads)
     kernel(out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
-           cam_params, spacetime_params, ctx.disc_params, width, height,
-           nmax, dt, ju, jv, weight, row0, rows, Val(von), Val(nb);
+           cam_params, spacetime_params, ctx.disc_params, fan_b, skyp_b,
+           width, height, nmax, dt, ju, jv, weight, row0, rows,
+           Val(von), Val(nb), Val(layer);
            threads=threads, groups=groups)
     return nothing
 end
@@ -1150,6 +1204,416 @@ function warp_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
         img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
     end
     return img
+end
+
+# ---------------------------------------------------------------------------
+# Layered real-time engine: exact sky fan + disc/gas layer + composite
+# ---------------------------------------------------------------------------
+#
+# By spherical symmetry, the entire lensed sky seen by the static observer at
+# radius r is a one-dimensional function of the local angle ψ between the ray
+# and the outward radial axis. Each frame we integrate an exact fan of
+# geodesics over ψ ∈ [0, π] (a few thousand rays — one column's worth of
+# work) and every display pixel becomes a table lookup plus one starmap
+# sample: native-resolution, per-frame-exact lensing, shadow included. Only
+# the disc/gas — which breaks the symmetry — still pays for per-pixel
+# integration, rendered as a separate premultiplied layer (usually at lower
+# resolution) and composited over the sky.
+#
+# The fan is indexed by the *local* angle measured in the static tetrad
+# (cos ψ = p·ê_r for unit-frequency rays), which matches the pixel rays as
+# long as the camera tetrad is the unboosted static observer — the current
+# viewport convention.
+
+"""
+    sky_fan_kernel!(fan, cam_params, sky_params, nmax, dt)
+
+One thread per fan entry k: integrate the exact null geodesic launched from
+the camera radius at local angle `ψ_k = π(k−1)/(N−1)` from the outward radial
+axis, in the z = 0 plane from position `(r, 0, 0)` with lateral direction
+`+ŷ`. Writes `fan[:, k] = (escaped, cos θf, sin θf, r_min)` where `θf` is the
+asymptotic escape direction's in-plane angle from the radial axis and `r_min`
+the closest approach. `cam_params` is the 28-float block for the fan camera
+(`fwd = x̂`, `right = ŷ`); `sky_params[5:6] = (M, r_escape)`.
+"""
+function sky_fan_kernel!(fan, cam_params, sky_params, nmax, dt)
+    k = thread_position_in_grid().x
+    N = size(fan, 2)
+    k > N && return
+    M = sky_params[5]
+    r_escape = sky_params[6]
+
+    ψ = Float32(pi) * (Float32(k) - 1.0f0) / (Float32(N) - 1.0f0)
+    cf = cos(ψ)
+    cr = sin(ψ)
+
+    ef0 = cam_params[5];  ef1 = cam_params[6];  ef2 = cam_params[7];  ef3 = cam_params[8]
+    er0 = cam_params[9];  er1 = cam_params[10]; er2 = cam_params[11]; er3 = cam_params[12]
+    ut0 = cam_params[17]; ut1 = cam_params[18]; ut2 = cam_params[19]; ut3 = cam_params[20]
+
+    x = cam_params[1]; y = cam_params[2]; z = cam_params[3]
+    r = sqrt(x * x + y * y + z * z)
+    f = 2.0f0 * M / r
+    qt = cf * ef0 + cr * er0 - ut0
+    qx = cf * ef1 + cr * er1 - ut1
+    qy = cf * ef2 + cr * er2 - ut2
+    qz = cf * ef3 + cr * er3 - ut3
+    lq = qt + (x * qx + y * qy + z * qz) / r
+    p_t = -qt + f * lq
+    flr = f * lq / r
+    px = qx + flr * x
+    py = qy + flr * y
+    pz = qz + flr * z
+
+    r_min = r
+    hit_horizon = false
+    r_floor = r > 2.05f0 * M ? 2.0f0 * M : 0.3f0 * M
+    r_prev = -1.0f0
+    for _ in 1:nmax
+        r = sqrt(x * x + y * y + z * z)
+        r < r_min && (r_min = r)
+        if r < 3.2f0 * M
+            if r < r_floor ||
+               (r < 2.95f0 * M && r_prev > 0.0f0 && r < r_prev - 1.0f-4 * M)
+                hit_horizon = true
+                break
+            end
+            r_prev = r
+        end
+        r > r_escape && break
+        h = dt * min(max(0.16f0 * r / M, 1.0f0), 8.0f0)
+        k1 = ks_rhs_mtl(x, y, z, px, py, pz, p_t, M)
+        k2 = ks_rhs_mtl(
+            x + 0.5f0 * h * k1[1], y + 0.5f0 * h * k1[2], z + 0.5f0 * h * k1[3],
+            px + 0.5f0 * h * k1[4], py + 0.5f0 * h * k1[5], pz + 0.5f0 * h * k1[6],
+            p_t, M)
+        k3 = ks_rhs_mtl(
+            x + 0.5f0 * h * k2[1], y + 0.5f0 * h * k2[2], z + 0.5f0 * h * k2[3],
+            px + 0.5f0 * h * k2[4], py + 0.5f0 * h * k2[5], pz + 0.5f0 * h * k2[6],
+            p_t, M)
+        k4 = ks_rhs_mtl(
+            x + h * k3[1], y + h * k3[2], z + h * k3[3],
+            px + h * k3[4], py + h * k3[5], pz + h * k3[6],
+            p_t, M)
+        x  += (h / 6.0f0) * (k1[1] + 2.0f0 * k2[1] + 2.0f0 * k3[1] + k4[1])
+        y  += (h / 6.0f0) * (k1[2] + 2.0f0 * k2[2] + 2.0f0 * k3[2] + k4[2])
+        z  += (h / 6.0f0) * (k1[3] + 2.0f0 * k2[3] + 2.0f0 * k3[3] + k4[3])
+        px += (h / 6.0f0) * (k1[4] + 2.0f0 * k2[4] + 2.0f0 * k3[4] + k4[4])
+        py += (h / 6.0f0) * (k1[5] + 2.0f0 * k2[5] + 2.0f0 * k3[5] + k4[5])
+        pz += (h / 6.0f0) * (k1[6] + 2.0f0 * k2[6] + 2.0f0 * k3[6] + k4[6])
+        if !(x == x) || !(px == px)
+            hit_horizon = true
+            break
+        end
+    end
+
+    rf = max(sqrt(x * x + y * y + z * z), 1.0f-6)
+    if hit_horizon || rf < 4.0f0 * M
+        fan[1, k] = 0.0f0
+        fan[2, k] = 1.0f0
+        fan[3, k] = 0.0f0
+    else
+        inv_rf = 1.0f0 / rf
+        ff = 2.0f0 * M * inv_rf
+        κf = (x * px + y * py + z * pz) * inv_rf
+        c1f = ff * (-p_t + κf) * inv_rf
+        vx = px - c1f * x
+        vy = py - c1f * y
+        vl = max(sqrt(vx * vx + vy * vy), 1.0f-20)
+        fan[1, k] = 1.0f0
+        fan[2, k] = vx / vl
+        fan[3, k] = vy / vl
+    end
+    fan[4, k] = r_min
+    return nothing
+end
+
+"""
+    sky_composite_kernel!(out, bg, fan, layer, cam_params, spacetime_params,
+                          sky_params, width, height, lw, lh)
+
+Per display pixel: build the pixel ray exactly like the trace kernel, find
+its local angle ψ to the radial axis (`ê_r` in `sky_params[1:4]`), look up
+the exact deflection in `fan` and sample the starmap along the asymptotic
+direction (black when captured — the shadow at native resolution), then
+composite the premultiplied disc/gas `layer` (bilinear, `lw × lh`) over it.
+Near-critical fan entries (neighbours disagreeing in escape or direction)
+fall back to the nearest entry — a sub-pixel zone at the photon ring.
+"""
+function sky_composite_kernel!(out, bg, fan, layer, cam_params,
+                               spacetime_params, sky_params,
+                               width, height, lw, lh)
+    idx = thread_position_in_grid().x
+    idx > width * height && return
+    j = (idx - 1) ÷ width + 1
+    i = (idx - 1) % width + 1
+
+    M = spacetime_params[1]
+    cx = cam_params[1];  cy = cam_params[2];  cz = cam_params[3]
+    fov = cam_params[4]
+    ef0 = cam_params[5];  ef1 = cam_params[6];  ef2 = cam_params[7];  ef3 = cam_params[8]
+    er0 = cam_params[9];  er1 = cam_params[10]; er2 = cam_params[11]; er3 = cam_params[12]
+    eu0 = cam_params[13]; eu1 = cam_params[14]; eu2 = cam_params[15]; eu3 = cam_params[16]
+    ut0 = cam_params[17]; ut1 = cam_params[18]; ut2 = cam_params[19]; ut3 = cam_params[20]
+
+    half_h = Float32(height) / 2.0f0
+    u = (Float32(i) - 0.5f0 - Float32(width) / 2.0f0) / half_h
+    v = (Float32(j) - 0.5f0 - Float32(height) / 2.0f0) / half_h
+
+    cr = 0.0f0
+    cu = 0.0f0
+    cf = 1.0f0
+    if cam_params[21] > 0.5f0
+        ρ = sqrt(u * u + v * v)
+        θp = ρ * cam_params[22]
+        sθ = sin(θp)
+        inv_ρ = ρ > 1.0f-8 ? 1.0f0 / ρ : 0.0f0
+        cr = sθ * u * inv_ρ
+        cu = sθ * v * inv_ρ
+        cf = cos(θp)
+    else
+        dxl = u * fov
+        dyl = v * fov
+        ν = sqrt(dxl * dxl + dyl * dyl + 1.0f0)
+        cr = dxl / ν
+        cu = dyl / ν
+        cf = 1.0f0 / ν
+    end
+
+    x = cx; y = cy; z = cz
+    r = sqrt(x * x + y * y + z * z)
+    f = 2.0f0 * M / r
+    qt = cf * ef0 + cr * er0 + cu * eu0 - ut0
+    qx = cf * ef1 + cr * er1 + cu * eu1 - ut1
+    qy = cf * ef2 + cr * er2 + cu * eu2 - ut2
+    qz = cf * ef3 + cr * er3 + cu * eu3 - ut3
+    lq = qt + (x * qx + y * qy + z * qz) / r
+    p_t = -qt + f * lq
+    flr = f * lq / r
+    px = qx + flr * x
+    py = qy + flr * y
+    pz = qz + flr * z
+
+    scam = spacetime_params[4] > 0.5f0 ?
+           1.0f0 / clamp(abs(p_t), 0.05f0, 20.0f0) : 1.0f0
+
+    # Local angle to the radial axis, then the exact deflection.
+    cψ = clamp(p_t * sky_params[1] + px * sky_params[2] +
+               py * sky_params[3] + pz * sky_params[4], -1.0f0, 1.0f0)
+    N = size(fan, 2)
+    tf = acos(cψ) * (Float32(N) - 1.0f0) / Float32(pi)
+    k0 = clamp(unsafe_trunc(Int32, tf), Int32(0), Int32(N - 2))
+    frac = tf - Float32(k0)
+    e_a = fan[1, k0 + 1]; e_b = fan[1, k0 + 2]
+    c_a = fan[2, k0 + 1]; c_b = fan[2, k0 + 2]
+    s_a = fan[3, k0 + 1]; s_b = fan[3, k0 + 2]
+    esc = 0.0f0
+    cθ = 1.0f0
+    sθ = 0.0f0
+    if e_a == e_b && c_a * c_b + s_a * s_b > 0.9987f0
+        esc = e_a
+        cθ = c_a + frac * (c_b - c_a)
+        sθ = s_a + frac * (s_b - s_a)
+        nl = max(sqrt(cθ * cθ + sθ * sθ), 1.0f-6)
+        cθ /= nl
+        sθ /= nl
+    else
+        # Photon-ring zone: neighbours wind or disagree — nearest entry.
+        kn = frac < 0.5f0 ? k0 + 1 : k0 + 2
+        esc = fan[1, kn]
+        cθ = fan[2, kn]
+        sθ = fan[3, kn]
+    end
+
+    sky_r = 0.0f0
+    sky_g = 0.0f0
+    sky_b = 0.0f0
+    if esc > 0.5f0
+        # Rebuild the asymptotic direction in this ray's own geodesic plane:
+        # e1 = outward radial, e2 = the unit lateral part of the coordinate
+        # velocity at the camera.
+        inv_r = 1.0f0 / r
+        κ0 = (x * px + y * py + z * pz) * inv_r
+        c10 = f * (-p_t + κ0) * inv_r
+        vx = px - c10 * x
+        vy = py - c10 * y
+        vz = pz - c10 * z
+        e1x = x * inv_r; e1y = y * inv_r; e1z = z * inv_r
+        vr = vx * e1x + vy * e1y + vz * e1z
+        lx = vx - vr * e1x
+        ly = vy - vr * e1y
+        lz = vz - vr * e1z
+        ll = sqrt(lx * lx + ly * ly + lz * lz)
+        if ll < 1.0f-7
+            # (Anti)radial ray: no deflection plane; the direction is ±e1.
+            lx = -e1y; ly = e1x; lz = 0.0f0
+            lm = max(sqrt(lx * lx + ly * ly), 1.0f-6)
+            lx /= lm; ly /= lm
+        else
+            lx /= ll; ly /= ll; lz /= ll
+        end
+        dx = cθ * e1x + sθ * lx
+        dy = cθ * e1y + sθ * ly
+        dz = cθ * e1z + sθ * lz
+        θbg = acos(clamp(dz / max(sqrt(dx * dx + dy * dy + dz * dz), 1.0f-9),
+                         -1.0f0, 1.0f0))
+        φbg = atan(dy, dx)
+        sky_r, sky_g, sky_b = sample_background_mtl(bg, θbg, φbg,
+                                                    size(bg, 2), size(bg, 3))
+        if scam != 1.0f0
+            sky_r *= 57.4f0 / (exp(4.067f0 / scam) - 1.0f0)
+            sky_g *= 90.2f0 / (exp(4.513f0 / scam) - 1.0f0)
+            sky_b *= 206.5f0 / (exp(5.335f0 / scam) - 1.0f0)
+        end
+    end
+
+    # Composite the (lower-resolution) premultiplied disc layer over the sky.
+    fx = (Float32(i) - 0.5f0) * Float32(lw) / Float32(width) + 0.5f0
+    fy = (Float32(j) - 0.5f0) * Float32(lh) / Float32(height) + 0.5f0
+    x0 = clamp(unsafe_trunc(Int32, floor(fx)), Int32(1), Int32(lw - 1))
+    y0 = clamp(unsafe_trunc(Int32, floor(fy)), Int32(1), Int32(lh - 1))
+    tx = clamp(fx - Float32(x0), 0.0f0, 1.0f0)
+    ty = clamp(fy - Float32(y0), 0.0f0, 1.0f0)
+    x1 = x0 + Int32(1); y1 = y0 + Int32(1)
+    w00 = (1.0f0 - tx) * (1.0f0 - ty); w10 = tx * (1.0f0 - ty)
+    w01 = (1.0f0 - tx) * ty;           w11 = tx * ty
+    lr = layer[1, x0, y0] * w00 + layer[1, x1, y0] * w10 +
+         layer[1, x0, y1] * w01 + layer[1, x1, y1] * w11
+    lg = layer[2, x0, y0] * w00 + layer[2, x1, y0] * w10 +
+         layer[2, x0, y1] * w01 + layer[2, x1, y1] * w11
+    lb = layer[3, x0, y0] * w00 + layer[3, x1, y0] * w10 +
+         layer[3, x0, y1] * w01 + layer[3, x1, y1] * w11
+    la = layer[4, x0, y0] * w00 + layer[4, x1, y0] * w10 +
+         layer[4, x0, y1] * w01 + layer[4, x1, y1] * w11
+
+    out[1, i, j] = lr + la * sky_r
+    out[2, i, j] = lg + la * sky_g
+    out[3, i, j] = lb + la * sky_b
+    return nothing
+end
+
+# Compiled-once pipelines and dummy buffers for the layered engine.
+const _SKY_FAN_KERNEL = Ref{Any}(nothing)
+const _COMPOSITE_KERNEL = Ref{Any}(nothing)
+const _DUMMY_FAN = Ref{Any}(nothing)
+const _DUMMY_SKYP = Ref{Any}(nothing)
+_dummy_fan() = _DUMMY_FAN[] === nothing ?
+    (_DUMMY_FAN[] = MtlArray(zeros(Float32, 4, 2))) : _DUMMY_FAN[]
+_dummy_skyp() = _DUMMY_SKYP[] === nothing ?
+    (_DUMMY_SKYP[] = MtlArray(zeros(Float32, 8))) : _DUMMY_SKYP[]
+
+"""
+    SkyFanState(pos, M; n=4096)
+
+Host-side state for the layered engine's deflection fan: the fan table, its
+parameter block, and the fan camera's tetrad block.
+"""
+struct SkyFanState
+    fan::MtlArray{Float32,2}
+    sky_params::MtlVector{Float32}
+    fan_cam::MtlVector{Float32}
+end
+
+SkyFanState(; n::Int=4096) = SkyFanState(
+    MtlArray{Float32,2}(undef, 4, n),
+    MtlVector{Float32}(undef, 8),
+    MtlVector{Float32}(undef, 28))
+
+"""
+    update_sky_fan!(sky::SkyFanState, ctx, pos, spacetime; gate, dt=0.02)
+
+Rebuild the deflection fan for a camera at `pos`: integrate `n` exact
+geodesics from radius `‖pos‖` (a per-frame cost of roughly one image
+column). Also refreshes `sky_params`: the radial tetrad axis ê_r at `pos`,
+`(M, r_escape)`, and the gas gate radius.
+"""
+function update_sky_fan!(sky::SkyFanState, ctx::MetalPreviewContext,
+                         pos::SVector{3,Float64}, spacetime::Schwarzschild;
+                         gate::Real, dt::Real=Float64(ctx.dt))
+    M = spacetime.M
+    r = norm(pos)
+    x̂ = pos / r
+    # Fan camera at (r, 0, 0): fwd = outward radial, right = +ŷ (the fan's
+    # lateral axis), matching the kernel's θf convention.
+    fpos = SVector(r, 0.0, 0.0)
+    tet = ks_camera_tetrad(fpos, SVector(1.0, 0.0, 0.0),
+                           SVector(0.0, 1.0, 0.0), SVector(0.0, 0.0, 1.0), M)
+    copyto!(sky.fan_cam,
+            Float32[fpos..., 1.0, tet[2]..., tet[3]..., tet[4]..., tet[1]...,
+                    0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    # ê_r at the actual camera position (any completion of the basis).
+    a = abs(x̂[3]) < 0.9 ? SVector(0.0, 0.0, 1.0) : SVector(1.0, 0.0, 0.0)
+    b1 = normalize(cross(a, x̂))
+    b2 = cross(x̂, b1)
+    êr = ks_camera_tetrad(pos, x̂, b1, b2, M)[2]
+    r_escape = ctx.r_escape_factor * max(r, 15.0 * M)
+    copyto!(sky.sky_params,
+            Float32[êr..., M, r_escape, gate, 0.0])
+    nmax = min(max(ctx.nmax,
+                   ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)),
+               20_000)
+    n = size(sky.fan, 2)
+    if _SKY_FAN_KERNEL[] === nothing
+        _SKY_FAN_KERNEL[] = @metal launch=false sky_fan_kernel!(
+            sky.fan, sky.fan_cam, sky.sky_params, nmax, Float32(dt))
+    end
+    kern = _SKY_FAN_KERNEL[]
+    threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
+    kern(sky.fan, sky.fan_cam, sky.sky_params, nmax, Float32(dt);
+         threads=threads, groups=cld(n, threads))
+    return nothing
+end
+
+"""
+    render_layered_gpu!(comp_out, layer_out, ctx, sky, cam, spacetime;
+                        fisheye_deg=0.0, relativistic=false, dt=ctx.dt)
+
+One frame of the layered engine, entirely on the GPU: trace the disc/gas
+layer into `layer_out` (`(4, lw, lh)`, premultiplied RGB + transmittance,
+gate-culled by the fan), then composite it over the exact fan-driven sky
+into `comp_out` (`(3, width, height)`). Call [`update_sky_fan!`](@ref) for
+the current camera position first.
+"""
+function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
+                             sky::SkyFanState, cam::Camera,
+                             spacetime::Schwarzschild;
+                             fisheye_deg::Real=0.0, relativistic::Bool=false,
+                             dt::Real=Float64(ctx.dt), trace_layer::Bool=true)
+    M = Float32(spacetime.M)
+    r_band = Float32(2.05 * spacetime.M)
+    r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
+                                                 15.0 * spacetime.M))
+    nmax = min(max(ctx.nmax,
+                   ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)),
+               20_000)
+    copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
+                                           fisheye_deg=fisheye_deg))
+    copyto!(ctx.spacetime_params,
+            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
+
+    lw, lh = size(layer_out, 2), size(layer_out, 3)
+    if trace_layer
+        fill!(layer_out, 0.0f0)
+        _launch_trace!(ctx, layer_out, ctx.cam_params, ctx.spacetime_params,
+                       lw, lh, nmax, Float32(dt), 0.5f0, 0.5f0, 1.0f0, 0, lh;
+                       fan=sky.fan, sky_params=sky.sky_params, layer=true)
+    end
+    # With trace_layer=false the caller keeps `layer_out` pre-filled with
+    # α = 1 (fully transparent): the frame is the fan-driven sky alone.
+
+    width, height = size(comp_out, 2), size(comp_out, 3)
+    if _COMPOSITE_KERNEL[] === nothing
+        _COMPOSITE_KERNEL[] = @metal launch=false sky_composite_kernel!(
+            comp_out, ctx.bg_gpu, sky.fan, layer_out, ctx.cam_params,
+            ctx.spacetime_params, sky.sky_params, width, height, lw, lh)
+    end
+    kern = _COMPOSITE_KERNEL[]
+    n = width * height
+    threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
+    kern(comp_out, ctx.bg_gpu, sky.fan, layer_out, ctx.cam_params,
+         ctx.spacetime_params, sky.sky_params, width, height, lw, lh;
+         threads=threads, groups=cld(n, threads))
+    return nothing
 end
 
 """GPU-only reprojection: warp `prev` into `warp_out` without downloading."""

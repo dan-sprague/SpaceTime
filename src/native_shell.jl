@@ -1,14 +1,19 @@
 # ---------------------------------------------------------------------------
-# Native shell: the flight simulator without Makie
+# Native shell: the simulator without Makie
 # ---------------------------------------------------------------------------
 #
-# A bare-metal presentation path for the flythrough: a GLFW window with no GL
-# context, a CAMetalLayer attached to its content view, and the preview
-# renderer's GPU output packed to BGRA and blitted straight into the layer's
-# drawable. The traced frame never leaves the GPU — no host download, no
-# Matrix{RGBf} conversion, no scene graph — and the game loop owns input and
-# physics directly. This is the shell a shipped build would use; the GLMakie
-# apps remain the studio tools.
+# A bare-metal presentation path: a GLFW window with no GL context, a
+# CAMetalLayer attached to its content view, and the renderer's GPU output
+# packed to BGRA and blitted straight into the layer's drawable. The frame
+# never leaves the GPU — no host download, no Matrix{RGBf} conversion, no
+# scene graph — and the game loop owns input and physics directly. This is
+# the shell a shipped build would use; the GLMakie apps remain the studio
+# tools.
+#
+# Rendering uses the layered engine (`update_sky_fan!` +
+# `render_layered_gpu!`): an exact per-frame deflection fan turns every sky
+# pixel into a table lookup, and only the disc/gas pays for per-pixel
+# geodesic integration, at reduced resolution.
 #
 # Everything Objective-C is done through ObjectiveC.jl (already a Metal.jl
 # dependency); the window handle comes from GLFW's native-access API.
@@ -86,7 +91,7 @@ end
 Pack `src` (the renderer's `(3, W, H)` output) to BGRA and blit it into the
 next drawable. Blocks until a drawable is free (≈ vsync when saturated).
 Command-buffer order on the shared global queue keeps the pack after any
-in-flight trace/warp kernels; an explicit flush publishes Metal.jl's batched
+in-flight render kernels; an explicit flush publishes Metal.jl's batched
 launches before ours commits.
 """
 function present!(p::MetalPresenter, src::MtlArray{Float32,3})
@@ -124,26 +129,32 @@ end
 """
     fly_native(cam, spacetime, background; disc=nothing, volume=nothing,
                width=960, height=540, winwidth=1600, winheight=900,
-               title="Spacetime Simulator")
+               layer_scale=2, fan_n=4096, title="Spacetime Simulator")
 
-The flight simulator in a native Metal window — no Makie. Renders at
-`width × height` and lets Core Animation scale to the window; the traced
-frame never leaves the GPU. Same flight model as [`flythrough`](@ref): the
-camera is a [`ShipState`](@ref) on a true GR worldline and thrust is proper
-acceleration in the ship frame, but the viewport renders from the local
-reference observer — ship speed reads out in telemetry, not as aberration.
-Runs on the calling (main) thread until the window closes.
+The simulator in a native Metal window — no Makie. Every frame: an exact
+deflection fan (`fan_n` RK4 geodesics for the current radius) drives the
+lensed sky and shadow at native resolution, the disc/gas renders as a
+separate layer at `1/layer_scale` resolution, and the composite is presented
+without ever leaving the GPU.
 
-Controls: drag to look; W/S A/D Q/E thrust; Space retro-burn; Shift ×4 burn;
-Z/C roll; `[`/`]` thrust setting; `-`/`=` time warp; V volumetric gas;
-R relativistic shading; L lens (rectilinear/fisheye); X reset ship; Esc quit.
-Telemetry lives in the window title.
+The default camera is an **omnipotent free camera**: W/S A/D move
+forward/right, Q/E move along world-vertical, all at flat velocity (`[`/`]`
+speed, Shift ×5, speed auto-scales with altitude). Press **F** to hand the
+camera to the GR ship instead ([`ShipState`](@ref)): thrust, free fall,
+retro-burn (Space), time warp (`-`/`=`) — the viewport still renders from
+the local reference observer.
+
+Other keys: drag to look; Z/C roll; V volumetric gas; R relativistic
+shading; L lens (rectilinear/fisheye); X reset position; Esc quit.
+Telemetry lives in the window title. Runs on the calling (main) thread
+until the window closes.
 """
 function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     disc::Union{AccretionDisc,Nothing}=nothing,
                     volume::Union{DiscVolume,Nothing}=nothing,
                     width::Int=960, height::Int=540,
                     winwidth::Int=1600, winheight::Int=900,
+                    layer_scale::Int=2, fan_n::Int=4096,
                     title::String="Spacetime Simulator",
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
@@ -154,46 +165,55 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     win = GLFW.CreateWindow(winwidth, winheight, title)
     presenter = MetalPresenter(win, width, height)
 
-    # Flight state (single-threaded: no locks needed).
+    # Camera state (single-threaded: no locks needed).
     state = FlyCamState(cam)
     spawn_pos = SVector{3,Float64}(cam.pos)
     ship = ShipState(spawn_pos, M)
+    flight = false          # F toggles the GR ship; default is the free cam
     focal = 24.0
     fisheye = 0.0
     relativistic = false
-    thrust = 0.05
-    twarp = 2.0
-    # The view renders from the local reference observer's frame — the ship's
-    # velocity does NOT boost the camera tetrad (no aberration/motion Doppler;
-    # only the black hole's lensing). Per Dan: the flight is relativistic,
-    # the viewport isn't.
-    beta = SVector(0.0, 0.0, 0.0)
+    speed = 2.0             # free-cam speed at reference altitude
+    thrust = 0.05           # ship max proper acceleration, c²/M
+    twarp = 2.0             # ship proper time per wall second, M
 
-    # Reprojection state.
-    prev_gpu = MtlArray{Float32}(undef, 3, width, height)
-    warp_out = MtlArray{Float32}(undef, 3, width, height)
-    warp_params = MtlVector{Float32}(undef, 22)
-    prev_cam = Ref{Any}(nothing)
-    prev_fe = Ref(0.0)
-    prev_beta = Ref(SVector(0.0, 0.0, 0.0))
-    last_full = Ref(0.0)
-    trace_cost = Ref(0.05)
-    last_present = Ref(0.0)
+    # Layered engine state: deflection fan + reduced-resolution disc layer.
+    # The layer resolution is bounded (~300 rows) so the per-frame cost of
+    # gas/disc integration stays roughly constant at any display size — the
+    # sky, stars, and shadow edge are always native.
+    sky = SkyFanState(n=fan_n)
+    lh = min(cld(height, layer_scale), 300)
+    lw = cld(width * lh, height)
+    layer_out = MtlArray{Float32,3}(undef, 4, lw, lh)
+    layer_on = disc !== nothing || volume !== nothing
+    if !layer_on
+        empty_layer = zeros(Float32, 4, lw, lh)
+        empty_layer[4, :, :] .= 1.0f0    # fully transparent: sky only
+        copyto!(layer_out, empty_layer)
+    end
+    # Gas gate: rays that provably stay outside this radius carry no disc or
+    # gas and short-circuit to pure transparency in the layer pass.
+    gate = 0.0
+    disc !== nothing && (gate = max(gate, disc.outer_radius))
+    volume !== nothing &&
+        (gate = max(gate, hypot(exp(volume.log_s_out), volume.z_max)))
+    gate *= 1.05
 
     build_cam() = camera_from_state(state, focal, 2.8, norm(state.pos), false)
 
-    # Warm every kernel (trace variants, warp, pack) before the clock starts:
-    # first-call compilation costs seconds and would otherwise hitch the
-    # opening frames of the flight.
+    # Warm every kernel (fan, both layer variants, composite, pack) before
+    # the clock starts: first-call compilation costs seconds and would
+    # otherwise hitch the opening frames.
     let cam0 = build_cam()
+        update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate)
         if ctx.has_volume
             set_volume_enabled!(ctx, false)
-            _trace_preview_gpu!(ctx, cam0, spacetime)
+            render_layered_gpu!(ctx.out_gpu, layer_out, ctx, sky, cam0,
+                                spacetime; trace_layer=layer_on)
             set_volume_enabled!(ctx, true)
         end
-        _trace_preview_gpu!(ctx, cam0, spacetime)
-        copyto!(prev_gpu, ctx.out_gpu)
-        _warp_gpu!(ctx, warp_out, prev_gpu, warp_params, cam0, cam0)
+        render_layered_gpu!(ctx.out_gpu, layer_out, ctx, sky, cam0,
+                            spacetime; trace_layer=layer_on)
         Metal.synchronize()
         present!(presenter, ctx.out_gpu)
     end
@@ -212,8 +232,11 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     t_start = time()
     last_wall = time()
     last_title = 0.0
-    n_traces = 0
-    n_warps = 0
+    frame_ms = 16.0
+    nframes = 0
+    β = SVector(0.0, 0.0, 0.0)
+    γ = 1.0
+    a_mag = 0.0
 
     while !GLFW.WindowShouldClose(win) && time() - t_start < max_seconds
         GLFW.PollEvents()
@@ -237,117 +260,117 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         else
             dragging = false
         end
-        droll = ((down(GLFW.KEY_C) ? 1.0 : 0.0) -
-                 (down(GLFW.KEY_Z) ? 1.0 : 0.0)) * 1.5 * dwall
-        state.roll += droll
+        state.roll += ((down(GLFW.KEY_C) ? 1.0 : 0.0) -
+                       (down(GLFW.KEY_Z) ? 1.0 : 0.0)) * 1.5 * dwall
         pressed_once(GLFW.KEY_V) && ctx.has_volume &&
             set_volume_enabled!(ctx, !ctx.vol_on[])
         pressed_once(GLFW.KEY_R) && (relativistic = !relativistic)
         pressed_once(GLFW.KEY_L) && (fisheye = fisheye > 0.0 ? 0.0 : 100.0)
-        pressed_once(GLFW.KEY_X) && (ship = ShipState(spawn_pos, M))
-        down(GLFW.KEY_LEFT_BRACKET) && (thrust = max(0.005, thrust / 1.03))
-        down(GLFW.KEY_RIGHT_BRACKET) && (thrust = min(0.5, thrust * 1.03))
-        down(GLFW.KEY_MINUS) && (twarp = max(0.0, twarp - 8.0 * dwall))
-        down(GLFW.KEY_EQUAL) && (twarp = min(30.0, twarp + 8.0 * dwall))
+        if pressed_once(GLFW.KEY_F)
+            flight = !flight
+            flight && (ship = ShipState(state.pos, M))
+        end
+        if pressed_once(GLFW.KEY_X)
+            state.pos = spawn_pos
+            ship = ShipState(spawn_pos, M)
+        end
+        if flight
+            down(GLFW.KEY_LEFT_BRACKET) && (thrust = max(0.005, thrust / 1.03))
+            down(GLFW.KEY_RIGHT_BRACKET) && (thrust = min(0.5, thrust * 1.03))
+            down(GLFW.KEY_MINUS) && (twarp = max(0.0, twarp - 8.0 * dwall))
+            down(GLFW.KEY_EQUAL) && (twarp = min(30.0, twarp + 8.0 * dwall))
+        else
+            down(GLFW.KEY_LEFT_BRACKET) && (speed = max(0.1, speed / 1.03))
+            down(GLFW.KEY_RIGHT_BRACKET) && (speed = min(50.0, speed * 1.03))
+        end
 
-        # --- physics (same model as the flythrough ticker) -------------
-        dτ = twarp * dwall
-        acc = SVector((down(GLFW.KEY_W) ? 1.0 : 0.0) - (down(GLFW.KEY_S) ? 1.0 : 0.0),
-                      (down(GLFW.KEY_D) ? 1.0 : 0.0) - (down(GLFW.KEY_A) ? 1.0 : 0.0),
-                      (down(GLFW.KEY_E) ? 1.0 : 0.0) - (down(GLFW.KEY_Q) ? 1.0 : 0.0))
-        na = norm(acc)
-        na > 1.0 && (acc = acc / na)
-        amax = thrust * (down(GLFW.KEY_LEFT_SHIFT) ? 4.0 : 1.0)
+        # --- movement --------------------------------------------------
         fwd, right, _ = _flycam_basis(state)
         upr = _flycam_up(state)
-        β, _ = ship_velocity(ship, M, fwd, right, upr)
-        sp = norm(β)
-        if down(GLFW.KEY_SPACE) && sp > 0.0
-            if sp < 1.5 * amax * dτ
-                τ0, t0 = ship.τ, ship.t
-                ship = ShipState(ship.x, M)
-                ship.τ, ship.t = τ0, t0
-                acc = SVector(0.0, 0.0, 0.0)
-            else
-                acc = -β / sp
+        if flight
+            # GR ship: same model as the flythrough's flight mode.
+            dτ = twarp * dwall
+            acc = SVector(
+                (down(GLFW.KEY_W) ? 1.0 : 0.0) - (down(GLFW.KEY_S) ? 1.0 : 0.0),
+                (down(GLFW.KEY_D) ? 1.0 : 0.0) - (down(GLFW.KEY_A) ? 1.0 : 0.0),
+                (down(GLFW.KEY_E) ? 1.0 : 0.0) - (down(GLFW.KEY_Q) ? 1.0 : 0.0))
+            na = norm(acc)
+            na > 1.0 && (acc = acc / na)
+            amax = thrust * (down(GLFW.KEY_LEFT_SHIFT) ? 4.0 : 1.0)
+            β, _ = ship_velocity(ship, M, fwd, right, upr)
+            sp = norm(β)
+            if down(GLFW.KEY_SPACE) && sp > 0.0
+                if sp < 1.5 * amax * dτ
+                    τ0, t0 = ship.τ, ship.t
+                    ship = ShipState(ship.x, M)
+                    ship.τ, ship.t = τ0, t0
+                    acc = SVector(0.0, 0.0, 0.0)
+                else
+                    acc = -β / sp
+                end
             end
-        end
-        a_vec = acc * amax
-        a_mag = norm(a_vec)
-        if dτ > 0.0
-            if a_mag > 0.0
-                tetb = ks_camera_tetrad(ship.x, fwd, right, upr, M; beta=β)
-                step_ship!(ship, M, dτ; accel=a_vec,
-                           axes=(tetb[2], tetb[3], tetb[4]))
-            else
-                step_ship!(ship, M, dτ)
+            a_vec = acc * amax
+            a_mag = norm(a_vec)
+            if dτ > 0.0
+                if a_mag > 0.0
+                    tetb = ks_camera_tetrad(ship.x, fwd, right, upr, M; beta=β)
+                    step_ship!(ship, M, dτ; accel=a_vec,
+                               axes=(tetb[2], tetb[3], tetb[4]))
+                else
+                    step_ship!(ship, M, dτ)
+                end
             end
-        end
-        norm(ship.x) < 0.5 * M && (ship = ShipState(spawn_pos, M))
-        state.pos = ship.x
-        β, γ = ship_velocity(ship, M, fwd, right, upr)   # telemetry only
-        sp = norm(β)
-
-        # --- render: full trace when stale, warp for pure rotation -----
-        cam_now = build_cam()
-        compat = prev_cam[] !== nothing && fisheye == prev_fe[] &&
-                 norm(beta - prev_beta[]) < 0.02
-        fresh = wall - last_full[] < max(0.1, 1.5 * trace_cost[])
-        if compat && fresh
-            _warp_gpu!(ctx, warp_out, prev_gpu, warp_params, cam_now,
-                       prev_cam[]; fisheye_deg=prev_fe[])
-            present!(presenter, warp_out)
-            last_present[] = time()
-            n_warps += 1
+            norm(ship.x) < 0.5 * M && (ship = ShipState(spawn_pos, M))
+            state.pos = ship.x
+            β, γ = ship_velocity(ship, M, fwd, right, upr)   # telemetry
         else
-            t0 = time()
-            on_band = compat ? function ()
-                # Keep the display fed during a long trace: warp at most
-                # once per ~14 ms, at the freshest look direction.
-                time() - last_present[] < 0.014 && return
-                GLFW.PollEvents()
-                camw = build_cam()
-                _warp_gpu!(ctx, warp_out, prev_gpu, warp_params, camw,
-                           prev_cam[]; fisheye_deg=prev_fe[])
-                present!(presenter, warp_out)
-                last_present[] = time()
-                return
-            end : nothing
-            _trace_preview_gpu!(ctx, cam_now, spacetime; fisheye_deg=fisheye,
-                                relativistic=relativistic, beta=beta,
-                                band_rows=on_band === nothing ? 0 :
-                                          cld(height,
-                                              clamp(round(Int, trace_cost[] / 0.012),
-                                                    4, 24)),
-                                on_band=on_band)
-            copyto!(prev_gpu, ctx.out_gpu)
-            prev_cam[] = cam_now
-            prev_fe[] = fisheye
-            prev_beta[] = beta
-            present!(presenter, ctx.out_gpu)
-            last_present[] = time()
-            last_full[] = time()
-            trace_cost[] = time() - t0
-            n_traces += 1
+            # Omnipotent free camera: flat velocity while keys are held.
+            v = speed * dwall * (down(GLFW.KEY_LEFT_SHIFT) ? 5.0 : 1.0)
+            rn = norm(state.pos)
+            v *= clamp(0.12 * max(rn - 1.9 * M, 0.25 * rn), 0.02, 8.0)
+            world_z = SVector(0.0, 0.0, 1.0)
+            down(GLFW.KEY_W) && (state.pos += v * fwd)
+            down(GLFW.KEY_S) && (state.pos -= v * fwd)
+            down(GLFW.KEY_A) && (state.pos -= v * right)
+            down(GLFW.KEY_D) && (state.pos += v * right)
+            down(GLFW.KEY_Q) && (state.pos -= v * world_z)
+            down(GLFW.KEY_E) && (state.pos += v * world_z)
+            rn = norm(state.pos)
+            rn < 0.45 * M && (state.pos *= 0.45 * M / rn)
         end
+
+        # --- render: fan + layer + composite, all on the GPU -----------
+        t0 = time()
+        cam_now = build_cam()
+        update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
+        render_layered_gpu!(ctx.out_gpu, layer_out, ctx, sky, cam_now,
+                            spacetime; fisheye_deg=fisheye,
+                            relativistic=relativistic, trace_layer=layer_on)
+        present!(presenter, ctx.out_gpu)
+        frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
+        nframes += 1
 
         # --- telemetry in the title bar (cheap, 4 Hz) ------------------
         if wall - last_title > 0.25
             last_title = wall
-            r = norm(ship.x)
+            r = norm(state.pos)
             regime = r < 2.0 ? "INSIDE HORIZON" : r < 3.0 ? "PHOTON SPHERE" :
                      r < 6.0 ? "BELOW ISCO" : ""
+            info = flight ?
+                @sprintf("FLIGHT · β %.3fc γ %.2f · a %s · thr %.2f · warp %.1f · τ %.1fs t %.1fs",
+                         norm(β), γ,
+                         a_mag > 0 ? @sprintf("%.2f", a_mag) : "0 (free fall)",
+                         thrust, twarp, ship.τ * 0.49255, ship.t * 0.49255) :
+                @sprintf("free cam · spd %.1f", speed)
             GLFW.SetWindowTitle(win, @sprintf(
-                "%s — r %.2fM %s · β %.3fc γ %.2f · a %s · thr %.2f · warp %.1f · τ %.1fs t %.1fs · trace %.0fms",
-                title, r, regime, sp, γ,
-                a_mag > 0 ? @sprintf("%.2f", a_mag) : "0 (free fall)",
-                thrust, twarp, ship.τ * 0.49255, ship.t * 0.49255,
-                1000 * trace_cost[]))
+                "%s — r %.2fM %s · %s · %.1f ms (%.0f fps)",
+                title, r, regime, info, frame_ms,
+                1000.0 / max(frame_ms, 1.0e-3)))
         end
     end
     elapsed = time() - t_start
-    @printf("fly_native: %.1f s, %d traces + %d warps = %.1f frames/s presented\n",
-            elapsed, n_traces, n_warps, (n_traces + n_warps) / elapsed)
+    @printf("fly_native: %.1f s, %d frames = %.1f fps, last frame %.1f ms\n",
+            elapsed, nframes, nframes / elapsed, frame_ms)
     GLFW.DestroyWindow(win)
     return nothing
 end
