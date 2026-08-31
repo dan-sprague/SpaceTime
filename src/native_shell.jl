@@ -129,9 +129,10 @@ end
 The flight simulator in a native Metal window — no Makie. Renders at
 `width × height` and lets Core Animation scale to the window; the traced
 frame never leaves the GPU. Same flight model as [`flythrough`](@ref): the
-camera is a [`ShipState`](@ref) on a true GR worldline, thrust is proper
-acceleration in the ship frame, and the ship's velocity boosts the camera
-tetrad. Runs on the calling (main) thread until the window closes.
+camera is a [`ShipState`](@ref) on a true GR worldline and thrust is proper
+acceleration in the ship frame, but the viewport renders from the local
+reference observer — ship speed reads out in telemetry, not as aberration.
+Runs on the calling (main) thread until the window closes.
 
 Controls: drag to look; W/S A/D Q/E thrust; Space retro-burn; Shift ×4 burn;
 Z/C roll; `[`/`]` thrust setting; `-`/`=` time warp; V volumetric gas;
@@ -159,9 +160,13 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     ship = ShipState(spawn_pos, M)
     focal = 24.0
     fisheye = 0.0
-    relativistic = true
+    relativistic = false
     thrust = 0.05
     twarp = 2.0
+    # The view renders from the local reference observer's frame — the ship's
+    # velocity does NOT boost the camera tetrad (no aberration/motion Doppler;
+    # only the black hole's lensing). Per Dan: the flight is relativistic,
+    # the viewport isn't.
     beta = SVector(0.0, 0.0, 0.0)
 
     # Reprojection state.
@@ -280,9 +285,8 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         end
         norm(ship.x) < 0.5 * M && (ship = ShipState(spawn_pos, M))
         state.pos = ship.x
-        β, γ = ship_velocity(ship, M, fwd, right, upr)
+        β, γ = ship_velocity(ship, M, fwd, right, upr)   # telemetry only
         sp = norm(β)
-        beta = sp > 0.99 ? β * (0.99 / sp) : β
 
         # --- render: full trace when stale, warp for pure rotation -----
         cam_now = build_cam()

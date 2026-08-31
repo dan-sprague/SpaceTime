@@ -53,9 +53,10 @@ The camera has mass. In **Flight** mode (the default) it rides a
 Kerr–Schild geodesic equations the renderer uses. Engines off is exact free
 fall: release the keys near the hole and you orbit, or plunge, with the
 accelerometer reading zero. Thrust keys apply a proper acceleration in the
-ship's own frame, and the ship's velocity relative to the local reference
-observer Lorentz-boosts the camera tetrad, so aberration, motion Doppler,
-and beaming develop as you accelerate.
+ship's own frame. The viewport renders from the local reference observer's
+frame — the ship's speed shows up in the telemetry and the clocks, not as
+aberration of the view (the boosted-tetrad machinery stays in the video
+pipeline via `REL=1`).
 
 - **Drag** to look, **W/S · A/D · Q/E** to thrust (forward/right/up in the
   ship frame), **Space** to retro-burn to rest, **Shift** for a 4× burn,
@@ -109,9 +110,8 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # beyond any rectilinear focal length.
     fisheye_obs = Observable(0.0)
     # Relativistic shading: gravitational blueshift + Doppler of the camera
-    # applied to the sky (Planck-locus tint + brightness) and disc. Defaults
-    # on: in flight mode the ship reaches speeds where it matters.
-    rel_obs = Observable(true)
+    # applied to the sky (Planck-locus tint + brightness) and disc.
+    rel_obs = Observable(false)
     focal_obs = Observable(24.0)
     move_speed_obs = Observable(2.0)
     auto_speed_obs = Observable(true)
@@ -779,9 +779,11 @@ function flythrough(cam::AbstractCamera, spacetime::Schwarzschild, background;
                         state.pos = s.x
                         moved = true
                     end
+                    # Telemetry only: the ship's velocity does not boost the
+                    # rendered view (beta_ref stays zero) — the flight is
+                    # relativistic, the viewport shows only the hole's lensing.
                     β2, γ2 = ship_velocity(s, M, fwd, right, upr)
                     sp2 = norm(β2)
-                    beta_ref[] = sp2 > 0.99 ? β2 * (0.99 / sp2) : β2
                     if telem === nothing && wall - last_telem[] > 0.15
                         gtxt = a_mag > 0.0 ?
                             @sprintf("%.2f c²/M (%.1e g)", a_mag, a_mag * GEE) :
