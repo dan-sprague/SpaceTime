@@ -105,8 +105,8 @@ function _streak_kernel!(dst, src, BW, BH, L)
     while d < 4
         dx = d == 0 ? 1.0f0 : d == 1 ? 0.7071f0 : d == 2 ? 0.0f0 : -0.7071f0
         dy = d == 0 ? 0.0f0 : d == 1 ? 0.7071f0 : d == 2 ? 1.0f0 : 0.7071f0
-        for t in 1:16
-            s = Float32(t) * 4.0f0
+        for t in 1:20
+            s = Float32(t) * 2.5f0
             w = exp(-s * invL)
             for sgn in (-1.0f0, 1.0f0)
                 sx = clamp(unsafe_trunc(Int32, Float32(x) + sgn * s * dx),
@@ -395,16 +395,18 @@ function present!(p::MetalPresenter, src::MtlArray{Float32,3};
         td = min(kd.pipeline.maxTotalThreadsPerThreadgroup, nb)
         kd(p.bloom_a, src, W, H, BW, BH, p.grade_host[1] * escale,
            p.grade_host[10]; threads=td, groups=cld(nb, td))
+        tb = min(kb.pipeline.maxTotalThreadsPerThreadgroup, nb)
+        kb(p.bloom_b, p.bloom_a, BW, BH, 1, 0; threads=tb, groups=cld(nb, tb))
+        kb(p.bloom_a, p.bloom_b, BW, BH, 0, 1; threads=tb, groups=cld(nb, tb))
         if p.grade_host[14] > 0.0f0
-            # Streaks read the un-blurred bright pass; decay length scales
-            # with the source width (≈ 0.1·W, the porthole recipe).
+            # Streaks read the BLURRED bright pass: a compact far-away
+            # source sampled with strided nearest taps turns into dashed
+            # rays; pre-smoothing the source keeps them continuous.
+            # Decay length ≈ 0.1·W, the porthole recipe.
             ts = min(ks.pipeline.maxTotalThreadsPerThreadgroup, nb)
             ks(p.bloom_s, p.bloom_a, BW, BH, Float32(0.1f0 * BW);
                threads=ts, groups=cld(nb, ts))
         end
-        tb = min(kb.pipeline.maxTotalThreadsPerThreadgroup, nb)
-        kb(p.bloom_b, p.bloom_a, BW, BH, 1, 0; threads=tb, groups=cld(nb, tb))
-        kb(p.bloom_a, p.bloom_b, BW, BH, 0, 1; threads=tb, groups=cld(nb, tb))
         th = min(kh.pipeline.maxTotalThreadsPerThreadgroup, nw)
         kh(p.bloom_w1, p.bloom_a, BW, BH, WW, WH; threads=th,
            groups=cld(nw, th))
@@ -534,9 +536,9 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                          # vignette 0.3). Threshold raised from the video's
                          # 0.5 — quarter-res bloom must not catch stars.
             set_grade!(presenter; exposure=1.741 * exposure, filmic=true,
-                       crush=1.0, saturation=1.0, vignette=0.30,
+                       crush=1.0, saturation=0.94, vignette=0.30,
                        wb=(1.0, 1.0, 1.0), bloom=1.0, bloom_threshold=1.0,
-                       hue_preserve=0.75, gamma_power=5.0, grain=0.02,
+                       hue_preserve=0.55, gamma_power=5.0, grain=0.02,
                        streak_fraction=0.667, streak_gain=4.0)
         end
         grade_rev += 1
