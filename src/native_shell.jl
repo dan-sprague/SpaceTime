@@ -263,6 +263,8 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     last_sig = nothing
     REFINE_PASSES = 32
     passes = 0
+    refine_row = 0
+    mpr = 1.0e-4            # measured seconds per refined row (EMA)
     accum = MtlArray{Float32,3}(undef, 3, width, height)
 
     while !GLFW.WindowShouldClose(win) && time() - t_start < max_seconds
@@ -385,6 +387,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             end
             last_sig = sig
             passes = 0
+            refine_row = 0
             t0 = time()
             update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
             if layer_on
@@ -405,29 +408,34 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
             nframes += 1
         elseif passes < REFINE_PASSES
-            # At rest: progressive refinement. Full-resolution passes with
-            # sub-pixel jitter (R2 low-discrepancy sequence) keep summing
+            # At rest: time-sliced progressive refinement. Full-resolution
+            # jittered passes (R2 low-discrepancy sequence) keep summing
             # into `accum` — every pass is real rays, so the still image
-            # converges to a supersampled photograph. The presenter's
-            # exposure factor divides by the pass count; any input aborts.
-            if passes == 0
-                render_layered_gpu!(accum, L, ctx, sky, cam_now, spacetime;
-                                    fisheye_deg=fisheye,
-                                    relativistic=relativistic,
-                                    trace_layer=layer_on)
-            else
-                ju = mod(0.5 + 0.7548776662466927 * passes, 1.0)
-                jv = mod(0.5 + 0.5698402909980532 * passes, 1.0)
-                render_layered_gpu!(accum, L, ctx, sky, cam_now, spacetime;
-                                    fisheye_deg=fisheye,
-                                    relativistic=relativistic,
-                                    trace_layer=layer_on,
-                                    ju=ju, jv=jv, accumulate=true)
+            # converges to a supersampled photograph — but the work is
+            # submitted in row bands of ~7 ms and synchronized per band, so
+            # the event loop keeps its cadence and any input aborts between
+            # bands. Presented at pass boundaries; the presenter's exposure
+            # factor divides by the pass count.
+            t0 = time()
+            ju = passes == 0 ? 0.5 : mod(0.5 + 0.7548776662466927 * passes, 1.0)
+            jv = passes == 0 ? 0.5 : mod(0.5 + 0.5698402909980532 * passes, 1.0)
+            band = clamp(round(Int, 0.007 / mpr), 16, height - refine_row)
+            render_layered_gpu!(accum, L, ctx, sky, cam_now, spacetime;
+                                fisheye_deg=fisheye,
+                                relativistic=relativistic,
+                                trace_layer=layer_on, ju=ju, jv=jv,
+                                accumulate=passes > 0,
+                                row0=refine_row, rows=band)
+            Metal.synchronize()
+            mpr = 0.7 * mpr + 0.3 * (time() - t0) / band
+            refine_row += band
+            if refine_row >= height
+                refine_row = 0
+                passes += 1
+                present!(presenter, accum;
+                         exposure=exposure / Float32(passes), filmic=filmic)
+                nframes += 1
             end
-            passes += 1
-            present!(presenter, accum; exposure=exposure / Float32(passes),
-                     filmic=filmic)
-            nframes += 1
         else
             sleep(0.006)
         end

@@ -1369,11 +1369,13 @@ fall back to the nearest entry — a sub-pixel zone at the photon ring.
 """
 function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
                                spacetime_params, sky_params,
-                               width, height, lw, lh, ju, jv, accumulate)
+                               width, height, lw, lh, ju, jv, accumulate,
+                               row0, rows)
     idx = thread_position_in_grid().x
-    idx > width * height && return
-    j = (idx - 1) ÷ width + 1
+    idx > width * rows && return
+    j = (idx - 1) ÷ width + 1 + row0
     i = (idx - 1) % width + 1
+    j > height && return
 
     M = spacetime_params[1]
     cx = cam_params[1];  cy = cam_params[2];  cz = cam_params[3]
@@ -1669,7 +1671,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                              dt::Real=Float64(ctx.dt), trace_layer::Bool=true,
                              substride::Int=1, subx::Int=0, suby::Int=0,
                              ju::Real=0.5, jv::Real=0.5,
-                             accumulate::Bool=false)
+                             accumulate::Bool=false,
+                             row0::Int=0, rows::Int=-1)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -1683,35 +1686,43 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
 
     lw, lh = size(layer_out, 2), size(layer_out, 3)
+    width, height = size(comp_out, 2), size(comp_out, 3)
+    # Optional row band (time-sliced refinement): applies to both passes.
+    # Banded use requires a display-sized layer so the rows line up.
+    rows < 0 && (rows = height)
+    banded = !(row0 == 0 && rows == height)
+    banded && ((lw, lh) != (width, height) || substride != 1) &&
+        throw(ArgumentError("row-banded layered render needs a display-sized layer and substride 1"))
     if trace_layer
         # LAYER passes write every dispatched pixel by assignment, so no
         # clear is needed — and a sub-grid pass (substride > 1) must NOT
         # clear: the undispatched pixels carry reprojected history. The
         # dispatch covers layer_out / substride pixels of it.
         sw, sh = cld(lw, substride), cld(lh, substride)
+        lrow0 = banded ? row0 : 0
+        lrows = banded ? rows : sh
         _launch_trace!(ctx, layer_out, ctx.cam_params, ctx.spacetime_params,
                        sw, sh, nmax, Float32(dt), Float32(ju), Float32(jv),
-                       1.0f0, 0, sh;
+                       1.0f0, lrow0, lrows;
                        fan=sky.fan, sky_params=sky.sky_params, layer=true,
                        substride=substride, subx=subx, suby=suby)
     end
     # With trace_layer=false the caller keeps `layer_out` pre-filled with
     # α = 1 (fully transparent): the frame is the fan-driven sky alone.
 
-    width, height = size(comp_out, 2), size(comp_out, 3)
     acc = accumulate ? 1.0f0 : 0.0f0
     if _COMPOSITE_KERNEL[] === nothing
         _COMPOSITE_KERNEL[] = @metal launch=false sky_composite_kernel!(
             comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out,
             ctx.cam_params, ctx.spacetime_params, sky.sky_params,
-            width, height, lw, lh, Float32(ju), Float32(jv), acc)
+            width, height, lw, lh, Float32(ju), Float32(jv), acc, row0, rows)
     end
     kern = _COMPOSITE_KERNEL[]
-    n = width * height
+    n = width * rows
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
     kern(comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out, ctx.cam_params,
          ctx.spacetime_params, sky.sky_params, width, height, lw, lh,
-         Float32(ju), Float32(jv), acc;
+         Float32(ju), Float32(jv), acc, row0, rows;
          threads=threads, groups=cld(n, threads))
     return nothing
 end
