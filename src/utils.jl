@@ -16,7 +16,7 @@ function compare_hamiltonian_drift(cam::AbstractCamera, spacetime::AbstractSpace
         ylabel = "log10|H|",
         yscale = log10)
 
-    lines!(ax, sol_sym.u .|> x -> x[2] / (2 * spacetime.M), abs.(h_err), label="Functor", color=:blue)
+    lines!(ax, sol_sym.u .|> x -> sqrt(x[2]^2 + x[3]^2 + x[4]^2) / (2 * spacetime.M), abs.(h_err), label="Functor", color=:blue)
 
     axislegend(ax)
     return fig
@@ -27,13 +27,8 @@ function visualize_solution(solutions::Vector{WorldLine}, spacetime::Schwarzschi
     title = "")
     # Precompute Cartesian trajectories (reverse if requested)
     trajectories = map(solutions) do wl
-        r = [μ[2] for μ in wl.μ]
-        θ = [μ[3] for μ in wl.μ]
-        ϕ = [μ[4] for μ in wl.μ]
-        x = r .* sin.(θ) .* cos.(ϕ)
-        y = r .* sin.(θ) .* sin.(ϕ)
-        z = r .* cos.(θ)
-        pts = Point3f.(x, y, z)
+        # State is Cartesian Kerr–Schild: positions are components 2:4.
+        pts = [Point3f(μ[2], μ[3], μ[4]) for μ in wl.μ]
         rev ? reverse(pts) : pts
     end
 

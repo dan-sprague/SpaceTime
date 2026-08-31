@@ -108,12 +108,13 @@ RES=4k SAVE_TIFF=0 STOP_AFTER=9 julia -t auto,1 --project examples/videos/render
 
 ## How it works
 
-**Geodesics.** Photons follow null geodesics of the Schwarzschild metric.
-The CPU path integrates Hamilton's equations in Schwarzschild coordinates
-with DifferentialEquations.jl; the GPU kernel integrates in Cartesian
-Kerr–Schild coordinates (fixed-step RK4, radius-adaptive step), which are
-regular at the horizon — that's what makes interior cameras possible. Rays
-are traced *backward* from the camera to the sky, the disc, or the shadow.
+**Geodesics.** Photons follow null geodesics of the Schwarzschild metric,
+integrated in Cartesian Kerr–Schild coordinates on both paths — regular at
+the poles and the horizon (that's what makes interior cameras possible). The
+CPU path integrates Hamilton's equations adaptively with
+DifferentialEquations.jl; the GPU kernel uses fixed-step RK4 with a
+radius-adaptive step. Rays are traced *backward* from the camera to the sky,
+the disc, or the shadow.
 
 **Cameras are tetrads.** A camera is an orthonormal frame: a static observer
 where one exists, a radial free-faller inside r = 2.5M, and optionally

@@ -171,29 +171,31 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    _accumulate_volume_sample!(meta, st, disc, vol, r, θ, ϕ, pr, pθ, pϕ, ds)
+    _accumulate_volume_sample!(meta, st, disc, vol, x, y, z, px, py, pz, p_t, ds)
 
 Add one path sample of Doppler-shaded volume emission to `meta` and attenuate
-its transmittance. Mirrors the Metal kernel's in-loop shading.
+its transmittance. Position and momentum are Cartesian Kerr–Schild. Mirrors
+the Metal kernel's in-loop shading.
 """
 function _accumulate_volume_sample!(meta, st::Schwarzschild,
                                     disc::AccretionDisc, vol::DiscVolume,
-                                    r, θ, ϕ, pr, pθ, pϕ, ds)
+                                    x, y, z, px, py, pz, p_t, ds)
     M = st.M
-    sθ, cθ = sin(θ), cos(θ)
-    s_cyl = r * sθ
-    z = r * cθ
+    s_cyl = sqrt(x^2 + y^2)
+    s_cyl <= 1e-12 && return
+    ϕ = atan(y, x)
     ρ = sample_disc_volume(vol, s_cyl, ϕ, z)
     ρ <= 1e-4 && return
 
-    # Photon momentum in Cartesian coordinates (general θ).
-    sp, cp = sin(ϕ), cos(ϕ)
-    v_r = (r - 2M) / r * pr
-    vth = pθ / r
-    vph = pϕ / (r * max(sθ, 1e-6))
-    px = v_r * sθ * cp + vth * cθ * cp - vph * sp
-    py = v_r * sθ * sp + vth * cθ * sp + vph * cp
-    pz = v_r * cθ - vth * sθ
+    r = sqrt(x^2 + y^2 + z^2)
+    # Photon coordinate velocity dx/dλ: the spatial part of the KS RHS.
+    f = 2M / r
+    κ = (x * px + y * py + z * pz) / r
+    c1 = f * (-p_t + κ) / r
+    sp, cp = y / s_cyl, x / s_cyl
+    px = px - c1 * x
+    py = py - c1 * y
+    pz = pz - c1 * z
     plen = sqrt(px^2 + py^2 + pz^2)
     plen <= 0 && return
 
@@ -239,32 +241,29 @@ function make_volume_cb(vol::DiscVolume, disc::AccretionDisc)
         st = integrator.p[1]
         u1 = integrator.uprev
         u2 = integrator.u
-        r1, θ1, ϕ1 = u1[2], u1[3], u1[4]
-        r2, θ2, ϕ2 = u2[2], u2[3], u2[4]
+        x1, y1, z1 = u1[2], u1[3], u1[4]
+        x2, y2, z2 = u2[2], u2[3], u2[4]
 
         # Cheap reject: both endpoints on the same side, outside the slab.
-        z1 = r1 * cos(θ1)
-        z2 = r2 * cos(θ2)
         if abs(z1) > zmax && abs(z2) > zmax && sign(z1) == sign(z2)
             return
         end
 
-        dϕ = rem(ϕ2 - ϕ1, 2π, RoundNearest)
-        rm = 0.5 * (r1 + r2)
-        ds_tot = sqrt((r2 - r1)^2 + (rm * (θ2 - θ1))^2 +
-                      (rm * sin(0.5 * (θ1 + θ2)) * dϕ)^2)
+        ds_tot = sqrt((x2 - x1)^2 + (y2 - y1)^2 + (z2 - z1)^2)
         ds_tot <= 0 && return
         nsub = clamp(ceil(Int, ds_tot / 0.25), 1, 24)
         h = ds_tot / nsub
+        p_t = u1[5]                                  # conserved
         for m in 1:nsub
             f = (m - 0.5) / nsub
             _accumulate_volume_sample!(meta, st, disc, vol,
-                                       r1 + f * (r2 - r1),
-                                       θ1 + f * (θ2 - θ1),
-                                       ϕ1 + f * dϕ,
+                                       x1 + f * (x2 - x1),
+                                       y1 + f * (y2 - y1),
+                                       z1 + f * (z2 - z1),
                                        u1[6] + f * (u2[6] - u1[6]),
                                        u1[7] + f * (u2[7] - u1[7]),
-                                       u1[8], h)
+                                       u1[8] + f * (u2[8] - u1[8]),
+                                       p_t, h)
         end
         return
     end

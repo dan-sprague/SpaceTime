@@ -2,12 +2,12 @@
     Photon
 
 Represents a photon in the spacetime, encapsulating its position and momentum
-as an 8-component state vector. The first four components represent the
-coordinates (t, r, θ, ϕ), while the last four represent the corresponding
-momenta (pt, pr, pθ, pϕ).
+as an 8-component state vector in Cartesian Kerr–Schild coordinates. The first
+four components represent the coordinates (t, x, y, z), while the last four
+represent the corresponding momenta (p_t, px, py, pz).
 """
 struct Photon
-    μ::SVector{8, Float64}  # (t, r, θ, ϕ, pt, pr, pθ, pϕ)
+    μ::SVector{8, Float64}  # (t, x, y, z, p_t, px, py, pz)
 
     Photon(μ::SVector{8, Float64}) = new(μ)
     Photon(q::SVector{4, Float64}, p::SVector{4, Float64}) = new(vcat(q, p))
@@ -60,39 +60,27 @@ end
 """
     init_photon(origin, direction, spacetime::AbstractSpacetime)
 
-Build a `Photon` from a ray `origin` and unit `direction` in Cartesian
-coordinates. The position is converted to spherical coordinates and the
-corresponding null momentum is computed from the inverse metric.
+Build a photon state vector from a ray `origin` and unit `direction` in
+Cartesian Kerr–Schild coordinates `(t, x, y, z, p_t, px, py, pz)`. The
+observer tetrad is [`ks_camera_tetrad`](@ref) — a static observer where one
+exists, a radial free-faller inside r = 2.5M — and the null momentum comes
+from [`ks_init_photon`](@ref): the ray is traced *backward* in time
+(`q = n − u`), matching the GPU kernel, so sensor angles are proper angles in
+the observer's frame and the conserved `p_t` carries the full frequency shift.
 """
 function init_photon(origin::SVector{3,Float64}, direction::SVector{3,Float64},
                      spacetime::AbstractSpacetime)
-    dx, dy, dz = direction
-    x, y, z = origin
+    # Any flat-orthonormal pair completing `direction`: ks_init_photon only
+    # uses them to decompose a direction that is entirely along `fwd`.
+    a = abs(direction[3]) < 0.9 ? SVector(0.0, 0.0, 1.0) : SVector(1.0, 0.0, 0.0)
+    right = normalize(cross(direction, a))
+    up = cross(right, direction)
 
-    r = sqrt(x^2 + y^2 + z^2)
-    θ = acos(z / r)
-    ϕ = atan(y, x)
-    q0 = @SVector [0.0, r, θ, ϕ]
-
-    # Unit projections onto the local orthonormal spherical axes (r̂, θ̂, ϕ̂).
-    nr = dx * sin(θ) * cos(ϕ) + dy * sin(θ) * sin(ϕ) + dz * cos(θ)
-    nθ = dx * cos(θ) * cos(ϕ) + dy * cos(θ) * sin(ϕ) - dz * sin(θ)
-    nϕ = -dx * sin(ϕ) + dy * cos(ϕ)
-
-    g_inv = metric_inverse(spacetime, q0)
-
-    # Static-observer orthonormal tetrad for a diagonal metric: e_î = √(g^ii) ∂_i,
-    # e_t̂ = √(−g^tt) ∂_t. A unit-local-frequency photon p = e_t̂ + n^î e_î then has
-    # lowered components p_i = n_î / √(g^ii) and p_t = −1/√(−g^tt) (the conserved,
-    # gravitationally redshifted energy). Sensor angles are thereby proper angles
-    # in the static observer's frame — matching the GPU kernel's tetrad — rather
-    # than coordinate angles, which stretch radially near the horizon.
-    pt = -1.0 / sqrt(abs(g_inv[1,1]))
-    pr = nr / sqrt(abs(g_inv[2,2]))
-    pθ = nθ / sqrt(abs(g_inv[3,3]))
-    pϕ = nϕ / sqrt(abs(g_inv[4,4]))
-
-    return vcat(q0, SVector(pt, pr, pθ, pϕ))
+    tet = ks_camera_tetrad(origin, direction, right, up, spacetime.M)
+    μ6, p_t = ks_init_photon(origin, direction, spacetime.M, tet,
+                             direction, right, up)
+    return SVector{8,Float64}(0.0, μ6[1], μ6[2], μ6[3],
+                              p_t, μ6[4], μ6[5], μ6[6])
 end
 
 """
@@ -193,16 +181,19 @@ function _trace_color(integrator, meta, cam::AbstractCamera,
     reinit!(integrator, μ0)
     solve!(integrator)
 
-    final_r = integrator.sol.u[end][2]
-    final_θ = integrator.sol.u[end][3]
-    final_ϕ = integrator.sol.u[end][4]
+    μf = integrator.sol.u[end]
+    xf, yf, zf = μf[2], μf[3], μf[4]
+    final_r = sqrt(xf^2 + yf^2 + zf^2)
+    final_θ = acos(clamp(zf / final_r, -1.0, 1.0))
+    final_ϕ = atan(yf, xf)
 
     # Compute approximate path length for dust extinction.
-    r_start = μ0[2]
+    x0, y0, z0 = μ0[2], μ0[3], μ0[4]
+    r_start = sqrt(x0^2 + y0^2 + z0^2)
     path_len = abs(r_start - final_r)  # radial component
     # Add transverse component for non-radial rays.
-    Δθ = abs(μ0[3] - final_θ)
-    path_len += r_start * Δθ * 0.5  # approximate
+    cosΔψ = (x0 * xf + y0 * yf + z0 * zf) / (r_start * final_r)
+    path_len += r_start * acos(clamp(cosΔψ, -1.0, 1.0)) * 0.5  # approximate
     meta.path_length = path_len
 
     color = if final_r < 2.1 * spacetime.M
@@ -238,8 +229,9 @@ function _trace_grayscale(integrator, meta, cam::AbstractCamera,
     reinit!(integrator, μ0)
     solve!(integrator)
 
-    final_r = integrator.sol.u[end][2]
-    return final_r < 2.1 * spacetime.M ? 0.0 : 0.5 + 0.5 * sin(10 * integrator.sol.u[end][4])
+    μf = integrator.sol.u[end]
+    final_r = sqrt(μf[2]^2 + μf[3]^2 + μf[4]^2)
+    return final_r < 2.1 * spacetime.M ? 0.0 : 0.5 + 0.5 * sin(10 * atan(μf[3], μf[2]))
 end
 
 """
@@ -478,7 +470,7 @@ Trace a photon through `spacetime` and return a `WorldLine`.
 """
 function raytrace(spacetime::AbstractSpacetime, photon::Photon;
                   tspan::Tuple{Float64,Float64}=(0.0, 500.0), npoints::Int=1000, solver=Tsit5())
-    r_max = 2.0 * photon.μ[2]
+    r_max = 2.0 * sqrt(photon.μ[2]^2 + photon.μ[3]^2 + photon.μ[4]^2)
     cb = ContinuousCallback(make_boundary_condition(r_max), horizon_affect!)
     prob = ODEProblem(spacetime, photon.μ, tspan, (spacetime, nothing))
     sol = solve(prob, solver, callback=cb, reltol=1e-6, abstol=1e-6)

@@ -4,9 +4,9 @@
 A general-relativistic ray tracer and virtual camera for Schwarzschild black
 holes, built as an educational resource and a tech demo.
 
-Light is traced along null geodesics — on the CPU with DifferentialEquations.jl
-in Schwarzschild coordinates, and on Apple-silicon GPUs with a Metal kernel in
-horizon-regular Kerr–Schild coordinates — through a volumetric accretion disc
+Light is traced along null geodesics in horizon-regular Cartesian Kerr–Schild
+coordinates — on the CPU adaptively with DifferentialEquations.jl, and on
+Apple-silicon GPUs with a Metal kernel — through a volumetric accretion disc
 shaded by Doppler-shifted blackbody emission. A physical camera pipeline
 (pinhole / thin-lens / fisheye projections, sensor noise, bloom, tonemapping,
 film-look post) turns the physics into photographs, and GLMakie apps

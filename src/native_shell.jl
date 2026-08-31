@@ -144,13 +144,14 @@ end
 """
     fly_native(cam, spacetime, background; disc=nothing, volume=nothing,
                width=960, height=540, winwidth=1600, winheight=900,
-               layer_scale=2, fan_n=4096, title="Spacetime Simulator")
+               fan_n=4096, title="Spacetime Simulator")
 
 The simulator in a native Metal window — no Makie. Every frame: an exact
 deflection fan (`fan_n` RK4 geodesics for the current radius) drives the
-lensed sky and shadow at native resolution, the disc/gas renders as a
-separate layer at `1/layer_scale` resolution, and the composite is presented
-without ever leaving the GPU.
+lensed sky and shadow at native resolution; the disc/gas layer renders
+fresh at half display resolution while moving (quarter under load) and at
+full resolution at rest; the composite is presented without ever leaving
+the GPU.
 
 The default camera is an **omnipotent free camera**: W/S A/D move
 forward/right, Q/E move along world-vertical, all at flat velocity (`[`/`]`
@@ -172,7 +173,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     volume::Union{DiscVolume,Nothing}=nothing,
                     width::Int=960, height::Int=540,
                     winwidth::Int=1600, winheight::Int=900,
-                    layer_scale::Int=2, fan_n::Int=4096,
+                    fan_n::Int=4096,
                     title::String="Spacetime Simulator",
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
@@ -197,19 +198,21 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     exposure = 1.0f0        # display transform (T/G keys)
     filmic = true           # ACES-style display curve (P toggles)
 
-    # Layered engine state: deflection fan + reduced-resolution disc layer.
-    # The layer resolution is bounded (~300 rows) so the per-frame cost of
-    # gas/disc integration stays roughly constant at any display size — the
-    # sky, stars, and shadow edge are always native.
+    # Layered engine state: deflection fan + the disc/gas layer. While
+    # moving, the layer renders FRESH every frame at half display resolution
+    # (a quarter-res rung when the frame runs hot) — no temporal history:
+    # reprojected history echoes badly next to the photon ring, where the
+    # parallax of wound light paths is extreme. At rest, one full-resolution
+    # pass. Sky/shadow are always per-frame exact and native.
     sky = SkyFanState(n=fan_n)
-    lh = min(cld(height, layer_scale), 300)
-    lw = cld(width * lh, height)
-    layer_out = MtlArray{Float32,3}(undef, 4, lw, lh)
     layer_on = disc !== nothing || volume !== nothing
+    L = MtlArray{Float32,3}(undef, 4, width, height)          # rest: native
+    Lh = MtlArray{Float32,3}(undef, 4, width ÷ 2, height ÷ 2) # moving
+    Lq = MtlArray{Float32,3}(undef, 4, width ÷ 4, height ÷ 4) # moving, hot
     if !layer_on
-        empty_layer = zeros(Float32, 4, lw, lh)
+        empty_layer = zeros(Float32, 4, width, height)
         empty_layer[4, :, :] .= 1.0f0    # fully transparent: sky only
-        copyto!(layer_out, empty_layer)
+        copyto!(L, empty_layer)
     end
     # Gas gate: rays that provably stay outside this radius carry no disc or
     # gas and short-circuit to pure transparency in the layer pass.
@@ -228,11 +231,11 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate)
         if ctx.has_volume
             set_volume_enabled!(ctx, false)
-            render_layered_gpu!(ctx.out_gpu, layer_out, ctx, sky, cam0,
+            render_layered_gpu!(ctx.out_gpu, L, ctx, sky, cam0,
                                 spacetime; trace_layer=layer_on)
             set_volume_enabled!(ctx, true)
         end
-        render_layered_gpu!(ctx.out_gpu, layer_out, ctx, sky, cam0,
+        render_layered_gpu!(ctx.out_gpu, L, ctx, sky, cam0,
                             spacetime; trace_layer=layer_on)
         Metal.synchronize()
         present!(presenter, ctx.out_gpu)
@@ -259,7 +262,6 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     a_mag = 0.0
     last_sig = nothing
     refined = false
-    layer_full = Ref{Any}(nothing)   # native-res gas layer for stills
 
     while !GLFW.WindowShouldClose(win) && time() - t_start < max_seconds
         GLFW.PollEvents()
@@ -383,20 +385,28 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             refined = false
             t0 = time()
             update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
-            render_layered_gpu!(ctx.out_gpu, layer_out, ctx, sky, cam_now,
-                                spacetime; fisheye_deg=fisheye,
-                                relativistic=relativistic,
-                                trace_layer=layer_on)
+            if layer_on
+                # Fresh gas every frame — half display resolution, dropping
+                # a rung when the frame budget runs hot. No history: nothing
+                # to echo.
+                render_layered_gpu!(ctx.out_gpu, frame_ms > 20.0 ? Lq : Lh,
+                                    ctx, sky, cam_now, spacetime;
+                                    fisheye_deg=fisheye,
+                                    relativistic=relativistic)
+            else
+                render_layered_gpu!(ctx.out_gpu, L, ctx, sky, cam_now,
+                                    spacetime; fisheye_deg=fisheye,
+                                    relativistic=relativistic,
+                                    trace_layer=false)
+            end
             present!(presenter, ctx.out_gpu; exposure=exposure, filmic=filmic)
             frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
             nframes += 1
         elseif !refined && layer_on
-            if layer_full[] === nothing
-                layer_full[] = MtlArray{Float32,3}(undef, 4, width, height)
-            end
-            render_layered_gpu!(ctx.out_gpu, layer_full[], ctx, sky, cam_now,
+            # At rest: one full-grid exact pass — stills are native-sharp.
+            render_layered_gpu!(ctx.out_gpu, L, ctx, sky, cam_now,
                                 spacetime; fisheye_deg=fisheye,
-                                relativistic=relativistic, trace_layer=true)
+                                relativistic=relativistic)
             present!(presenter, ctx.out_gpu; exposure=exposure, filmic=filmic)
             refined = true
             nframes += 1

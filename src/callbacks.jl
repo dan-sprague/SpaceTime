@@ -4,7 +4,10 @@
 Returns a boundary condition closure that terminates integration when the photon
 crosses the event horizon (r ≈ 2M) or escapes beyond `r_max`.
 """
-make_boundary_condition(r_max) = (μ, t, integrator) -> (μ[2] - 2.00001) * (r_max - μ[2])
+make_boundary_condition(r_max) = function (μ, t, integrator)
+    r = sqrt(μ[2]^2 + μ[3]^2 + μ[4]^2)
+    (r - 2.00001) * (r_max - r)
+end
 
 """
     horizon_affect!(integrator)
@@ -17,10 +20,10 @@ end
 
 """
     disc_condition(μ,t,integrator)
-Defines a condition for when the photon intersects with the accretion disc. The function returns a value that changes sign when the photon crosses the plane of the disc (θ = π/2), allowing the ODE solver to trigger an event.
+Defines a condition for when the photon intersects with the accretion disc. The function returns a value that changes sign when the photon crosses the plane of the disc (z = 0), allowing the ODE solver to trigger an event.
 """
 function disc_condition(μ,t,integrator)
-    μ[3] - π/2
+    μ[4]
 end
 
 
@@ -31,7 +34,7 @@ Defines the effect to be applied when the photon intersects with the accretion d
 function disc_affect!(integrator)
     bh, meta, disc = integrator.p
 
-    r = integrator.u[2]
+    r = sqrt(integrator.u[2]^2 + integrator.u[3]^2 + integrator.u[4]^2)
     if disc.inner_radius < r < disc.outer_radius
         meta.hit_disc = true
         meta.r_hit = r
@@ -47,8 +50,9 @@ function disc_affect_doppler!(integrator)
     bh = integrator.p[1]
     disc = integrator.p[3]
     M = bh.M
-    r, θ, ϕ = integrator.u[2], integrator.u[3], integrator.u[4]
-    pr, pθ, pϕ = integrator.u[6], integrator.u[7], integrator.u[8]
+    x, y, z = integrator.u[2], integrator.u[3], integrator.u[4]
+    p_t, px, py, pz = integrator.u[5], integrator.u[6], integrator.u[7], integrator.u[8]
+    r = sqrt(x^2 + y^2 + z^2)
 
     # Track closest approach
     meta = integrator.p[2]
@@ -56,13 +60,12 @@ function disc_affect_doppler!(integrator)
         meta.r_min = r
     end
 
-    e_r = SVector(sin(θ)*cos(ϕ), sin(θ)*sin(ϕ), cos(θ))
-    e_θ = SVector(cos(θ)*cos(ϕ), cos(θ)*sin(ϕ), -sin(θ))
-    e_ϕ = SVector(-sin(ϕ), cos(ϕ), 0.0)
-
-    v_r = (r - 2M) / r * pr
-    p_cartesian = v_r * e_r + (pθ/r) * e_θ + (pϕ/(r*sin(θ))) * e_ϕ
-    pos_cartesian = SVector(r*sin(θ)*cos(ϕ), r*sin(θ)*sin(ϕ), r*cos(θ))
+    # Coordinate velocity dx/dλ, i.e. the spatial part of the KS geodesic RHS.
+    f = 2M / r
+    κ = (x * px + y * py + z * pz) / r
+    c1 = f * (-p_t + κ) / r
+    p_cartesian = SVector(px - c1 * x, py - c1 * y, pz - c1 * z)
+    pos_cartesian = SVector(x, y, z)
 
     if disc.inner_radius < r < disc.outer_radius
         local_color, T_obs = get_disc_color_doppler(r, pos_cartesian,

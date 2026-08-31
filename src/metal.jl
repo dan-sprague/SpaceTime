@@ -297,7 +297,7 @@ several short dispatches.
 function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                            spacetime_params, disc_params, fan, sky_params,
                            width, height, nmax, dt, jitter_u, jitter_v,
-                           weight, row0, rows,
+                           weight, row0, rows, substride, subx, suby,
                            ::Val{VOL}, ::Val{NB},
                            ::Val{LAYER}) where {VOL, NB, LAYER}
     idx = thread_position_in_grid().x
@@ -309,6 +309,19 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     i = (idx - 1) % width + 1
     if j > height
         return
+    end
+
+    # Sub-grid pass (LAYER temporal accumulation): this dispatch traces every
+    # `substride`-th pixel of a `substride`× larger persistent layer, offset
+    # by (subx, suby); the other pixels keep their reprojected history. The
+    # sensor plane is that of the full-size layer.
+    fw = width
+    fh = height
+    if LAYER && substride > 1
+        fw = width * substride
+        fh = height * substride
+        i = (i - 1) * substride + 1 + subx
+        j = (j - 1) * substride + 1 + suby
     end
 
     M = spacetime_params[1]
@@ -324,10 +337,11 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
     eu0 = cam_params[13]; eu1 = cam_params[14]; eu2 = cam_params[15]; eu3 = cam_params[16]
     ut0 = cam_params[17]; ut1 = cam_params[18]; ut2 = cam_params[19]; ut3 = cam_params[20]
 
-    # Sensor coordinate with subpixel jitter.
-    half_h = Float32(height) / 2.0f0
-    u = (Float32(i) - 1.0f0 + jitter_u - Float32(width) / 2.0f0) / half_h
-    v = (Float32(j) - 1.0f0 + jitter_v - Float32(height) / 2.0f0) / half_h
+    # Sensor coordinate with subpixel jitter (fw/fh: full sensor size, which
+    # differs from the dispatch size only in a LAYER sub-grid pass).
+    half_h = Float32(fh) / 2.0f0
+    u = (Float32(i) - 1.0f0 + jitter_u - Float32(fw) / 2.0f0) / half_h
+    v = (Float32(j) - 1.0f0 + jitter_v - Float32(fh) / 2.0f0) / half_h
 
     # Thin-lens aperture offset, per-pixel stratified: cam_params[26] is the
     # lens stratum width (0 = pinhole), [23:24] this pass's stratum origin in
@@ -438,7 +452,10 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
             esc = fan[1, k0 + 1] + frac_f * (fan[1, k0 + 2] - fan[1, k0 + 1])
             rmin = fan[4, k0 + 1] + frac_f * (fan[4, k0 + 2] - fan[4, k0 + 1])
             if esc > 0.999f0 && rmin > gate
-                out[4, i, j] += weight
+                out[1, i, j] = 0.0f0
+                out[2, i, j] = 0.0f0
+                out[3, i, j] = 0.0f0
+                out[4, i, j] = 1.0f0
                 return nothing
             end
         end
@@ -698,12 +715,14 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
 
     if LAYER
         # Disc/gas layer output: premultiplied emission + transmittance to
-        # the sky. Capture blackness is not written here — the sky pass owns
-        # the shadow (at native resolution, from the exact fan).
-        out[1, i, j] += weight * acc_r
-        out[2, i, j] += weight * acc_g
-        out[3, i, j] += weight * acc_b
-        out[4, i, j] += weight * alpha
+        # the sky, written by assignment — every launched thread owns its
+        # pixel outright (temporal accumulation keeps the rest). Capture
+        # blackness is not written here — the sky pass owns the shadow (at
+        # native resolution, from the exact fan).
+        out[1, i, j] = acc_r
+        out[2, i, j] = acc_g
+        out[3, i, j] = acc_b
+        out[4, i, j] = alpha
         return nothing
     end
 
@@ -882,7 +901,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         spacetime_params, width::Int, height::Int,
                         nmax::Int, dt::Float32, ju::Float32, jv::Float32,
                         weight::Float32, row0::Int, rows::Int; nb::Int=0,
-                        fan=nothing, sky_params=nothing, layer::Bool=false)
+                        fan=nothing, sky_params=nothing, layer::Bool=false,
+                        substride::Int=1, subx::Int=0, suby::Int=0)
     von = ctx.vol_on[]
     fan_b = fan === nothing ? _dummy_fan() : fan
     skyp_b = sky_params === nothing ? _dummy_skyp() : sky_params
@@ -893,7 +913,7 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
             out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
             cam_params, spacetime_params, ctx.disc_params, fan_b, skyp_b,
             width, height, nmax, dt, ju, jv, weight, row0, rows,
-            Val(von), Val(nb), Val(layer))
+            substride, subx, suby, Val(von), Val(nb), Val(layer))
     end
     kernel = kernels[key]
     n = width * rows
@@ -902,7 +922,7 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
     kernel(out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
            cam_params, spacetime_params, ctx.disc_params, fan_b, skyp_b,
            width, height, nmax, dt, ju, jv, weight, row0, rows,
-           Val(von), Val(nb), Val(layer);
+           substride, subx, suby, Val(von), Val(nb), Val(layer);
            threads=threads, groups=groups)
     return nothing
 end
@@ -1103,7 +1123,7 @@ translation, corrected by the next full trace.
 `wp` (22 floats): new fwd/right/up (9), prev fwd/right/up (9), fov,
 projection mode (>0.5 = fisheye), θ_edge (rad), pad.
 """
-function warp_kernel_mtl!(out, prev, wp, width, height)
+function warp_kernel_mtl!(out, prev, wp, width, height, ::Val{C}) where {C}
     idx = thread_position_in_grid().x
     idx > width * height && return
     j = (idx - 1) ÷ width + 1
@@ -1166,6 +1186,9 @@ function warp_kernel_mtl!(out, prev, wp, width, height)
     y = vo * half_h + Float32(height) / 2.0f0 + 0.5f0
     if !valid || x < 1.0f0 || x > Float32(width) || y < 1.0f0 || y > Float32(height)
         out[1, i, j] = 0.0f0; out[2, i, j] = 0.0f0; out[3, i, j] = 0.0f0
+        # 4-channel (gas layer): revealed pixels are transparent, not black —
+        # the sky pass owns whatever is behind them.
+        C == 4 && (out[4, i, j] = 1.0f0)
         return
     end
     x0 = clamp(unsafe_trunc(Int32, floor(x)), Int32(1), Int32(width - 1))
@@ -1174,12 +1197,10 @@ function warp_kernel_mtl!(out, prev, wp, width, height)
     x1 = x0 + Int32(1); y1 = y0 + Int32(1)
     w00 = (1.0f0 - tx) * (1.0f0 - ty); w10 = tx * (1.0f0 - ty)
     w01 = (1.0f0 - tx) * ty;           w11 = tx * ty
-    out[1, i, j] = prev[1, x0, y0] * w00 + prev[1, x1, y0] * w10 +
-                   prev[1, x0, y1] * w01 + prev[1, x1, y1] * w11
-    out[2, i, j] = prev[2, x0, y0] * w00 + prev[2, x1, y0] * w10 +
-                   prev[2, x0, y1] * w01 + prev[2, x1, y1] * w11
-    out[3, i, j] = prev[3, x0, y0] * w00 + prev[3, x1, y0] * w10 +
-                   prev[3, x0, y1] * w01 + prev[3, x1, y1] * w11
+    for c in 1:C
+        out[c, i, j] = prev[c, x0, y0] * w00 + prev[c, x1, y0] * w10 +
+                       prev[c, x0, y1] * w01 + prev[c, x1, y1] * w11
+    end
     return
 end
 
@@ -1637,7 +1658,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                              sky::SkyFanState, cam::Camera,
                              spacetime::Schwarzschild;
                              fisheye_deg::Real=0.0, relativistic::Bool=false,
-                             dt::Real=Float64(ctx.dt), trace_layer::Bool=true)
+                             dt::Real=Float64(ctx.dt), trace_layer::Bool=true,
+                             substride::Int=1, subx::Int=0, suby::Int=0)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -1652,10 +1674,15 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
 
     lw, lh = size(layer_out, 2), size(layer_out, 3)
     if trace_layer
-        fill!(layer_out, 0.0f0)
+        # LAYER passes write every dispatched pixel by assignment, so no
+        # clear is needed — and a sub-grid pass (substride > 1) must NOT
+        # clear: the undispatched pixels carry reprojected history. The
+        # dispatch covers layer_out / substride pixels of it.
+        sw, sh = cld(lw, substride), cld(lh, substride)
         _launch_trace!(ctx, layer_out, ctx.cam_params, ctx.spacetime_params,
-                       lw, lh, nmax, Float32(dt), 0.5f0, 0.5f0, 1.0f0, 0, lh;
-                       fan=sky.fan, sky_params=sky.sky_params, layer=true)
+                       sw, sh, nmax, Float32(dt), 0.5f0, 0.5f0, 1.0f0, 0, sh;
+                       fan=sky.fan, sky_params=sky.sky_params, layer=true,
+                       substride=substride, subx=subx, suby=suby)
     end
     # With trace_layer=false the caller keeps `layer_out` pre-filled with
     # α = 1 (fully transparent): the frame is the fan-driven sky alone.
@@ -1676,25 +1703,31 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
     return nothing
 end
 
-"""GPU-only reprojection: warp `prev` into `warp_out` without downloading."""
+"""
+GPU-only reprojection: warp `prev` into `warp_out` without downloading.
+`channels=4` warps a premultiplied gas layer (revealed pixels transparent);
+`width`/`height` override the warp dimensions (default: the context's).
+"""
 function _warp_gpu!(ctx::MetalPreviewContext, warp_out, prev, warp_params,
-                    cam::Camera, prev_cam::Camera; fisheye_deg::Real=0.0)
+                    cam::Camera, prev_cam::Camera; fisheye_deg::Real=0.0,
+                    channels::Int=3, width::Int=ctx.width,
+                    height::Int=ctx.height)
     copyto!(warp_params,
             Float32[cam.fwd..., cam.right..., cam.up_local...,
                     prev_cam.fwd..., prev_cam.right..., prev_cam.up_local...,
                     cam.fov_factor,
                     fisheye_deg > 0 ? 1.0 : 0.0,
                     deg2rad(max(fisheye_deg, 0.0)), 0.0])
-    if _WARP_KERNEL[] === nothing
-        _WARP_KERNEL[] = @metal launch=false warp_kernel_mtl!(warp_out, prev,
-                                                              warp_params,
-                                                              ctx.width,
-                                                              ctx.height)
+    kernels = _WARP_KERNEL[] === nothing ?
+        (_WARP_KERNEL[] = Dict{Int,Any}()) : _WARP_KERNEL[]::Dict{Int,Any}
+    if !haskey(kernels, channels)
+        kernels[channels] = @metal launch=false warp_kernel_mtl!(
+            warp_out, prev, warp_params, width, height, Val(channels))
     end
-    kern = _WARP_KERNEL[]
-    n = ctx.width * ctx.height
+    kern = kernels[channels]
+    n = width * height
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
-    kern(warp_out, prev, warp_params, ctx.width, ctx.height;
+    kern(warp_out, prev, warp_params, width, height, Val(channels);
          threads=threads, groups=cld(n, threads))
     return nothing
 end
