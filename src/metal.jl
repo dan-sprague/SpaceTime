@@ -1369,7 +1369,7 @@ fall back to the nearest entry — a sub-pixel zone at the photon ring.
 """
 function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
                                spacetime_params, sky_params,
-                               width, height, lw, lh)
+                               width, height, lw, lh, ju, jv, accumulate)
     idx = thread_position_in_grid().x
     idx > width * height && return
     j = (idx - 1) ÷ width + 1
@@ -1384,8 +1384,8 @@ function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
     ut0 = cam_params[17]; ut1 = cam_params[18]; ut2 = cam_params[19]; ut3 = cam_params[20]
 
     half_h = Float32(height) / 2.0f0
-    u = (Float32(i) - 0.5f0 - Float32(width) / 2.0f0) / half_h
-    v = (Float32(j) - 0.5f0 - Float32(height) / 2.0f0) / half_h
+    u = (Float32(i) - 1.0f0 + ju - Float32(width) / 2.0f0) / half_h
+    v = (Float32(j) - 1.0f0 + jv - Float32(height) / 2.0f0) / half_h
 
     cr = 0.0f0
     cu = 0.0f0
@@ -1491,9 +1491,17 @@ function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
     la = layer[4, x0, y0] * w00 + layer[4, x1, y0] * w10 +
          layer[4, x0, y1] * w01 + layer[4, x1, y1] * w11
 
-    out[1, i, j] = lr + la * sky_r
-    out[2, i, j] = lg + la * sky_g
-    out[3, i, j] = lb + la * sky_b
+    if accumulate > 0.5f0
+        # Progressive refinement: sum jittered passes (the presenter divides
+        # by the pass count via its exposure factor).
+        out[1, i, j] += lr + la * sky_r
+        out[2, i, j] += lg + la * sky_g
+        out[3, i, j] += lb + la * sky_b
+    else
+        out[1, i, j] = lr + la * sky_r
+        out[2, i, j] = lg + la * sky_g
+        out[3, i, j] = lb + la * sky_b
+    end
     return nothing
 end
 
@@ -1659,7 +1667,9 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                              spacetime::Schwarzschild;
                              fisheye_deg::Real=0.0, relativistic::Bool=false,
                              dt::Real=Float64(ctx.dt), trace_layer::Bool=true,
-                             substride::Int=1, subx::Int=0, suby::Int=0)
+                             substride::Int=1, subx::Int=0, suby::Int=0,
+                             ju::Real=0.5, jv::Real=0.5,
+                             accumulate::Bool=false)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -1680,7 +1690,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
         # dispatch covers layer_out / substride pixels of it.
         sw, sh = cld(lw, substride), cld(lh, substride)
         _launch_trace!(ctx, layer_out, ctx.cam_params, ctx.spacetime_params,
-                       sw, sh, nmax, Float32(dt), 0.5f0, 0.5f0, 1.0f0, 0, sh;
+                       sw, sh, nmax, Float32(dt), Float32(ju), Float32(jv),
+                       1.0f0, 0, sh;
                        fan=sky.fan, sky_params=sky.sky_params, layer=true,
                        substride=substride, subx=subx, suby=suby)
     end
@@ -1688,17 +1699,19 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
     # α = 1 (fully transparent): the frame is the fan-driven sky alone.
 
     width, height = size(comp_out, 2), size(comp_out, 3)
+    acc = accumulate ? 1.0f0 : 0.0f0
     if _COMPOSITE_KERNEL[] === nothing
         _COMPOSITE_KERNEL[] = @metal launch=false sky_composite_kernel!(
             comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out,
             ctx.cam_params, ctx.spacetime_params, sky.sky_params,
-            width, height, lw, lh)
+            width, height, lw, lh, Float32(ju), Float32(jv), acc)
     end
     kern = _COMPOSITE_KERNEL[]
     n = width * height
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
     kern(comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out, ctx.cam_params,
-         ctx.spacetime_params, sky.sky_params, width, height, lw, lh;
+         ctx.spacetime_params, sky.sky_params, width, height, lw, lh,
+         Float32(ju), Float32(jv), acc;
          threads=threads, groups=cld(n, threads))
     return nothing
 end

@@ -261,7 +261,9 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     γ = 1.0
     a_mag = 0.0
     last_sig = nothing
-    refined = false
+    REFINE_PASSES = 32
+    passes = 0
+    accum = MtlArray{Float32,3}(undef, 3, width, height)
 
     while !GLFW.WindowShouldClose(win) && time() - t_start < max_seconds
         GLFW.PollEvents()
@@ -382,7 +384,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                 end
             end
             last_sig = sig
-            refined = false
+            passes = 0
             t0 = time()
             update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
             if layer_on
@@ -402,16 +404,31 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             present!(presenter, ctx.out_gpu; exposure=exposure, filmic=filmic)
             frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
             nframes += 1
-        elseif !refined && layer_on
-            # At rest: one full-grid exact pass — stills are native-sharp.
-            render_layered_gpu!(ctx.out_gpu, L, ctx, sky, cam_now,
-                                spacetime; fisheye_deg=fisheye,
-                                relativistic=relativistic)
-            present!(presenter, ctx.out_gpu; exposure=exposure, filmic=filmic)
-            refined = true
+        elseif passes < REFINE_PASSES
+            # At rest: progressive refinement. Full-resolution passes with
+            # sub-pixel jitter (R2 low-discrepancy sequence) keep summing
+            # into `accum` — every pass is real rays, so the still image
+            # converges to a supersampled photograph. The presenter's
+            # exposure factor divides by the pass count; any input aborts.
+            if passes == 0
+                render_layered_gpu!(accum, L, ctx, sky, cam_now, spacetime;
+                                    fisheye_deg=fisheye,
+                                    relativistic=relativistic,
+                                    trace_layer=layer_on)
+            else
+                ju = mod(0.5 + 0.7548776662466927 * passes, 1.0)
+                jv = mod(0.5 + 0.5698402909980532 * passes, 1.0)
+                render_layered_gpu!(accum, L, ctx, sky, cam_now, spacetime;
+                                    fisheye_deg=fisheye,
+                                    relativistic=relativistic,
+                                    trace_layer=layer_on,
+                                    ju=ju, jv=jv, accumulate=true)
+            end
+            passes += 1
+            present!(presenter, accum; exposure=exposure / Float32(passes),
+                     filmic=filmic)
             nframes += 1
         else
-            refined = true    # sky-only scenes need no refine pass
             sleep(0.006)
         end
 
@@ -428,9 +445,9 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                          thrust, twarp, ship.τ * 0.49255, ship.t * 0.49255) :
                 @sprintf("free cam · spd %.1f", speed)
             GLFW.SetWindowTitle(win, @sprintf(
-                "%s — r %.2fM %s · %s · %.1f ms (%.0f fps)",
+                "%s — r %.2fM %s · %s · %.1f ms (%.0f fps) · spp %d/%d",
                 title, r, regime, info, frame_ms,
-                1000.0 / max(frame_ms, 1.0e-3)))
+                1000.0 / max(frame_ms, 1.0e-3), passes, REFINE_PASSES))
         end
     end
     elapsed = time() - t_start
