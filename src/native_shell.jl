@@ -33,14 +33,19 @@ end
 # Display grade
 # ---------------------------------------------------------------------------
 #
-# The presenter carries a 12-float grade block applied on the GPU during
-# packing, plus a quarter-resolution bloom chain (bright-pass, separable
-# Gaussian) mixed in before the filmic curve:
-#   [1] exposure  [2] filmic on   [3] crush (post-curve contrast power)
-#   [4] saturation [5] vignette   [6:8] white-balance gains (r, g, b)
-#   [9] bloom strength [10] bloom threshold (linear)  [11:12] spare
+# The presenter carries a 16-float grade block applied on the GPU during
+# packing, plus a bloom/streak chain faithful to `postprocess()` (the video
+# pipeline): per-channel bright pass, quarter-res Gaussian bloom with a
+# sixteenth-res wide stage (the Moffat kernel's long tails), a 4-spike
+# exponential streak pass, hue-preserving ACES, free gamma power, grain:
+#   [1] exposure (linear ev) [2] filmic on [3] crush   [4] saturation
+#   [5] vignette  [6:8] white-balance gains (r, g, b)
+#   [9] bloom strength [10] bloom threshold [11] tonemap hue-preserve k
+#   [12] gamma power (0.4545 = sRGB; 5 = the gamma-0.2 crush)
+#   [13] grain amount  [14] streak fraction of scattered light  [15:16] spare
 
-# Bright-pass 4×4 box downsample into the quarter-res bloom source.
+# Per-channel bright-pass 4×4 box downsample into the quarter-res source
+# (matches postprocess(): bright = max(c·ev − threshold, 0)).
 function _bloom_down_kernel!(dst, src, W, H, BW, BH, e, thresh)
     i = thread_position_in_grid().x
     i > BW * BH && return
@@ -54,16 +59,80 @@ function _bloom_down_kernel!(dst, src, W, H, BW, BH, e, thresh)
         g += src[2, sx, sy]
         b += src[3, sx, sy]
     end
-    r *= 0.0625f0 * e; g *= 0.0625f0 * e; b *= 0.0625f0 * e
+    r = r * 0.0625f0 * e
+    g = g * 0.0625f0 * e
+    b = b * 0.0625f0 * e
     r = r == r ? r : 0.0f0
     g = g == g ? g : 0.0f0
     b = b == b ? b : 0.0f0
-    l = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
-    w = l > thresh ? (l - thresh) / l : 0.0f0
-    dst[1, bx + 1, by + 1] = r * w
-    dst[2, bx + 1, by + 1] = g * w
-    dst[3, bx + 1, by + 1] = b * w
+    dst[1, bx + 1, by + 1] = max(r - thresh, 0.0f0)
+    dst[2, bx + 1, by + 1] = max(g - thresh, 0.0f0)
+    dst[3, bx + 1, by + 1] = max(b - thresh, 0.0f0)
     return nothing
+end
+
+# 2×2 box downsample (quarter → sixteenth) for the wide bloom stage.
+function _bloom_half_kernel!(dst, src, SW, SH, DW, DH)
+    i = thread_position_in_grid().x
+    i > DW * DH && return
+    x = (i - 1) % DW
+    y = (i - 1) ÷ DW
+    for c in 1:3
+        v = 0.0f0
+        for oy in 1:2, ox in 1:2
+            v += src[c, min(2 * x + ox, SW), min(2 * y + oy, SH)]
+        end
+        dst[c, x + 1, y + 1] = 0.25f0 * v
+    end
+    return nothing
+end
+
+# 4-spike star streaks: exponential-decay line blur along four directions
+# (0°, 45°, 90°, 135°), the GPU analogue of generate_streak_kernel.
+# `L` is the decay length in source pixels.
+function _streak_kernel!(dst, src, BW, BH, L)
+    i = thread_position_in_grid().x
+    i > BW * BH && return
+    x = (i - 1) % BW + 1
+    y = (i - 1) ÷ BW + 1
+    r = 0.0f0; g = 0.0f0; b = 0.0f0
+    wsum = 0.0f0
+    invL = 1.0f0 / L
+    d = 0
+    while d < 4
+        dx = d == 0 ? 1.0f0 : d == 1 ? 0.7071f0 : d == 2 ? 0.0f0 : -0.7071f0
+        dy = d == 0 ? 0.0f0 : d == 1 ? 0.7071f0 : d == 2 ? 1.0f0 : 0.7071f0
+        for t in 1:24
+            s = Float32(t) * 2.5f0
+            w = exp(-s * invL)
+            for sgn in (-1.0f0, 1.0f0)
+                sx = clamp(unsafe_trunc(Int32, Float32(x) + sgn * s * dx),
+                           Int32(1), Int32(BW))
+                sy = clamp(unsafe_trunc(Int32, Float32(y) + sgn * s * dy),
+                           Int32(1), Int32(BH))
+                r += w * src[1, sx, sy]
+                g += w * src[2, sx, sy]
+                b += w * src[3, sx, sy]
+                wsum += w
+            end
+        end
+        d += 1
+    end
+    w0 = 1.0f0
+    r += w0 * src[1, x, y]; g += w0 * src[2, x, y]; b += w0 * src[3, x, y]
+    wsum += w0
+    dst[1, x, y] = r / wsum
+    dst[2, x, y] = g / wsum
+    dst[3, x, y] = b / wsum
+    return nothing
+end
+
+# Small integer hash → [0, 1) for sensor-grain noise.
+@inline function _grain_hash(x::Int32, y::Int32)
+    h = x * Int32(374761393) + y * Int32(668265263)
+    h = (h ⊻ (h >> 13)) * Int32(1274126177)
+    h = h ⊻ (h >> 16)
+    return Float32(h & Int32(0x00FFFFFF)) * 5.9604645f-8
 end
 
 # 9-tap separable Gaussian blur along (dx, dy) at bloom resolution.
@@ -96,7 +165,22 @@ end
 # rotr90 for the same reason). NaN guards: clamp propagates NaN, and a
 # checked convert would trap the GPU. `escale` is an extra linear factor
 # (the progressive-refinement pass average).
-function _pack_bgra_kernel!(dst, src, bloom, W, H, BW, BH, grade, escale)
+@inline function _grade_bilinear(buf, c, fx, fy, BW, BH)
+    x0 = clamp(unsafe_trunc(Int32, floor(fx)), Int32(1), Int32(BW - 1))
+    y0 = clamp(unsafe_trunc(Int32, floor(fy)), Int32(1), Int32(BH - 1))
+    tx = clamp(fx - Float32(x0), 0.0f0, 1.0f0)
+    ty = clamp(fy - Float32(y0), 0.0f0, 1.0f0)
+    return buf[c, x0, y0] * (1 - tx) * (1 - ty) +
+           buf[c, x0 + 1, y0] * tx * (1 - ty) +
+           buf[c, x0, y0 + 1] * (1 - tx) * ty +
+           buf[c, x0 + 1, y0 + 1] * tx * ty
+end
+
+@inline _aces(x) = clamp((x * (2.51f0 * x + 0.03f0)) /
+                         (x * (2.43f0 * x + 0.59f0) + 0.14f0), 0.0f0, 1.0f0)
+
+function _pack_bgra_kernel!(dst, src, bloomg, bloomw, blooms,
+                            W, H, BW, BH, WW, WH, grade, escale)
     i = thread_position_in_grid().x
     i > W * H && return
     x = (i - 1) % W + 1
@@ -109,21 +193,30 @@ function _pack_bgra_kernel!(dst, src, bloom, W, H, BW, BH, grade, escale)
     g = g == g ? g : 0.0f0
     b = b == b ? b : 0.0f0
     if grade[9] > 0.0f0
+        # Scattered light: Gaussian core + wide stage (Moffat-like tails),
+        # plus the streak pass, split by the streak fraction.
+        sfrac = grade[14]
+        bfrac = 1.0f0 - sfrac
         fx = (Float32(x) - 0.5f0) * Float32(BW) / Float32(W) + 0.5f0
         fy = (Float32(j) - 0.5f0) * Float32(BH) / Float32(H) + 0.5f0
-        x0 = clamp(unsafe_trunc(Int32, floor(fx)), Int32(1), Int32(BW - 1))
-        y0 = clamp(unsafe_trunc(Int32, floor(fy)), Int32(1), Int32(BH - 1))
-        tx = clamp(fx - Float32(x0), 0.0f0, 1.0f0)
-        ty = clamp(fy - Float32(y0), 0.0f0, 1.0f0)
-        w00 = (1.0f0 - tx) * (1.0f0 - ty); w10 = tx * (1.0f0 - ty)
-        w01 = (1.0f0 - tx) * ty;           w11 = tx * ty
+        wx = (Float32(x) - 0.5f0) * Float32(WW) / Float32(W) + 0.5f0
+        wy = (Float32(j) - 0.5f0) * Float32(WH) / Float32(H) + 0.5f0
         s = grade[9]
-        r += s * (bloom[1, x0, y0] * w00 + bloom[1, x0 + 1, y0] * w10 +
-                  bloom[1, x0, y0 + 1] * w01 + bloom[1, x0 + 1, y0 + 1] * w11)
-        g += s * (bloom[2, x0, y0] * w00 + bloom[2, x0 + 1, y0] * w10 +
-                  bloom[2, x0, y0 + 1] * w01 + bloom[2, x0 + 1, y0 + 1] * w11)
-        b += s * (bloom[3, x0, y0] * w00 + bloom[3, x0 + 1, y0] * w10 +
-                  bloom[3, x0, y0 + 1] * w01 + bloom[3, x0 + 1, y0 + 1] * w11)
+        for c in 1:3
+            core = _grade_bilinear(bloomg, c, fx, fy, BW, BH)
+            wide = _grade_bilinear(bloomw, c, wx, wy, WW, WH)
+            bl = bfrac * (0.6f0 * core + 0.4f0 * wide)
+            if sfrac > 0.0f0
+                bl += sfrac * _grade_bilinear(blooms, c, fx, fy, BW, BH)
+            end
+            if c == 1
+                r += s * bl
+            elseif c == 2
+                g += s * bl
+            else
+                b += s * bl
+            end
+        end
     end
     l = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
     sat = grade[4]
@@ -131,17 +224,37 @@ function _pack_bgra_kernel!(dst, src, bloom, W, H, BW, BH, grade, escale)
     g = max(l + sat * (g - l), 0.0f0)
     b = max(l + sat * (b - l), 0.0f0)
     if grade[2] > 0.5f0
-        r = (r * (2.51f0 * r + 0.03f0)) / (r * (2.43f0 * r + 0.59f0) + 0.14f0)
-        g = (g * (2.51f0 * g + 0.03f0)) / (g * (2.43f0 * g + 0.59f0) + 0.14f0)
-        b = (b * (2.51f0 * b + 0.03f0)) / (b * (2.43f0 * b + 0.59f0) + 0.14f0)
-        r = exp(log(max(r, 1.0f-6)) * 0.454545f0)
-        g = exp(log(max(g, 1.0f-6)) * 0.454545f0)
-        b = exp(log(max(b, 1.0f-6)) * 0.454545f0)
+        # ACES per channel, blended with the hue-preserving variant
+        # (tonemap the luminance, rescale the triple) by grade[11] —
+        # postprocess()'s tonemap_hue_preserve.
+        k = grade[11]
+        pr = _aces(r); pg = _aces(g); pb = _aces(b)
+        if k > 0.0f0
+            Y = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
+            sY = _aces(Y) / max(Y, 1.0f-8)
+            r = (1.0f0 - k) * pr + k * clamp(r * sY, 0.0f0, 1.0f0)
+            g = (1.0f0 - k) * pg + k * clamp(g * sY, 0.0f0, 1.0f0)
+            b = (1.0f0 - k) * pb + k * clamp(b * sY, 0.0f0, 1.0f0)
+        else
+            r = pr; g = pg; b = pb
+        end
+        gp = grade[12]
+        r = exp(log(max(r, 1.0f-6)) * gp)
+        g = exp(log(max(g, 1.0f-6)) * gp)
+        b = exp(log(max(b, 1.0f-6)) * gp)
     end
     if grade[3] != 1.0f0
         r = exp(log(max(r, 1.0f-6)) * grade[3])
         g = exp(log(max(g, 1.0f-6)) * grade[3])
         b = exp(log(max(b, 1.0f-6)) * grade[3])
+    end
+    if grade[13] > 0.0f0
+        # Sensor grain in display space (the video applies sensor_expose!
+        # after the grade): luma-scaled, zero-mean.
+        l2 = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
+        n = grade[13] * (_grain_hash(Int32(x), Int32(j)) - 0.5f0) *
+            2.0f0 * sqrt(max(l2, 2.0f-3))
+        r += n; g += n; b += n
     end
     if grade[5] > 0.0f0
         vu = (Float32(x) - 0.5f0 * Float32(W)) / (0.5f0 * Float32(H))
@@ -170,10 +283,13 @@ mutable struct MetalPresenter{Q}
     pack_gpu::MtlArray{UInt32,1}
     pack_kernel::Base.RefValue{Any}   # compiled-once kernels, like _WARP_KERNEL
     bloom_kernels::Base.RefValue{Any}
-    grade::MtlVector{Float32}         # 12-float display-grade block
+    grade::MtlVector{Float32}         # 16-float display-grade block
     grade_host::Vector{Float32}
     bloom_a::MtlArray{Float32,3}      # quarter-res bloom ping-pong
     bloom_b::MtlArray{Float32,3}
+    bloom_s::MtlArray{Float32,3}      # quarter-res streaks
+    bloom_w1::MtlArray{Float32,3}     # sixteenth-res wide stage
+    bloom_w2::MtlArray{Float32,3}
     width::Int
     height::Int
 end
@@ -193,15 +309,19 @@ function MetalPresenter(win::GLFW.Window, width::Int, height::Int)
     @objc [view::id{Object} setWantsLayer:true::Bool]::Nothing
     @objc [view::id{Object} setLayer:layer::id{Object}]::Nothing
     queue = Metal.global_queue(dev)
-    grade_host = Float32[1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0]
+    grade_host = Float32[1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0.4545, 0, 0, 0, 0]
     grade = MtlArray(grade_host)
     bw, bh = cld(width, 4), cld(height, 4)
+    ww, wh = cld(bw, 2), cld(bh, 2)
     MetalPresenter{typeof(queue)}(layer, queue,
                                   MtlArray{UInt32}(undef, width * height),
                                   Ref{Any}(nothing), Ref{Any}(nothing),
                                   grade, grade_host,
                                   MtlArray{Float32,3}(undef, 3, bw, bh),
                                   MtlArray{Float32,3}(undef, 3, bw, bh),
+                                  MtlArray{Float32,3}(undef, 3, bw, bh),
+                                  MtlArray{Float32,3}(undef, 3, ww, wh),
+                                  MtlArray{Float32,3}(undef, 3, ww, wh),
                                   width, height)
 end
 
@@ -220,10 +340,15 @@ function set_grade!(p::MetalPresenter; exposure::Real=p.grade_host[1],
                     wb::NTuple{3,<:Real}=(p.grade_host[6], p.grade_host[7],
                                           p.grade_host[8]),
                     bloom::Real=p.grade_host[9],
-                    bloom_threshold::Real=p.grade_host[10])
+                    bloom_threshold::Real=p.grade_host[10],
+                    hue_preserve::Real=p.grade_host[11],
+                    gamma_power::Real=p.grade_host[12],
+                    grain::Real=p.grade_host[13],
+                    streak_fraction::Real=p.grade_host[14])
     p.grade_host .= Float32[exposure, filmic ? 1 : 0, crush, saturation,
                             vignette, wb[1], wb[2], wb[3], bloom,
-                            bloom_threshold, 0, 0]
+                            bloom_threshold, hue_preserve, gamma_power,
+                            grain, streak_fraction, 0, 0]
     copyto!(p.grade, p.grade_host)
     return nothing
 end
@@ -242,30 +367,55 @@ function present!(p::MetalPresenter, src::MtlArray{Float32,3};
     W, H = p.width, p.height
     BW, BH = size(p.bloom_a, 2), size(p.bloom_a, 3)
     n = W * H
+    WW, WH = size(p.bloom_w1, 2), size(p.bloom_w1, 3)
     if p.grade_host[9] > 0.0f0
         if p.bloom_kernels[] === nothing
             p.bloom_kernels[] = (
                 @metal(launch=false, _bloom_down_kernel!(
                     p.bloom_a, src, W, H, BW, BH, 1.0f0, 1.0f0)),
                 @metal(launch=false, _bloom_blur_kernel!(
-                    p.bloom_b, p.bloom_a, BW, BH, 1, 0)))
+                    p.bloom_b, p.bloom_a, BW, BH, 1, 0)),
+                @metal(launch=false, _streak_kernel!(
+                    p.bloom_s, p.bloom_a, BW, BH, 1.0f0)),
+                @metal(launch=false, _bloom_half_kernel!(
+                    p.bloom_w1, p.bloom_a, BW, BH, WW, WH)),
+                @metal(launch=false, _bloom_blur_kernel!(
+                    p.bloom_w2, p.bloom_w1, WW, WH, 1, 0)))
         end
-        kd, kb = p.bloom_kernels[]
+        kd, kb, ks, kh, kw = p.bloom_kernels[]
         nb = BW * BH
+        nw = WW * WH
         td = min(kd.pipeline.maxTotalThreadsPerThreadgroup, nb)
         kd(p.bloom_a, src, W, H, BW, BH, p.grade_host[1] * escale,
            p.grade_host[10]; threads=td, groups=cld(nb, td))
+        if p.grade_host[14] > 0.0f0
+            # Streaks read the un-blurred bright pass; decay length scales
+            # with the source width (≈ 0.1·W, the porthole recipe).
+            ts = min(ks.pipeline.maxTotalThreadsPerThreadgroup, nb)
+            ks(p.bloom_s, p.bloom_a, BW, BH, Float32(0.1f0 * BW);
+               threads=ts, groups=cld(nb, ts))
+        end
         tb = min(kb.pipeline.maxTotalThreadsPerThreadgroup, nb)
         kb(p.bloom_b, p.bloom_a, BW, BH, 1, 0; threads=tb, groups=cld(nb, tb))
         kb(p.bloom_a, p.bloom_b, BW, BH, 0, 1; threads=tb, groups=cld(nb, tb))
+        th = min(kh.pipeline.maxTotalThreadsPerThreadgroup, nw)
+        kh(p.bloom_w1, p.bloom_a, BW, BH, WW, WH; threads=th,
+           groups=cld(nw, th))
+        tw = min(kw.pipeline.maxTotalThreadsPerThreadgroup, nw)
+        kw(p.bloom_w2, p.bloom_w1, WW, WH, 1, 0; threads=tw,
+           groups=cld(nw, tw))
+        kw(p.bloom_w1, p.bloom_w2, WW, WH, 0, 1; threads=tw,
+           groups=cld(nw, tw))
     end
     if p.pack_kernel[] === nothing
         p.pack_kernel[] = @metal launch=false _pack_bgra_kernel!(
-            p.pack_gpu, src, p.bloom_a, W, H, BW, BH, p.grade, escale)
+            p.pack_gpu, src, p.bloom_a, p.bloom_w1, p.bloom_s,
+            W, H, BW, BH, WW, WH, p.grade, escale)
     end
     kern = p.pack_kernel[]
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
-    kern(p.pack_gpu, src, p.bloom_a, W, H, BW, BH, p.grade, escale;
+    kern(p.pack_gpu, src, p.bloom_a, p.bloom_w1, p.bloom_s,
+         W, H, BW, BH, WW, WH, p.grade, escale;
          threads=threads, groups=cld(n, threads))
     Metal.flush!()
     drawable = @objc [p.layer::id{Object} nextDrawable]::id{Object}
@@ -309,9 +459,10 @@ retro-burn (Space), time warp (`-`/`=`) — the viewport still renders from
 the local reference observer.
 
 Other keys: drag to look; Z/C roll; V volumetric gas; R relativistic
-shading; L lens (rectilinear/fisheye); **1/2/3 grade presets**
-(neutral / film / hectic — white balance, saturation, contrast crush,
-vignette, GPU bloom); T/G exposure; P filmic curve on/off; X reset
+shading; L lens (rectilinear/fisheye); **1/2/3/4 grade presets**
+(neutral / film / hectic / **porthole** — the escape-video recipe:
+hue-preserving ACES, gamma-0.2 crush, 4-spike streaks, grain); T/G
+exposure; P filmic curve on/off; X reset
 position; Esc quit. When the camera rests, refinement passes accumulate a
 supersampled still, then the GPU parks until something changes.
 Telemetry lives in the window title. Runs on the calling (main) thread
@@ -348,18 +499,37 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     filmic = true           # ACES-style display curve (P toggles)
     grade_rev = 0           # bumped on any grade change (re-presents stills)
     function apply_grade!(n)
+        # Bloom thresholds sit above star brightness (~1 linear): the bloom
+        # chain is quarter-res, and thresholds that let ordinary stars in
+        # smear the whole background into soft blobs. Only HDR sources —
+        # the disc, the ring — should scatter.
         if n == 1        # neutral: filmic curve only
             set_grade!(presenter; exposure=exposure, filmic=filmic,
                        crush=1.0, saturation=1.0, vignette=0.0,
-                       wb=(1.0, 1.0, 1.0), bloom=0.0)
+                       wb=(1.0, 1.0, 1.0), bloom=0.0, hue_preserve=0.0,
+                       gamma_power=0.4545, grain=0.0, streak_fraction=0.0)
         elseif n == 2    # film: gentle warmth, bloom, vignette
             set_grade!(presenter; exposure=exposure, filmic=filmic,
                        crush=1.15, saturation=1.12, vignette=0.30,
-                       wb=(1.02, 1.0, 0.97), bloom=0.8, bloom_threshold=0.75)
-        else             # hectic: crushed, saturated, dripping bloom
+                       wb=(1.02, 1.0, 0.97), bloom=0.8, bloom_threshold=1.5,
+                       hue_preserve=0.3, gamma_power=0.4545, grain=0.0,
+                       streak_fraction=0.0)
+        elseif n == 3    # hectic: crushed, saturated, dripping bloom
             set_grade!(presenter; exposure=exposure, filmic=filmic,
                        crush=1.5, saturation=1.25, vignette=0.45,
-                       wb=(1.05, 1.0, 0.94), bloom=1.6, bloom_threshold=0.55)
+                       wb=(1.05, 1.0, 0.94), bloom=1.6, bloom_threshold=1.2,
+                       hue_preserve=0.3, gamma_power=0.4545, grain=0.0,
+                       streak_fraction=0.0)
+        else             # porthole: the escape-video recipe (postprocess():
+                         # ev 2^0.8, hue-preserve 0.75, gamma 0.2 ⇒ x^5,
+                         # streaks carry 2/3 of scattered light, ISO grain,
+                         # vignette 0.3). Threshold raised from the video's
+                         # 0.5 — quarter-res bloom must not catch stars.
+            set_grade!(presenter; exposure=1.741 * exposure, filmic=true,
+                       crush=1.0, saturation=1.0, vignette=0.30,
+                       wb=(1.0, 1.0, 1.0), bloom=1.0, bloom_threshold=1.0,
+                       hue_preserve=0.75, gamma_power=5.0, grain=0.02,
+                       streak_fraction=0.667)
         end
         grade_rev += 1
         return nothing
@@ -484,6 +654,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         pressed_once(GLFW.KEY_1) && apply_grade!(1)
         pressed_once(GLFW.KEY_2) && apply_grade!(2)
         pressed_once(GLFW.KEY_3) && apply_grade!(3)
+        pressed_once(GLFW.KEY_4) && apply_grade!(4)
         if pressed_once(GLFW.KEY_F)
             flight = !flight
             flight && (ship = ShipState(state.pos, M))

@@ -1022,6 +1022,13 @@ The frame is split into row tiles so each GPU dispatch stays short; `progress`
 (if given) receives the completed fraction after every dispatch. Reuses the
 context's background/LUT/parameter buffers, so call it with the same `ctx` as
 the live preview. Thin-lens cameras fall back to pinhole optics (no DoF).
+
+Motion blur: pass `camera_at`, a function of the shutter fraction `s ∈ [0, 1)`
+returning `(cam::Camera, beta::SVector{3,Float64})`. Each of the `samples²`
+supersampling passes then renders from its own stratified shutter time — the
+passes double as the temporal samples, exactly as they double as the aperture
+samples for DoF, so the blur costs nothing extra. The positional `cam`/`beta`
+still set the escape radius and are the nominal (shutter-centre) pose.
 """
 function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           spacetime::Schwarzschild;
@@ -1032,7 +1039,8 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           fisheye_deg::Real=0.0,
                           aperture_world::Real=0.0, focus_dist::Real=1.0,
                           relativistic::Bool=false,
-                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
+                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
+                          camera_at::Union{Function,Nothing}=nothing)
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
@@ -1072,7 +1080,17 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     # strata pair randomly with the pixel-jitter strata) and every pixel
     # hashes its own point inside it — see the kernel's stratified-lens block.
     lens_perm = Random.randperm(rng, samples^2)
+    # Motion blur: each pass likewise owns one stratified shutter time,
+    # permuted independently so time strata pair randomly with the others.
+    time_perm = Random.randperm(rng, samples^2)
     for (pass, (du, dv)) in enumerate(offsets)
+        if camera_at !== nothing
+            s = (time_perm[pass] - 1 + rand(rng)) / samples^2
+            cam_s, beta_s = camera_at(s)
+            base_params = _ks_cam_params(cam_s, spacetime.M;
+                                         fisheye_deg=fisheye_deg,
+                                         focus_dist=focus_dist, beta=beta_s)
+        end
         if use_dof
             m = lens_perm[pass] - 1
             base_params[23] = Float32((m ÷ samples) / samples)
@@ -1080,8 +1098,8 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
             base_params[26] = Float32(1.0 / samples)
             base_params[27] = Float32(aperture_world / 2.0)
             base_params[28] = Float32(pass)
-            copyto!(cam_params, base_params)
         end
+        (use_dof || camera_at !== nothing) && copyto!(cam_params, base_params)
         for t in 0:(ntiles - 1)
             row0 = t * rows_per_tile
             rows = min(rows_per_tile, height - row0)
