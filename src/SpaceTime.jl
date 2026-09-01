@@ -9,12 +9,13 @@ coordinates — on the CPU adaptively with DifferentialEquations.jl, and on
 Apple-silicon GPUs with a Metal kernel — through a volumetric accretion disc
 shaded by Doppler-shifted blackbody emission. A physical camera pipeline
 (pinhole / thin-lens / fisheye projections, sensor noise, bloom, tonemapping,
-film-look post) turns the physics into photographs, and GLMakie apps
-([`viewfinder`](@ref), [`flythrough`](@ref)) make it interactive, including
-flight inside the photon sphere and across the horizon. Cameras may be given a
-velocity: the tetrad is Lorentz-boosted, so relativistic aberration, Doppler
-shift, and beaming appear in the image exactly as an on-board observer would
-see them.
+film-look post) turns the physics into photographs. Two apps make it
+interactive: [`viewfinder`](@ref), a GLMakie studio for composing a shot, and
+[`fly_native`](@ref), a Makie-free Metal window running the flight simulator,
+including flight inside the photon sphere and across the horizon. Cameras may
+be given a velocity: the tetrad is Lorentz-boosted, so relativistic aberration,
+Doppler shift, and beaming appear in the image exactly as an on-board observer
+would see them.
 
 See the `examples/` directory for entry points, and the README for the physics
 walkthrough.
@@ -60,7 +61,6 @@ include("viewfinder.jl")
 include("ship.jl")       # GR flight dynamics; uses the viewfinder integrator
 include("metal.jl")
 include("disc_sim.jl")   # live fluid disc; dispatches on MetalPreviewContext
-include("flythrough.jl")
 include("native_shell.jl") # Makie-free Metal window shell for the simulator
 include("postapp.jl")
 include("app.jl")        # julia_main: standalone-app entry point (create_app)
@@ -92,13 +92,13 @@ export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
        set_march_stride!, set_starfield!
 
 # --- Interactive apps and flight dynamics
-export PreviewSettings, render_preview, viewfinder, flythrough, postprocessor
+export PreviewSettings, render_preview, viewfinder, postprocessor
 export ShipState, step_ship!, ship_velocity
 export fly_native
 
 # --- Look and Sampling: resolution-independent grade, device-independent effort
 export Look, with_look, LOOK_FILM, LOOK_HERO, apply_look!
-export Sampling, with_sampling, STILL, MOTION
+export Sampling, with_sampling, STILL, MOTION, sampling_rng, shutter_span
 
 # --- Image pipeline
 export postprocess, airy_kernel, apply_diffraction!, generate_psf, fft_convolve, aces_tonemap,

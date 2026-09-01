@@ -245,6 +245,25 @@ end
     @test STILL.shutter == 0.0 && MOTION.shutter > 0.0
     @test STILL.samples > MOTION.samples
 
+    # Reproducible by construction, and independent per frame.
+    @test rand(sampling_rng(MOTION, 3)) == rand(sampling_rng(MOTION, 3))
+    @test rand(sampling_rng(MOTION, 3)) != rand(sampling_rng(MOTION, 4))
+    # 180-degree shutter on a 1/24 s frame is 1/48 s.
+    @test shutter_span(MOTION, 1 / 24) ≈ 1 / 48
+    @test shutter_span(STILL, 1 / 24) == 0.0
+
+    # The CPU renderer takes the same `Sampling` the GPU does — effort is not a
+    # property of a device. This is the CPU half; the GPU half needs Metal.
+    bg = fill(RGBf(0.02, 0.02, 0.05), 64, 32)
+    st = Schwarzschild(1.0)
+    cam = Camera(SVector(28.0, 0.0, 3.0), SVector(0.0, 0.0, 0.0),
+                 SVector(0.0, 0.0, 1.0), 0.35)
+    m = render_motion(t -> cam, 0.0, 1.0, st, bg,
+                      with_sampling(MOTION; samples=2);
+                      disc=nothing, width=24, height=14)
+    @test size(m) == (24, 14)
+    @test all(c -> isfinite(c.r) && isfinite(c.g) && isfinite(c.b), m)
+
     # apply_look! runs the chain and leaves a sane image.
     img = fill(RGBf(0.2, 0.2, 0.2), 64, 36)
     img[32, 18] = RGBf(40, 40, 40)

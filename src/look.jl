@@ -199,6 +199,65 @@ function with_sampling(s::Sampling; kwargs...)
     return Sampling(vals...)
 end
 
+"""
+    sampling_rng(s::Sampling, frame::Integer=0)
+
+The RNG for one render under `s`. `frame` offsets the stream so a sequence gets
+independent noise per frame while staying exactly reproducible — the same
+`Sampling` and frame number always give the same image.
+"""
+sampling_rng(s::Sampling, frame::Integer=0) = Random.Xoshiro(s.seed + frame)
+
+"""
+    shutter_span(s::Sampling, frame_interval::Real)
+
+Length of the open shutter in the same units as `frame_interval`. A shutter of
+`0.5` on a 1/24 s frame is the 180-degree convention, 1/48 s. Callers use this
+to build the `camera_at` they hand to a renderer; the shutter lives here rather
+than inside the renderer because only the caller knows what the camera is doing
+between frames.
+"""
+shutter_span(s::Sampling, frame_interval::Real) = s.shutter * frame_interval
+
+"""
+    render_draft_mtl(ctx, cam, spacetime, sampling::Sampling; frame=0, kwargs...)
+    render_motion(camera_at, t0, t1, spacetime, background, sampling::Sampling;
+                  frame=0, kwargs...)
+
+Render under a [`Sampling`](@ref) preset. Both renderers take the same
+`Sampling`, because effort and shutter are not properties of a device: `STILL`
+on the GPU is a fast preview of a final frame, and `MOTION` on the CPU is the
+reference a GPU frame can be checked against.
+
+`sampling.shutter == 0` freezes motion — the GPU form ignores `camera_at`, and
+the CPU form collapses to a single shutter sample.
+"""
+function render_draft_mtl(ctx, cam, spacetime, sampling::Sampling;
+                          frame::Integer=0,
+                          camera_at::Union{Function,Nothing}=nothing, kwargs...)
+    return render_draft_mtl(ctx, cam, spacetime;
+                            samples = sampling.samples,
+                            rng = sampling_rng(sampling, frame),
+                            camera_at = sampling.shutter > 0 ? camera_at : nothing,
+                            kwargs...)
+end
+
+function render_motion(camera_at::Function, t0::Real, t1::Real,
+                       spacetime::Schwarzschild, background, sampling::Sampling;
+                       frame::Integer=0, kwargs...)
+    # The CPU renderer multiplies its sample dimensions (samples² subpixel rays
+    # at each of `time_samples` shutter steps) where the GPU folds them into one
+    # set of passes. Matching the *total* rays per pixel keeps `Sampling` a
+    # statement about effort rather than about which renderer is running.
+    n = sampling.samples^2
+    ts = sampling.shutter > 0 ? max(1, round(Int, sqrt(n))) : 1
+    return render_motion(camera_at, t0, t1, spacetime, background;
+                         samples = max(1, round(Int, sqrt(n / ts))),
+                         time_samples = ts,
+                         rng = sampling_rng(sampling, frame),
+                         kwargs...)
+end
+
 # -----------------------------------------------------------------------------
 
 """
