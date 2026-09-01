@@ -933,10 +933,10 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
             throw(ArgumentError("baked = true needs a `track` to bake along"))
         baked_track = bake_track_maps(ctx, spacetime, track;
                                       n=bake_n, mapw=bake_res,
-                                      maph=bake_res ÷ 2,
-                                      relativistic=relativistic)
+                                      maph=bake_res ÷ 2)
     end
     τ_now = track === nothing ? 0.0 : track.τ[1]
+    track_β = 0.0
 
     frame_ms = 16.0
     # Input-pump deadline, in ms, tracked independently of `frame_ms` (see the
@@ -1138,6 +1138,13 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
             τn = track_loop ? track.τ[1] + mod(τr, span) : track.τ[1] + τr
             τ_now = τn
             tp, tf, tu, tv, _ = track_sample(track, τn)
+            # Keep the free-cam state in sync with the worldline so the
+            # telemetry reports where the ship actually is. Without this the
+            # title bar read `norm(state.pos)` — the position of a camera the
+            # track never touches — and cheerfully showed a constant radius
+            # while the ship dived past the photon sphere.
+            state.pos = tp
+            track_β = norm(tv)
             # Mouse-look as a rotation off the track's own frame rather than a
             # replacement for it, so the roll the worldline carries survives.
             rt = normalize(cross(tf, tu)); uu = cross(rt, tf)
@@ -1306,6 +1313,12 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
                          norm(β), γ,
                          a_mag > 0 ? @sprintf("%.2f", a_mag) : "0 (free fall)",
                          thrust, twarp, ship.τ * 0.49255, ship.t * 0.49255) :
+                track !== nothing ?
+                # Proper acceleration is identically zero on this track: it is
+                # a geodesic, so the whole pass is free fall and an onboard
+                # accelerometer reads nothing even through the periapsis whip.
+                @sprintf("TRACK · τ %.1f · β %.3fc · free fall%s",
+                         τ_now, track_β, baked ? " · baked" : " · live") :
                 @sprintf("free cam · spd %.1f", speed)
             GLFW.SetWindowTitle(win, @sprintf(
                 "%s — r %.2fM %s · %s · %.1f ms (%.0f fps) · spp %d/%d",

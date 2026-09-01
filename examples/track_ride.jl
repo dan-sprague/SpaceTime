@@ -50,19 +50,24 @@ fly_native(cam, spacetime, bg;
            track_speed = 2.5,       # proper seconds of ship time per wall second
            track_loop = true,
            focal = 10.0,             # 10mm: the wide field is where lensing reads
-           # Bake the lensing into warp maps along the track instead of tracing
-           # it every frame. Lensing maps a world direction to a world
-           # direction, so ONE map per position serves every orientation --
-           # look around all you like, it costs nothing extra. Set false to
-           # trace live and compare; the image should be the same.
-           baked = true, bake_n = 48, bake_res = 1024,
-           width = 256, height = 144,
-           winwidth = 1280, winheight = 720,
+           # Live tracing. `baked = true` bakes the lensing into warp maps
+           # along the track instead, which is ~41x cheaper per pixel -- but it
+           # interpolates badly exactly where this track is interesting (see
+           # the note in src/metal.jl), so it is off by default.
+           baked = false,
+           # 384x216 internal, x5 to a 1920x1080 window: an integer upscale, so
+           # the pixels stay square and crisp. Worst case on this track (the
+           # approach, where the disc fills a 10mm field) measures 13.6 ms, so
+           # there is real headroom left for game logic.
+           width = 384, height = 216,
+           winwidth = 1920, winheight = 1080,
            arcade = true,
-           palette = arcade_palette(6; ramp = :magma, lo = 0.12, hi = 0.92),
-           dither = 1.0,
+           # Full colour. Swap in
+           #   palette = arcade_palette(6; ramp = :magma, lo = 0.12, hi = 0.92),
+           #   dither  = 1.0,
+           # for the six-tone arcade look.
+           star_density = 384,
            vsync = false,
            star_texture_weight = 0.0,
-           star_psf_pixels = 0.9,
-           star_density = 110,
+           star_psf_pixels = 1.4,
            title = "Spacetime — track ride")

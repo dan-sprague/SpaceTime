@@ -658,7 +658,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                            ring_rmin,
                            ::Val{VOL}, ::Val{NB},
                            ::Val{LAYER}, ::Val{ORD},
-                           ::Val{KERR}) where {VOL, NB, LAYER, ORD, KERR}
+                           ::Val{KERR}, ::Val{BAKE}) where {VOL, NB, LAYER, ORD, KERR, BAKE}
     idx = thread_position_in_grid().x
     total = cols * rows
     if idx > total
@@ -1199,6 +1199,45 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     W = size(bg, 2)
     H = size(bg, 3)
 
+    if BAKE
+        # Warp-map output: everything about this geodesic EXCEPT the sky it
+        # landed on. Baking the final colour instead caps output sharpness at
+        # the map's angular resolution — 1024 px over 360 degrees is five times
+        # coarser than a 1080p frame across a 10 mm field, so stars came out as
+        # mush and the map size became what limited image quality.
+        #
+        # Storing the escape DIRECTION moves the sharpness back to render time.
+        # The deflection field is smooth and survives a coarse table; the
+        # starfield is then evaluated per pixel against the interpolated
+        # direction, so output stays sharp at any resolution and a 512x256 map
+        # is enough.
+        #
+        # Eight channels: direction (1:3), premultiplied disc emission (4:6),
+        # transmittance to the sky (7), escape flag (8).
+        rfb = max(sqrt(x * x + y * y + z * z), 1.0f-6)
+        escf = 0.0f0
+        if hit_horizon || rfb < 4.0f0 * M
+            out[1, i, j] = 0.0f0; out[2, i, j] = 0.0f0; out[3, i, j] = 0.0f0
+        else
+            escf = 1.0f0
+            vbx, vby, vbz, _, _, _ = _rhs_mtl(Val(KERR), x, y, z, px, py, pz,
+                                              p_t, M, spin_a)
+            vbl = max(sqrt(vbx * vbx + vby * vby + vbz * vbz), 1.0f-20)
+            out[1, i, j] = vbx / vbl
+            out[2, i, j] = vby / vbl
+            out[3, i, j] = vbz / vbl
+        end
+        out[4, i, j] = acc_r; out[5, i, j] = acc_g; out[6, i, j] = acc_b
+        out[7, i, j] = alpha
+        # Escape flag as its OWN channel rather than inferred from the
+        # direction's length. Interpolating two unit vectors that point
+        # different ways also shortens the result, so length would read a
+        # rapidly-turning deflection field as shadow and paint a dark rim
+        # exactly where the deflection is most interesting.
+        out[8, i, j] = escf
+        return nothing
+    end
+
     if LAYER
         # Disc/gas layer output: premultiplied emission + transmittance to
         # the sky, written by assignment — every launched thread owns its
@@ -1448,13 +1487,13 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         fan=nothing, sky_params=nothing, layer::Bool=false,
                         substride::Int=1, subx::Int=0, suby::Int=0,
                         ring_rmin::Real=0.0, col0::Int=0, cols::Int=-1,
-                        order::Int=4, kerr::Bool=false)
+                        order::Int=4, kerr::Bool=false, bake::Bool=false)
     cols < 0 && (cols = width)
     von = ctx.vol_on[]
     fan_b = fan === nothing ? _dummy_fan() : fan
     skyp_b = sky_params === nothing ? _dummy_skyp() : sky_params
     kernels = ctx.kernel[]::Dict{Any,Any}
-    key = (von, nb, layer, order, kerr)
+    key = (von, nb, layer, order, kerr, bake)
     if !haskey(kernels, key)
         kernels[key] = @metal launch=false trace_kernel_mtl!(
             out, ctx.bg_gpu, ctx.bb_lut, ctx.star_lut, ctx.vol_gpu,
@@ -1463,7 +1502,7 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
             fan_b, skyp_b,
             width, height, nmax, dt, ju, jv, weight, row0, rows,
             col0, cols, substride, subx, suby, Float32(ring_rmin),
-            Val(von), Val(nb), Val(layer), Val(order), Val(kerr))
+            Val(von), Val(nb), Val(layer), Val(order), Val(kerr), Val(bake))
     end
     kernel = kernels[key]
     n = cols * rows
@@ -1475,7 +1514,7 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
            fan_b, skyp_b,
            width, height, nmax, dt, ju, jv, weight, row0, rows,
            col0, cols, substride, subx, suby, Float32(ring_rmin),
-           Val(von), Val(nb), Val(layer), Val(order), Val(kerr);
+           Val(von), Val(nb), Val(layer), Val(order), Val(kerr), Val(bake);
            threads=threads, groups=groups)
     return nothing
 end
@@ -2609,42 +2648,52 @@ end
 # ---------------------------------------------------------------------------
 #
 # Live Kerr tracing costs ~170 ns/pixel: every pixel is a full RK4 geodesic with
-# a hundred-odd steps. A texture lookup costs ~3 ns/pixel. That ratio is not a
-# speedup so much as a change of category — you stop paying for physics per
-# pixel and start paying for bandwidth per pixel.
+# a hundred-odd steps. A warp-map lookup is a couple of bilinear fetches. That
+# ratio is not a speedup so much as a change of category — you stop paying for
+# physics per pixel and start paying for bandwidth per pixel.
 #
-# What makes it work here is that lensing maps a WORLD direction to a world
-# direction. It has no dependence on where the camera is pointing, only on
-# where it is. So one map per position serves every orientation: free look,
-# arbitrary roll, any field of view, all from the same table. A racing game can
-# exploit that harder than a free-flight simulator can, because the track
-# constrains the camera to a curve rather than a volume.
+# What makes it work is that lensing maps a WORLD direction to a world
+# direction. It has no dependence on where the camera is pointing, only on where
+# it is. So one map per position serves every orientation: free look, arbitrary
+# roll, any field of view, all from the same table. A racing game can exploit
+# that harder than a free-flight simulator can, because the track constrains the
+# camera to a curve rather than a volume.
 #
-# Two things this v1 does NOT do, both noted where they bite:
-#   * the disc is baked as colour, so it does not animate between bakes;
-#   * the shadow edge is a discontinuity in the map and blending across two
-#     maps there will ghost. Bardeen's closed-form Kerr shadow outline is the
-#     fix, interpolating only the smooth part.
+# The maps store the escape DIRECTION, not the final colour. That is what keeps
+# output sharp from a small table — see the kernel's `BAKE` block.
+#
+# One limit worth stating: the disc is baked as colour, so it does not animate
+# between bakes. Baking the disc HIT COORDINATES instead (r_hit, φ_hit, and the
+# redshift g) would let it rotate and shimmer at runtime with the geodesics
+# still frozen. Not done here.
 
 """
-    bake_warp_map(ctx, spacetime, pos, vel; mapw, maph, relativistic)
+    bake_warp_map(ctx, spacetime, pos, vel; mapw, maph)
 
-Trace one equirectangular environment map at `pos`, for a ship moving at
-coordinate 3-velocity `vel`. Returns `(map_gpu, basis)` where `basis` is the
-world-aligned camera frame the map is indexed against.
+Trace one equirectangular warp map at `pos`, for a ship moving at coordinate
+3-velocity `vel`. Returns `(map_gpu, basis)`, where `basis` is the world-aligned
+camera frame the map is indexed against.
 
 The map is baked with a **world-aligned** camera rather than the ship's, which
 is what makes the index a world direction and therefore orientation-independent.
-`vel` still matters: it boosts the observer tetrad, so aberration, Doppler and
-beaming are baked in as the ship at that point would see them.
+`vel` still matters: it boosts the observer tetrad, so aberration is baked in as
+the ship at that point would see it.
 """
 function bake_warp_map(ctx::MetalPreviewContext, spacetime::AbstractSpacetime,
                        pos::SVector{3,Float64}, vel::SVector{3,Float64};
-                       mapw::Int=1024, maph::Int=512, relativistic::Bool=false)
-    # Camera(pos, pos + x̂, ẑ) — the resulting basis is (x̂, −ŷ, ẑ); the sampler
-    # is handed it explicitly rather than assuming it.
-    cam = Camera(pos, pos + SVector(1.0, 0.0, 0.0), SVector(0.0, 0.0, 1.0),
-                 1.0; velocity = vel)
+                       mapw::Int=512, maph::Int=256)
+    # Bake in a frame rotated to the ship's own azimuth, so the map is stored in
+    # CANONICAL form (as if the ship were at φ = 0). Kerr is axisymmetric, so
+    # two maps at different azimuths are the same map rotated — and near
+    # periapsis almost all the apparent change between neighbouring samples IS
+    # that rotation. Factoring it out here is what lets interpolation work at
+    # the one place on the track where it matters.
+    #
+    # The resulting basis is R_z(φ)·(x̂, −ŷ, ẑ), so the sampler only has to undo
+    # a rotation about z rather than carry a general frame.
+    φc = atan(pos[2], pos[1])
+    cam = Camera(pos, pos + SVector(cos(φc), sin(φc), 0.0),
+                 SVector(0.0, 0.0, 1.0), 1.0; velocity = vel)
     M = Float32(spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(pos), 15.0 * spacetime.M))
     dt = ctx.dt
@@ -2652,27 +2701,89 @@ function bake_warp_map(ctx::MetalPreviewContext, spacetime::AbstractSpacetime,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)), 20_000)
     cp = MtlArray(_ks_cam_params(cam, spacetime.M; equirect = true))
     spin_a, rkill2 = _spin_horizon(spacetime)
-    sp = MtlArray(Float32[M, Float32(2.05 * spacetime.M), r_escape,
-                          relativistic ? 1.0f0 : 0.0f0,
+    sp = MtlArray(Float32[M, Float32(2.05 * spacetime.M), r_escape, 0.0f0,
                           HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
-    out = MtlArray{Float32}(undef, 3, mapw, maph)
+    out = MtlArray{Float32}(undef, 8, mapw, maph)
     fill!(out, 0.0f0)
     _launch_trace!(ctx, out, cp, sp, mapw, maph, nmax, dt,
-                   0.5f0, 0.5f0, 1.0f0, 0, maph; kerr = (spin_a != 0))
-    return out, (cam.fwd, cam.right, cam.up_local)
+                   0.5f0, 0.5f0, 1.0f0, 0, maph;
+                   kerr = (spin_a != 0), bake = true)
+    return out, φc
 end
 
 """
-Sample two baked maps and cross-fade. `p` carries the field of view, the
-runtime camera basis, the bake basis, and the blend weight — 20 floats.
-
-Blending two maps is a linear interpolation of the lensed sky, which is right
-everywhere the map is smooth and wrong across the shadow edge, where rays
-either escape or are captured and there is no in-between to interpolate. At
-the sample densities here that edge moves less than a texel between bakes, so
-it reads as a slightly soft rim rather than a ghost.
+Sample two baked maps, cross-fade, and composite the sky at FULL output
+resolution. The maps supply the deflection and the disc; the starfield is
+evaluated per pixel against the interpolated direction, so stars stay sharp at
+any output resolution.
 """
-function warp_sample_kernel!(out, m0, m1, p, width, height)
+@inline function _warp_lookup(m, dx, dy, dz, cϕ, sϕ)
+    # Rotate the view direction back by this map's own azimuth, so it indexes
+    # the canonical (φ = 0) map.
+    rx =  cϕ * dx + sϕ * dy
+    ry = -sϕ * dx + cϕ * dy
+    # Bake basis is R_z(φ)·(x̂, −ŷ, ẑ); having undone R_z(φ), what is left is
+    # (x̂, −ŷ, ẑ).
+    θ = acos(clamp(rx, -1.0f0, 1.0f0))
+    φ = atan(dz, -ry)
+
+    W = size(m, 2)
+    H = size(m, 3)
+    fH = Float32(H)
+    fu = φ * fH / 3.1415927f0 + Float32(W) / 2.0f0
+    fv = θ * fH / 3.1415927f0
+
+    i0 = unsafe_trunc(Int32, floor(fu - 0.5f0))
+    j0 = unsafe_trunc(Int32, floor(fv - 0.5f0))
+    tu = fu - 0.5f0 - Float32(i0)
+    tv = fv - 0.5f0 - Float32(j0)
+    # φ wraps, θ clamps: the poles are single points, not a seam. Branches
+    # rather than `mod` — integer modulo is multi-cycle and `fu` is already
+    # within one period of range.
+    iW = Int32(W)
+    ia = i0 < Int32(0) ? i0 + iW : (i0 >= iW ? i0 - iW : i0)
+    i1 = i0 + Int32(1)
+    ib = i1 < Int32(0) ? i1 + iW : (i1 >= iW ? i1 - iW : i1)
+    ia += Int32(1); ib += Int32(1)
+    ja = clamp(j0, Int32(0), Int32(H - 1)) + Int32(1)
+    jb = clamp(j0 + Int32(1), Int32(0), Int32(H - 1)) + Int32(1)
+
+    a00 = (1.0f0 - tu) * (1.0f0 - tv)
+    a10 = tu * (1.0f0 - tv)
+    a01 = (1.0f0 - tu) * tv
+    a11 = tu * tv
+
+    @inbounds begin
+        v1 = m[1,ia,ja]*a00 + m[1,ib,ja]*a10 + m[1,ia,jb]*a01 + m[1,ib,jb]*a11
+        v2 = m[2,ia,ja]*a00 + m[2,ib,ja]*a10 + m[2,ia,jb]*a01 + m[2,ib,jb]*a11
+        v3 = m[3,ia,ja]*a00 + m[3,ib,ja]*a10 + m[3,ia,jb]*a01 + m[3,ib,jb]*a11
+        v4 = m[4,ia,ja]*a00 + m[4,ib,ja]*a10 + m[4,ia,jb]*a01 + m[4,ib,jb]*a11
+        v5 = m[5,ia,ja]*a00 + m[5,ib,ja]*a10 + m[5,ia,jb]*a01 + m[5,ib,jb]*a11
+        v6 = m[6,ia,ja]*a00 + m[6,ib,ja]*a10 + m[6,ia,jb]*a01 + m[6,ib,jb]*a11
+        v7 = m[7,ia,ja]*a00 + m[7,ib,ja]*a10 + m[7,ia,jb]*a01 + m[7,ib,jb]*a11
+        v8 = m[8,ia,ja]*a00 + m[8,ib,ja]*a10 + m[8,ia,jb]*a01 + m[8,ib,jb]*a11
+        # The stored escape direction is in world coordinates for THIS map's
+        # configuration; rotate it to canonical form too, so the two maps are
+        # blended in a common frame rather than across a large rotation.
+        e1 =  cϕ * v1 + sϕ * v2
+        e2 = -sϕ * v1 + cϕ * v2
+        return (e1, e2, v3, v4, v5, v6, v7, v8)
+    end
+end
+
+"""
+Sample two baked maps, cross-fade, and composite the sky at FULL output
+resolution. The maps supply the deflection and the disc; the starfield is
+evaluated per pixel against the interpolated direction, so stars stay sharp at
+any output resolution and map size stops being what limits image quality.
+
+Both maps are stored canonically (ship at azimuth zero) and are un-rotated into
+a common frame before blending, so the interpolation only ever has to span the
+change in radius — not the ship's sweep around the hole, which near periapsis is
+most of the apparent change and which axisymmetry makes free.
+"""
+function warp_sample_kernel!(out, m0, m1, bg, star_lut, star_params, p,
+                             width, height)
     idx = thread_position_in_grid().x
     if idx > width * height
         return
@@ -2691,49 +2802,55 @@ function warp_sample_kernel!(out, m0, m1, p, width, height)
     cu = dly / ν
     cf = 1.0f0 / ν
 
-    # Pixel direction in world coordinates, via the runtime camera basis...
+    # Pixel direction in world coordinates via the runtime camera basis.
     dx = cf * p[2] + cr * p[5] + cu * p[8]
     dy = cf * p[3] + cr * p[6] + cu * p[9]
     dz = cf * p[4] + cr * p[7] + cu * p[10]
-    # ...then re-expressed on the bake basis, which is how the map is indexed.
-    bf = dx * p[11] + dy * p[12] + dz * p[13]
-    br = dx * p[14] + dy * p[15] + dz * p[16]
-    bu = dx * p[17] + dy * p[18] + dz * p[19]
 
-    θ = acos(clamp(bf, -1.0f0, 1.0f0))
-    φ = atan(bu, br)
-
-    W = size(m0, 2)
-    H = size(m0, 3)
-    fH = Float32(H)
-    fu = φ * fH / 3.1415927f0 + Float32(W) / 2.0f0
-    fv = θ * fH / 3.1415927f0
-
-    i0 = unsafe_trunc(Int32, floor(fu - 0.5f0))
-    j0 = unsafe_trunc(Int32, floor(fv - 0.5f0))
-    tu = fu - 0.5f0 - Float32(i0)
-    tv = fv - 0.5f0 - Float32(j0)
-    # φ wraps, θ clamps: the poles are single points, not a seam. Branches
-    # rather than `mod` — integer modulo is a multi-cycle op and this kernel is
-    # doing two of them per pixel for no reason; fu is already within one
-    # period of range.
-    iW = Int32(W)
-    ia = i0 < Int32(0) ? i0 + iW : (i0 >= iW ? i0 - iW : i0)
-    i1 = i0 + Int32(1)
-    ib = i1 < Int32(0) ? i1 + iW : (i1 >= iW ? i1 - iW : i1)
-    ia += Int32(1); ib += Int32(1)
-    ja = clamp(j0, Int32(0), Int32(H - 1)) + Int32(1)
-    jb = clamp(j0 + Int32(1), Int32(0), Int32(H - 1)) + Int32(1)
+    A = _warp_lookup(m0, dx, dy, dz, p[11], p[12])
+    B = _warp_lookup(m1, dx, dy, dz, p[13], p[14])
 
     w = p[20]
-    @inbounds for c in 1:3
-        a0 = m0[c, ia, ja] * (1.0f0 - tu) + m0[c, ib, ja] * tu
-        a1 = m0[c, ia, jb] * (1.0f0 - tu) + m0[c, ib, jb] * tu
-        s0 = a0 * (1.0f0 - tv) + a1 * tv
-        b0 = m1[c, ia, ja] * (1.0f0 - tu) + m1[c, ib, ja] * tu
-        b1 = m1[c, ia, jb] * (1.0f0 - tu) + m1[c, ib, jb] * tu
-        s1 = b0 * (1.0f0 - tv) + b1 * tv
-        out[c, i, j] = s0 * (1.0f0 - w) + s1 * w
+    ω = 1.0f0 - w
+    vx = ω*A[1] + w*B[1]
+    vy = ω*A[2] + w*B[2]
+    vz = ω*A[3] + w*B[3]
+    dr = ω*A[4] + w*B[4]
+    dg = ω*A[5] + w*B[5]
+    db = ω*A[6] + w*B[6]
+    al = ω*A[7] + w*B[7]
+    es = clamp(ω*A[8] + w*B[8], 0.0f0, 1.0f0)
+
+    # Back out of canonical form into the ship's current azimuth, so the sky is
+    # sampled in world coordinates and the starfield stays fixed to the sky
+    # rather than spinning with the ship.
+    cn = p[15]; sn = p[16]
+    wx = cn * vx - sn * vy
+    wy = sn * vx + cn * vy
+
+    sr = 0.0f0; sg = 0.0f0; sb = 0.0f0
+    if es > 1.0f-3
+        vl = max(sqrt(wx * wx + wy * wy + vz * vz), 1.0f-20)
+        nx = wx / vl; ny = wy / vl; nz = vz / vl
+        θb = acos(clamp(nz, -1.0f0, 1.0f0))
+        φb = atan(ny, nx)
+        sr, sg, sb = sample_background_mtl(bg, θb, φb, size(bg, 2), size(bg, 3))
+        if star_params[1] > 0.0f0
+            tw = star_params[16]
+            sr *= tw; sg *= tw; sb *= tw
+            pr, pg, pb = starfield_mtl(nx, ny, nz, star_params, star_lut)
+            sr += star_params[1] * pr
+            sg += star_params[1] * pg
+            sb += star_params[1] * pb
+        end
+        sr *= es; sg *= es; sb *= es
+    end
+
+    ex = p[21]
+    @inbounds begin
+        out[1, i, j] = (dr + al * sr) * ex
+        out[2, i, j] = (dg + al * sg) * ex
+        out[3, i, j] = (db + al * sb) * ex
     end
     return nothing
 end
@@ -2741,58 +2858,149 @@ end
 """
     BakedTrack
 
-Warp maps baked along a track, plus the persistent buffers the sampler needs.
-The parameter buffer lives here rather than being built per frame: allocating a
-GPU buffer every frame cost ~2.5 ms of fixed overhead, which at 256x144 was
-most of the frame.
+Warp maps baked along a track, plus the persistent buffers the sampler needs and
+the sky sources it composites against.
+
+The parameter buffer is shared storage with a host view that ALIASES it. Apple
+silicon has unified memory, so staging 20 floats through a host vector and
+calling `copyto!` was copying a buffer to itself — ~1 kB of allocation per frame
+to move 80 bytes the GPU could already see.
 """
-struct BakedTrack{M,K}
+struct BakedTrack{M,B,L,S,K}
     maps::Vector{M}
     τ::Vector{Float64}
-    basis::NTuple{3,SVector{3,Float64}}
-    # Shared storage plus a host view that ALIASES it. Apple silicon has
-    # unified memory, so staging 20 floats through a host vector and calling
-    # `copyto!` was copying a buffer to itself -- 989 B of allocation per frame
-    # to move 80 bytes that were already visible to the GPU. Writing through
-    # `host` is free and the kernel sees it immediately.
+    # Azimuth each map was baked at. The maps are stored canonically, so this
+    # is what the sampler rotates by to get back to world coordinates.
+    φ::Vector{Float64}
+    # Per-map exposure, baked alongside the geodesics. A single flyby spans
+    # ~400x in scene luminance — the 99th percentile runs from 0.025 far out to
+    # 11.0 on the approach, where a third of the frame clipped to the top
+    # palette tone and the picture became a cream wall. No fixed exposure serves
+    # that range.
+    #
+    # A live renderer would need auto-exposure with a time constant, which lags
+    # and pumps. Here the track is known in advance, so the curve is
+    # precomputed and interpolated: correct on the first frame, no lag, no
+    # hunting. The same trick as the lensing, applied to the histogram.
+    exposure::Vector{Float32}
+    bg::B
+    star_lut::L
+    star_params::S
     params::MtlVector{Float32,Metal.SharedStorage}
     host::Vector{Float32}
     kernel::K
 end
 
 """
+    _baked_track(ctx, maps, τs, basis)
+
+Wrap baked maps with the persistent sampler state. The kernel is compiled
+eagerly so it can be stored concretely rather than fetched from a `Ref{Any}` on
+every frame, and `maps` must already be a concretely-typed vector — as
+`Vector{Any}` it boxed a map handle per frame for no reason.
+"""
+function _baked_track(ctx::MetalPreviewContext, maps::Vector,
+                      τs::Vector{Float64}, φs::Vector{Float64},
+                      exposure::Vector{Float32}=ones(Float32, length(maps)))
+    pbuf = MtlArray{Float32,1,Metal.SharedStorage}(undef, 24)
+    phost = unsafe_wrap(Array, pbuf)
+    fill!(phost, 0.0f0)
+    phost[21] = 1.0f0
+    dummy = MtlArray{Float32}(undef, 3, 1, 1)
+    kern = @metal launch=false warp_sample_kernel!(dummy, maps[1], maps[1],
+                     ctx.bg_gpu, ctx.star_lut, ctx.star_params, pbuf, 1, 1)
+    return BakedTrack(maps, τs, φs, exposure, ctx.bg_gpu, ctx.star_lut,
+                      ctx.star_params, pbuf, phost, kern)
+end
+
+"""
     render_baked!(out, bt, τ, cam)
 
-Composite one frame from the two maps bracketing proper time `τ`. This is the
-whole runtime cost of the lensing: two bilinear fetches per pixel and a lerp,
-with not one geodesic integrated.
+Composite one frame from the two maps bracketing proper time `τ`. No geodesic is
+integrated: the maps supply the deflection and the disc, and the sky is
+evaluated per pixel against the interpolated direction.
+
+Blending two maps is a linear interpolation of a smooth deflection field, which
+is right everywhere except across the shadow edge, where rays either escape or
+are captured and there is no in-between. The escape flag carries that edge, so
+it comes out antialiased rather than ghosted.
 """
 function render_baked!(out, bt::BakedTrack, τ::Real, cam::Camera)
     n = length(bt.τ)
     k = clamp(searchsortedfirst(bt.τ, τ), 2, n)
     w = n == 1 ? 0.0 :
         clamp((τ - bt.τ[k-1]) / (bt.τ[k] - bt.τ[k-1]), 0.0, 1.0)
-    Fb, Rb, Ub = bt.basis
     h = bt.host
-    h[1] = cam.fov_factor
-    h[2], h[3], h[4] = cam.fwd
-    h[5], h[6], h[7] = cam.right
-    h[8], h[9], h[10] = cam.up_local
-    h[11], h[12], h[13] = Fb
-    h[14], h[15], h[16] = Rb
-    h[17], h[18], h[19] = Ub
-    h[20] = Float32(w)
+    @inbounds begin
+        h[1] = cam.fov_factor
+        h[2] = cam.fwd[1];      h[3] = cam.fwd[2];      h[4] = cam.fwd[3]
+        h[5] = cam.right[1];    h[6] = cam.right[2];    h[7] = cam.right[3]
+        h[8] = cam.up_local[1]; h[9] = cam.up_local[2]; h[10] = cam.up_local[3]
+        h[11] = cos(bt.φ[k-1]); h[12] = sin(bt.φ[k-1])
+        h[13] = cos(bt.φ[k]);   h[14] = sin(bt.φ[k])
+        # Blend the azimuth as an ANGLE, shortest way round, so a pass that
+        # crosses the branch cut of atan does not snap the sky through 2π.
+        dφ = bt.φ[k] - bt.φ[k-1]
+        dφ = dφ - 2π * round(dφ / 2π)
+        φn = bt.φ[k-1] + w * dφ
+        h[15] = cos(φn); h[16] = sin(φn)
+        h[20] = Float32(w)
+        h[21] = (1.0f0 - Float32(w)) * bt.exposure[max(k-1, 1)] +
+                Float32(w) * bt.exposure[k]
+    end
     width = size(out, 2); height = size(out, 3)
-    m0 = bt.maps[k-1]; m1 = bt.maps[k]
-    # `maps` and `kernel` are both concretely typed (see `bake_track_maps`), so
-    # this whole function is allocation-free apart from what Metal's own launch
-    # path does. It ran as Vector{Any} first, which boxed a map handle on every
-    # frame for no reason.
+    m0 = bt.maps[max(k-1, 1)]; m1 = bt.maps[k]
     N = width * height
     threads = min(bt.kernel.pipeline.maxTotalThreadsPerThreadgroup, N)
-    bt.kernel(out, m0, m1, bt.params, width, height;
-              threads=threads, groups=cld(N, threads))
+    bt.kernel(out, m0, m1, bt.bg, bt.star_lut, bt.star_params, bt.params,
+              width, height; threads=threads, groups=cld(N, threads))
     return nothing
+end
+
+"""
+    _adaptive_taus(ctx, spacetime, track, n; probe_n, probe_res, floor_frac)
+
+Choose where along the track to bake, by measuring rather than assuming.
+
+Spacing maps uniformly in proper time is wrong, and visibly so: the ship covers
+a huge amount of *field* per unit time near periapsis and almost none far out,
+so uniform spacing under-samples exactly the part of the track the whole level
+is built around. The result is a jolt on the approach — adjacent maps differ so
+much that interpolating between them cannot hide the step.
+
+So bake a cheap low-resolution probe pass first, measure how much the map
+actually changes between neighbours, and redistribute the real samples to
+equalise that change. `floor_frac` keeps a fraction of the budget uniform, so a
+long quiet stretch still gets some samples instead of none.
+"""
+function _adaptive_taus(ctx::MetalPreviewContext, spacetime::AbstractSpacetime,
+                        track, n::Int; probe_n::Int=33, probe_res::Int=128,
+                        floor_frac::Float64=0.15)
+    τp = collect(range(track.τ[1], track.τ[end]; length=probe_n))
+    d = zeros(Float64, probe_n - 1)
+    prev = nothing
+    for k in 1:probe_n
+        pos, _, _, vel, _ = track_sample(track, τp[k])
+        m, _ = bake_warp_map(ctx, spacetime, pos, vel;
+                             mapw=probe_res, maph=probe_res ÷ 2)
+        a = Array(m)
+        prev !== nothing && (d[k-1] = sqrt(sum(abs2, a .- prev) / length(a)))
+        prev = a
+    end
+    tot = sum(d)
+    tot <= 0 && return collect(range(track.τ[1], track.τ[end]; length=n))
+    w = (1 - floor_frac) .* (d ./ tot) .+ floor_frac / length(d)
+    c = vcat(0.0, cumsum(w)); c ./= c[end]
+    # Invert the cumulative curve: equal steps in "field change" -> unequal τ.
+    τs = Vector{Float64}(undef, n)
+    for (i, u) in enumerate(range(0.0, 1.0; length=n))
+        j = clamp(searchsortedfirst(c, u), 2, probe_n)
+        span = c[j] - c[j-1]
+        f = span > 0 ? (u - c[j-1]) / span : 0.0
+        τs[i] = τp[j-1] + f * (τp[j] - τp[j-1])
+    end
+    τs[1] = track.τ[1]; τs[end] = track.τ[end]
+    return τs
 end
 
 """
@@ -2801,45 +3009,52 @@ end
 Bake `n` warp maps evenly spaced in proper time along `track`, as a
 [`BakedTrack`](@ref).
 
-Bake cost is set by total texel count, not by how it is split: ~33M geodesics
-takes a couple of seconds on an M3, which is a loading screen, not a build
-step. That is what makes mass, spin and disc geometry free per-level
-parameters — the table does not have to ship.
+Bake cost is set by total texel count, not by how it is split: a few tens of
+millions of geodesics take seconds on an M3, which is a loading screen rather
+than a build step. That is what makes mass, spin and disc geometry free
+per-level parameters — the table does not have to ship.
 """
 function bake_track_maps(ctx::MetalPreviewContext, spacetime::AbstractSpacetime,
-                         track; n::Int=64, mapw::Int=1024, maph::Int=512,
-                         relativistic::Bool=false, verbose::Bool=true)
-    τ0, τ1 = track.τ[1], track.τ[end]
-    τs = collect(range(τ0, τ1; length=n))
+                         track; n::Int=48, mapw::Int=512, maph::Int=256,
+                         exposure_target::Real=1.0, adaptive::Bool=true,
+                         verbose::Bool=true)
     t0 = time()
-    # Bake the first map to learn its concrete type, then allocate the vector
-    # for it. Vector{Any} here propagates into BakedTrack{Any} and costs a
-    # dynamic dispatch and a box on every single rendered frame.
+    τs = adaptive ? _adaptive_taus(ctx, spacetime, track, n) :
+                    collect(range(track.τ[1], track.τ[end]; length=n))
+    # Bake the first map to learn its concrete type, then allocate for it.
     p1, _, _, v1, _ = track_sample(track, τs[1])
-    m1, basis = bake_warp_map(ctx, spacetime, p1, v1;
-                              mapw=mapw, maph=maph, relativistic=relativistic)
+    m1, φ1 = bake_warp_map(ctx, spacetime, p1, v1; mapw=mapw, maph=maph)
     maps = Vector{typeof(m1)}(undef, n)
-    maps[1] = m1
+    φs = Vector{Float64}(undef, n)
+    maps[1] = m1; φs[1] = φ1
+    # Unwrap the azimuth so the sampler can interpolate it as a continuous
+    # angle: a flyby can wind through many turns near periapsis, and a wrapped
+    # atan would make every crossing look like a jump cut.
     for k in 2:n
         pos, _, _, vel, _ = track_sample(track, τs[k])
-        maps[k], _ = bake_warp_map(ctx, spacetime, pos, vel;
-                                   mapw=mapw, maph=maph,
-                                   relativistic=relativistic)
+        maps[k], φk = bake_warp_map(ctx, spacetime, pos, vel;
+                                    mapw=mapw, maph=maph)
+        φs[k] = φs[k-1] + rem(φk - φs[k-1], 2π, RoundNearest)
     end
     Metal.synchronize()
+    # Exposure per map: put the 99.5th percentile of scene luminance at
+    # `exposure_target`. A percentile rather than the max, so a handful of
+    # near-critical rays piling onto the photon ring cannot drag the whole
+    # frame dark.
+    expo = Vector{Float32}(undef, n)
+    for k in 1:n
+        a = Array(maps[k])
+        lum = vec(0.2126f0 .* a[4, :, :] .+ 0.7152f0 .* a[5, :, :] .+
+                  0.0722f0 .* a[6, :, :])
+        sort!(lum)
+        pk = lum[max(1, round(Int, 0.995 * length(lum)))]
+        expo[k] = Float32(exposure_target / max(pk, 1.0f-4))
+    end
     if verbose
         rays = n * mapw * maph
-        @printf("baked %d maps (%dx%d, %.1fM geodesics) in %.2f s — %.1f MB\n",
+        @printf("baked %d maps (%dx%d, %.1fM geodesics) in %.2f s — %.0f MB\n",
                 n, mapw, maph, rays / 1e6, time() - t0,
-                n * 3 * mapw * maph * 4 / 1e6)
+                n * 8 * mapw * maph * 4 / 1e6)
     end
-    # Compile the sampler eagerly against a dummy output so the kernel object
-    # can be stored concretely rather than fetched from a Ref{Any} per frame.
-    pbuf = MtlArray{Float32,1,Metal.SharedStorage}(undef, 20)
-    phost = unsafe_wrap(Array, pbuf)
-    fill!(phost, 0.0f0)
-    dummy = MtlArray{Float32}(undef, 3, 1, 1)
-    kern = @metal launch=false warp_sample_kernel!(dummy, maps[1], maps[1],
-                                                   pbuf, 1, 1)
-    return BakedTrack(maps, τs, basis, pbuf, phost, kern)
+    return _baked_track(ctx, maps, τs, φs, expo)
 end
