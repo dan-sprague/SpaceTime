@@ -769,6 +769,16 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
                        hue_preserve=0.55, gamma_power=5.0, grain=0.02,
                        streak_fraction=0.667, streak_gain=4.0)
         end
+        if arcade
+            # Bloom and vignette are scattered-light effects: they manufacture
+            # smooth low-contrast gradients, which is precisely what a
+            # six-tone luminance palette cannot represent — they arrive as
+            # dither mush and a grey haze over the black. Grain and streaks go
+            # for the same reason. Forced here rather than in the presets so
+            # that cycling 1/2/3/4 cannot put the haze back.
+            set_grade!(presenter; bloom=0.0, vignette=0.0, grain=0.0,
+                       streak_fraction=0.0)
+        end
         grade_rev += 1
         return nothing
     end
