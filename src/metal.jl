@@ -73,7 +73,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
                               volume::Union{DiscVolume,Nothing}=nothing)
     bg_gpu = _upload_background(background)
     out_gpu = MtlArray{Float32,3}(undef, 3, width, height)
-    cam_params = MtlVector{Float32}(undef, 28)
+    cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
     spacetime_params = MtlVector{Float32}(undef, 4)
     disc_params = MtlVector{Float32}(undef, 6)
     if isnothing(disc)
@@ -133,7 +133,7 @@ end
 
 Enable/disable the thin-plane accretion disc at runtime by rewriting the
 6-float disc parameter buffer (`inner = 0` disables it in the kernel).
-Contexts that share `disc_params` (flythrough resolution variants) all
+Contexts that share `disc_params` (resolution variants) all
 follow. The volumetric disc has its own switch: [`set_volume_enabled!`](@ref).
 """
 function set_disc_enabled!(ctx::MetalPreviewContext, disc::AccretionDisc,
@@ -466,8 +466,9 @@ end
 Metal compute kernel: one thread per pixel of the current row tile, tracing
 geodesics in **Cartesian Kerr–Schild coordinates** (see `ks_rhs_mtl`) — free
 of the polar and horizon coordinate singularities of the spherical chart, so
-flythroughs never hit pole artifacts. `cam_params` is a 13-element Float32
-vector `[pos(3); fwd(3); right(3); up(3); fov_factor]`. `spacetime_params`
+flight never hits pole artifacts. `cam_params` is a Float32 vector of
+[`CAM_PARAMS_N`](@ref) entries — pose, projection and motion-blur block, laid
+out there. `spacetime_params`
 is `[M; r_horizon; r_escape]`. `disc_params` is `[inner_radius; outer_radius;
 density_falloff; table_min; table_max; table_size]`; when the radii describe
 a valid annulus the kernel composites a semi-transparent Doppler-shaded disc,
@@ -524,6 +525,49 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, star_params,
     er0 = cam_params[9];  er1 = cam_params[10]; er2 = cam_params[11]; er3 = cam_params[12]
     eu0 = cam_params[13]; eu1 = cam_params[14]; eu2 = cam_params[15]; eu3 = cam_params[16]
     ut0 = cam_params[17]; ut1 = cam_params[18]; ut2 = cam_params[19]; ut3 = cam_params[20]
+
+    # Optional per-pixel shutter time (`per_pixel_shutter`; off by default).
+    # Without it every pixel in the frame is sampled at the same instant inside
+    # the pass's shutter stratum, so a moving frame is built from `samples²`
+    # frame-wide copies of itself. That is the same defect the stratified-lens
+    # block below fixes for the aperture, and this is the same fix: hash a point
+    # per pixel inside the stratum and interpolate the pose between its
+    # endpoints, cam_params[1:20] and [30:49].
+    #
+    # It is off by default because measurement did not support turning it on.
+    # A/B against a converged reference (1280x720 lensed starfield, 31 px of
+    # sweep across the shutter — 7.7 px between adjacent poses at samples=2,
+    # far more than any real shot here):
+    #
+    #   samples   RMS vs reference        error autocorrelation at 1 px
+    #             one pose   per pixel    one pose   per pixel
+    #     2       0.00875    0.01058       +0.044     +0.008
+    #     3       0.00494    0.00554       -0.060     -0.039
+    #     4       0.00395    0.00409       -0.043     -0.035
+    #
+    # So it does what it claims — the error becomes ~5x less spatially
+    # structured, i.e. noise rather than ghosts — but total error rises by up to
+    # 20%. That is the standard trade: one pose per stratum is midpoint
+    # quadrature and converges faster on a smooth integrand, while randomising
+    # buys incoherence at the cost of variance. The ghosting it removes turned
+    # out to be weak (+0.044 correlation in a deliberately extreme case), so on
+    # these numbers there is nothing here worth 20% more noise. Kept behind the
+    # flag because the trade may reverse on sharper content or lower sample
+    # counts, and it costs nothing to leave available.
+    if cam_params[29] > 0.0f0
+        τ = _sim_hash(Int32(i), Int32(j), unsafe_trunc(Int32, cam_params[29]))
+        cx += τ * (cam_params[30] - cx)
+        cy += τ * (cam_params[31] - cy)
+        cz += τ * (cam_params[32] - cz)
+        ef0 += τ * (cam_params[34] - ef0); ef1 += τ * (cam_params[35] - ef1)
+        ef2 += τ * (cam_params[36] - ef2); ef3 += τ * (cam_params[37] - ef3)
+        er0 += τ * (cam_params[38] - er0); er1 += τ * (cam_params[39] - er1)
+        er2 += τ * (cam_params[40] - er2); er3 += τ * (cam_params[41] - er3)
+        eu0 += τ * (cam_params[42] - eu0); eu1 += τ * (cam_params[43] - eu1)
+        eu2 += τ * (cam_params[44] - eu2); eu3 += τ * (cam_params[45] - eu3)
+        ut0 += τ * (cam_params[46] - ut0); ut1 += τ * (cam_params[47] - ut1)
+        ut2 += τ * (cam_params[48] - ut2); ut3 += τ * (cam_params[49] - ut3)
+    end
 
     # Sensor coordinate with subpixel jitter (fw/fh: full sensor size, which
     # differs from the dispatch size only in a LAYER sub-grid pass).
@@ -984,22 +1028,43 @@ end
 # ---------------------------------------------------------------------------
 
 """
-28-float camera parameter block: position, fov, the KS tetrad, and the
-projection. `fisheye_deg > 0` selects an equidistant fisheye with that
+Length of the camera parameter buffer.
+
+`1:20` is the pose — position, fov factor, and the orthonormal tetrad
+(forward / right / up / observer 4-velocity). `21:22` is the fisheye flag and
+half-angle, `23:28` the thin-lens stratum, aperture radius and pass seed.
+
+`29:49` is the motion-blur block: `29` is the per-pixel shutter hash seed (0
+disables it) and `30:49` is a second copy of the `1:20` pose, at the far end of
+this pass's shutter stratum. When it is on, each pixel draws its own time
+inside the stratum and interpolates between the two poses, so the frame does
+not resolve into `samples²` sharp ghosts of itself. See the kernel's
+per-pixel-shutter block.
+"""
+const CAM_PARAMS_N = 49
+
+# The pose block, 1:20 and mirrored at 30:49.
+const CAM_POSE_N = 20
+
+"""
+Camera parameter block: position, fov, the KS tetrad, the projection, and the
+motion-blur end pose. `fisheye_deg > 0` selects an equidistant fisheye with that
 vertical half-angle at the image's top edge (pixel radius ∝ view angle, so
 fields wider than 180° render cleanly — a rectilinear pinhole caps below
-180° at any focal length).
+180° at any focal length). See [`CAM_PARAMS_N`](@ref) for the layout.
 """
 function _ks_cam_params(cam::Camera, M::Float64; fisheye_deg::Real=0.0,
                         focus_dist::Real=1.0,
                         beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
     u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
                                       cam.up_local, M; beta=beta)
-    return Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
-                   Ef..., Er..., Eu..., u4...,
-                   fisheye_deg > 0 ? 1.0 : 0.0, deg2rad(max(fisheye_deg, 0.0)),
-                   0.0, 0.0, focus_dist,
-                   0.0, 0.0, 0.0]   # lens stratum origin/width, radius, seed
+    p = Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
+                Ef..., Er..., Eu..., u4...,
+                fisheye_deg > 0 ? 1.0 : 0.0, deg2rad(max(fisheye_deg, 0.0)),
+                0.0, 0.0, focus_dist,
+                0.0, 0.0, 0.0]   # lens stratum origin/width, radius, seed
+    # Motion-blur block off: seed 0, end pose unused.
+    return vcat(p, zeros(Float32, CAM_PARAMS_N - length(p)))
 end
 
 """
@@ -1162,7 +1227,7 @@ function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
     nmax = min(max(ctx.nmax,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt32)),
                40_000)
-    cam_params = MtlVector{Float32}(undef, 28)
+    cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
     spacetime_params = MtlVector{Float32}(undef, 4)
     copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
                                        fisheye_deg=fisheye_deg, beta=beta))
@@ -1229,7 +1294,8 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           aperture_world::Real=0.0, focus_dist::Real=1.0,
                           relativistic::Bool=false,
                           beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
-                          camera_at::Union{Function,Nothing}=nothing)
+                          camera_at::Union{Function,Nothing}=nothing,
+                          per_pixel_shutter::Bool=false)
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
@@ -1241,7 +1307,7 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
 
     # Own parameter buffers: preview frames may update ctx's buffers while the
     # draft's tiles are still dispatching.
-    cam_params = MtlVector{Float32}(undef, 28)
+    cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
     spacetime_params = MtlVector{Float32}(undef, 4)
     base_params = _ks_cam_params(cam, spacetime.M; fisheye_deg=fisheye_deg,
                                  focus_dist=focus_dist, beta=beta)
@@ -1269,16 +1335,35 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     # strata pair randomly with the pixel-jitter strata) and every pixel
     # hashes its own point inside it — see the kernel's stratified-lens block.
     lens_perm = Random.randperm(rng, samples^2)
-    # Motion blur: each pass likewise owns one stratified shutter time,
-    # permuted independently so time strata pair randomly with the others.
+    # Motion blur: each pass owns one shutter *stratum*, permuted independently
+    # so time strata pair randomly with the others. By default the pass renders
+    # from the stratum's midpoint — midpoint quadrature, which converges fastest
+    # on smooth motion. With `per_pixel_shutter` both ends go to the GPU and
+    # each pixel picks its own instant between them; see the measured trade in
+    # the kernel's per-pixel-shutter block.
     time_perm = Random.randperm(rng, samples^2)
     for (pass, (du, dv)) in enumerate(offsets)
         if camera_at !== nothing
-            s = (time_perm[pass] - 1 + rand(rng)) / samples^2
-            cam_s, beta_s = camera_at(s)
-            base_params = _ks_cam_params(cam_s, spacetime.M;
-                                         fisheye_deg=fisheye_deg,
-                                         focus_dist=focus_dist, beta=beta_s)
+            m = time_perm[pass] - 1
+            if per_pixel_shutter
+                cam_a, beta_a = camera_at(m / samples^2)
+                cam_b, beta_b = camera_at((m + 1) / samples^2)
+                base_params = _ks_cam_params(cam_a, spacetime.M;
+                                             fisheye_deg=fisheye_deg,
+                                             focus_dist=focus_dist, beta=beta_a)
+                endp = _ks_cam_params(cam_b, spacetime.M;
+                                      fisheye_deg=fisheye_deg,
+                                      focus_dist=focus_dist, beta=beta_b)
+                # Seed kept clear of the lens hashes (which use `pass` and
+                # `pass + 7919`), so time and aperture decorrelate per pixel.
+                base_params[29] = Float32(104729 + pass)
+                base_params[30:(29 + CAM_POSE_N)] .= @view endp[1:CAM_POSE_N]
+            else
+                cam_s, beta_s = camera_at((m + 0.5) / samples^2)
+                base_params = _ks_cam_params(cam_s, spacetime.M;
+                                             fisheye_deg=fisheye_deg,
+                                             focus_dist=focus_dist, beta=beta_s)
+            end
         end
         if use_dof
             m = lens_perm[pass] - 1
@@ -1582,8 +1667,10 @@ function sky_fan_kernel!(fan, cam_params, sky_params, nmax, dt, band)
 end
 
 """
-    sky_composite_kernel!(out, bg, fan, layer, cam_params, spacetime_params,
-                          sky_params, width, height, lw, lh)
+    sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
+                          spacetime_params, sky_params, star_params, bb_lut,
+                          width, height, lw, lh, ju, jv, accumulate,
+                          row0, rows)
 
 Per display pixel: build the pixel ray exactly like the trace kernel, find
 its local angle ψ to the radial axis (`ê_r` in `sky_params[1:4]`), look up
@@ -1594,7 +1681,8 @@ Near-critical fan entries (neighbours disagreeing in escape or direction)
 fall back to the nearest entry — a sub-pixel zone at the photon ring.
 """
 function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
-                               spacetime_params, sky_params,
+                               spacetime_params, sky_params, star_params,
+                               bb_lut,
                                width, height, lw, lh, ju, jv, accumulate,
                                row0, rows)
     idx = thread_position_in_grid().x
@@ -1693,6 +1781,20 @@ function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
         φbg = atan(dy, dx)
         sky_r, sky_g, sky_b = sample_background_mtl(bg, θbg, φbg,
                                                     size(bg, 2), size(bg, 3))
+        # Procedural stars, as in the trace kernel: evaluated along the
+        # asymptotic direction, so the fan's exact deflection lenses them the
+        # same way it lenses the texture. `star_params[16]` dims the texture,
+        # so the two crossfade rather than only swapping.
+        if star_params[1] > 0.0f0
+            dl = max(sqrt(dx * dx + dy * dy + dz * dz), 1.0f-20)
+            tw = star_params[16]
+            sky_r *= tw; sky_g *= tw; sky_b *= tw
+            sr, sg, sb = starfield_mtl(dx / dl, dy / dl, dz / dl,
+                                       star_params, bb_lut)
+            sky_r += star_params[1] * sr
+            sky_g += star_params[1] * sg
+            sky_b += star_params[1] * sb
+        end
         if scam != 1.0f0
             sky_r *= 57.4f0 / (exp(4.067f0 / scam) - 1.0f0)
             sky_g *= 90.2f0 / (exp(4.513f0 / scam) - 1.0f0)
@@ -1818,7 +1920,7 @@ SkyFanState(; n::Int=4096, n_fine::Int=1024) = SkyFanState(
     MtlArray{Float32,2}(undef, 4, n),
     MtlArray{Float32,2}(undef, 4, n_fine),
     MtlVector{Float32}(undef, 12),
-    MtlVector{Float32}(undef, 28))
+    MtlVector{Float32}(undef, CAM_PARAMS_N))
 
 """
     update_sky_fan!(sky::SkyFanState, ctx, pos, spacetime; gate, dt=0.02)
@@ -1941,13 +2043,15 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
         _COMPOSITE_KERNEL[] = @metal launch=false sky_composite_kernel!(
             comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out,
             ctx.cam_params, ctx.spacetime_params, sky.sky_params,
+            ctx.star_params, ctx.bb_lut,
             width, height, lw, lh, Float32(ju), Float32(jv), acc, row0, rows)
     end
     kern = _COMPOSITE_KERNEL[]
     n = width * rows
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
     kern(comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out, ctx.cam_params,
-         ctx.spacetime_params, sky.sky_params, width, height, lw, lh,
+         ctx.spacetime_params, sky.sky_params, ctx.star_params, ctx.bb_lut,
+         width, height, lw, lh,
          Float32(ju), Float32(jv), acc, row0, rows;
          threads=threads, groups=cld(n, threads))
     return nothing
