@@ -110,8 +110,23 @@ Build a volumetric disc for `disc`'s annulus around a black hole of mass `M`.
   the whole argument by not being a modulation: the detail field is subtracted
   from the base as a threshold, producing near-binary edges, and a ray either
   passes through a hole or it does not. See [`_shape_coverage`](@ref).
-  Because erosion only removes gas, the disc gets dimmer as it rises — expect
-  to raise `opacity_scale`/`emission_scale` alongside it.
+
+  Measured on the differential instrument (a `turbulence=0` render subtracted
+  from each, so shadow and caustics cancel), as image power by wavelength:
+
+  | erosion | λ>32px | 8–32px | 2–8px | gas left | `opacity_scale` |
+  |---|---|---|---|---|---|
+  | 0 (shipped) | 1.00× | 1.00× | 1.00× | 1.00× | 1.2 |
+  | 0.5 | 1.49× | 1.67× | 1.76× | 0.62× | 1.9 |
+  | 0.7 | 1.67× | 1.84× | **2.19×** | 0.46× | 2.6 |
+  | 0.85 | 1.70× | 1.77× | **2.39×** | 0.36× | 3.4 |
+
+  The gain is frequency-selective — past 0.7 the mid band *falls* while the
+  fine band keeps climbing, i.e. energy moves from mid to fine, which is what
+  a detail gain looks like as opposed to a contrast gain. Erosion only ever
+  removes gas, so raise `opacity_scale` by the tabulated factor to hold the
+  disc's brightness and let the carve read as structure rather than as a
+  dimmer disc. Around 0.7 with `opacity_scale=2.6` is the useful setting.
 - `erosion_scale` / `erosion_octaves`: frequency multiplier and depth of the
   carving field, relative to the base shape noise. The default 4× puts the
   coarsest carve just below the finest shape octave.

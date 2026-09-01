@@ -2,10 +2,11 @@
     julia_main() -> Cint
 
 Entry point for the standalone SpaceTime app built with PackageCompiler's
-`create_app`: boots the real-time flythrough with the bundled starmap. The
-built executable should be launched with `--julia-args -t auto,1` so render
-workers don't starve the UI thread. Set `SPACETIME_SMOKE=1` to auto-close
-after ~10 s (build smoke tests).
+`create_app`: boots the real-time simulator ([`fly_native`](@ref)) with the
+bundled starmap. `fly_native` runs the window loop on the calling thread and
+returns when it closes, so no thread pinning is needed. Set `SPACETIME_SMOKE=1`
+to auto-close after ~8 s (build smoke tests), and `RES=1080|1440|2160` to pick
+the render resolution.
 """
 function julia_main()::Cint
     try
@@ -29,15 +30,13 @@ function julia_main()::Cint
         cam = Camera(SVector(30.0, 1.1, 1.6), SVector(0.0, 0.0, 0.0),
                      SVector(0.0, 0.0, 1.0), Lens(24.0))
 
-        fig = flythrough(cam, spacetime, bg; disc=disc, volume=volume)
-
-        if get(ENV, "SPACETIME_SMOKE", "0") == "1"
-            @async begin
-                sleep(10.0)
-                GLMakie.closeall()
-            end
-        end
-        wait(GLMakie.Makie.getscreen(fig.scene))
+        res = get(Dict("1080" => (1920, 1080), "1440" => (2560, 1440),
+                       "2160" => (3840, 2160)),
+                  get(ENV, "RES", "1440"), (2560, 1440))
+        fly_native(cam, spacetime, bg; disc=disc, volume=volume,
+                   width=res[1], height=res[2],
+                   max_seconds=get(ENV, "SPACETIME_SMOKE", "0") == "1" ?
+                               8.0 : Inf)
         return 0
     catch err
         Base.showerror(stderr, err, catch_backtrace())

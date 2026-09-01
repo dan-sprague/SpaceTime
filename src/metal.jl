@@ -178,12 +178,12 @@ correction.
 function set_starfield!(ctx::MetalPreviewContext; strength::Real=1.0,
                         texture_weight::Real=0.0,
                         height::Union{Int,Nothing}=nothing,
-                        fov_factor::Real=0.55, density::Real=1024,
-                        fill::Real=0.5, flux::Real=0.022,
-                        psf_pixels::Real=1.0,
+                        fov_factor::Real=0.55, density::Real=384,
+                        fill::Real=0.4, flux::Real=0.008,
+                        psf_pixels::Real=0.5,
                         galactic::NTuple{3,Real}=(0.0, 0.0, 1.0),
                         concentration::Real=3.0, temp_min::Real=3000,
-                        temp_max::Real=9000, seed::Integer=12345)
+                        temp_max::Real=16000, seed::Integer=12345)
     H = something(height, ctx.height)
     gx, gy, gz = galactic
     gn = sqrt(gx^2 + gy^2 + gz^2)
@@ -445,7 +445,12 @@ choice: a 4K frame here sits at 0.026°/pixel, already inside that regime.
             w = flux * exp(-d2 * inv2σ2)
 
             ht = _sim_hash(ii, jj, seed + Int32(4))
-            T = tmin + tspan * ht * ht                    # biased cool
+            # Uniform across the range, and the range must *straddle* the LUT's
+            # white-balance temperature: the LUT is the disc's, white-balanced
+            # at `wb_temperature`, so every star below that point renders warm.
+            # A cool-biased draw inside a range that tops out below the white
+            # point makes the whole sky gold.
+            T = tmin + tspan * ht
             frac = (clamp(T, lut_tmin, lut_tmax) - lut_tmin) /
                    max(lut_tmax - lut_tmin, 1.0f-6)
             li = clamp(unsafe_trunc(Int32, frac * (lut_size - 1.0f0) + 0.5f0) +

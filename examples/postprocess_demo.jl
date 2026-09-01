@@ -1,5 +1,5 @@
 # Standalone post-processing app: grade a raw HDR frame saved by the
-# flythrough's "Save raw" button (or save_raw).
+# simulator's raw save (or save_raw).
 #
 # Run with:
 #     julia -t auto,1 --project examples/postprocess_demo.jl <raw.tiff>

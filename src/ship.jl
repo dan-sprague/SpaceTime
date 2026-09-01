@@ -2,7 +2,7 @@
 # Ship dynamics: a massive camera on a true general-relativistic worldline
 # ---------------------------------------------------------------------------
 #
-# The flythrough camera is not a ghost: it is a point mass whose worldline is
+# The simulator's camera is not a ghost: it is a point mass whose worldline is
 # integrated in Cartesian Kerr–Schild coordinates with the same geodesic
 # right-hand side the renderer trusts (`ks_rhs`). Engines off means exact free
 # fall — orbits, plunges, and zero on the accelerometer. Engines on apply a

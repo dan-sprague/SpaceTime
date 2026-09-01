@@ -467,7 +467,14 @@ camera to the GR ship instead ([`ShipState`](@ref)): thrust, free fall,
 retro-burn (Space), time warp (`-`/`=`) — the viewport still renders from
 the local reference observer.
 
-Other keys: drag to look; Z/C roll; V volumetric gas; R relativistic
+The sky is the **procedural starfield** by default, not the equirectangular
+starmap: a fixed angular texture magnifies into blobs exactly where lensing
+stretches the sky hardest, at the photon ring. `B` cycles stars → starmap →
+both; `starfield=false` restores the texture, and `star_texture_weight` keeps
+some of it under the stars (the map is good at diffuse Milky Way glow and bad
+at point sources). Needs a `disc` for the blackbody LUT that colours stars.
+
+Other keys: drag to look; Z/C roll; V volumetric gas; B sky; R relativistic
 shading; L lens (rectilinear/fisheye); **1/2/3/4 grade presets**
 (neutral / film / hectic / **porthole** — the escape-video recipe:
 hue-preserving ACES, gamma-0.2 crush, 4-spike streaks, grain); T/G
@@ -484,10 +491,27 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     winwidth::Int=1600, winheight::Int=900,
                     fan_n::Int=4096,
                     title::String="Spacetime Simulator",
+                    starfield::Bool=true, star_texture_weight::Real=0.0,
+                    star_psf_pixels::Real=1.0,
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
     ctx = MetalPreviewContext(background, width, height;
                               dt=0.1, nmax=1000, disc=disc, volume=volume)
+
+    # Procedural stars in place of the starmap. The 4k equirectangular texture
+    # is a fixed angular grid, so lensing magnifies its texels into visible
+    # blobs wherever the deflection stretches the sky — worst exactly at the
+    # photon ring, where the interesting structure is. The procedural field is
+    # evaluated along the asymptotic direction at the pixel's own footprint, so
+    # stars stay point-like at every resolution and under any magnification.
+    # Star colour needs the disc's blackbody LUT, so this needs a disc.
+    star_tw = Float64(star_texture_weight)
+    star_on = starfield && disc !== nothing
+    if star_on
+        set_starfield!(ctx; strength=1.0, texture_weight=star_tw,
+                       height=height, fov_factor=cam.fov_factor,
+                       psf_pixels=star_psf_pixels)
+    end
 
     GLFW.WindowHint(GLFW.CLIENT_API, GLFW.NO_API)
     win = GLFW.CreateWindow(winwidth, winheight, title)
@@ -507,6 +531,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     exposure = 1.0f0        # display transform (T/G keys)
     filmic = true           # ACES-style display curve (P toggles)
     grade_rev = 0           # bumped on any grade change (re-presents stills)
+    sky_mode = 0            # 0 procedural stars, 1 starmap, 2 both (B cycles)
     function apply_grade!(n)
         # Bloom thresholds sit above star brightness (~1 linear): the bloom
         # chain is quarter-res, and thresholds that let ordinary stars in
@@ -650,6 +675,16 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             set_volume_enabled!(ctx, !ctx.vol_on[])
         pressed_once(GLFW.KEY_R) && (relativistic = !relativistic)
         pressed_once(GLFW.KEY_L) && (fisheye = fisheye > 0.0 ? 0.0 : 100.0)
+        # B cycles the sky: procedural stars → the starmap → both. Direct A/B
+        # is the only honest way to judge a starfield.
+        if star_on && pressed_once(GLFW.KEY_B)
+            sky_mode = (sky_mode + 1) % 3
+            set_starfield!(ctx;
+                           strength=sky_mode == 1 ? 0.0 : 1.0,
+                           texture_weight=sky_mode == 0 ? star_tw : 1.0,
+                           height=height, fov_factor=18.0 / focal,
+                           psf_pixels=star_psf_pixels)
+        end
         if pressed_once(GLFW.KEY_P)
             filmic = !filmic
             set_grade!(presenter; filmic=filmic)
@@ -687,7 +722,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         fwd, right, _ = _flycam_basis(state)
         upr = _flycam_up(state)
         if flight
-            # GR ship: same model as the flythrough's flight mode.
+            # GR ship: the point-mass worldline of `src/ship.jl`.
             dτ = twarp * dwall
             acc = SVector(
                 (down(GLFW.KEY_W) ? 1.0 : 0.0) - (down(GLFW.KEY_S) ? 1.0 : 0.0),
@@ -744,7 +779,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         # — stills get offline sharpness), parked (nothing to render; the
         # layer retains the last drawable and the GPU idles).
         sig = (state.pos, state.yaw, state.pitch, state.roll, fisheye,
-               relativistic, ctx.vol_on[], grade_rev)
+               relativistic, ctx.vol_on[], grade_rev, sky_mode)
         cam_now = build_cam()
         if sig != last_sig
             if haskey(ENV, "SPACETIME_DEBUG") && last_sig !== nothing
@@ -774,7 +809,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     frame_ms = 16.0
                 end
                 # Coarser rungs also march the gas more coarsely — the
-                # in-slab flythrough cost is dominated by volume sampling.
+                # in-slab cost is dominated by volume sampling.
                 want = rung == 1 ? 2 : 4
                 if want != cur_stride
                     set_march_stride!(ctx, want)

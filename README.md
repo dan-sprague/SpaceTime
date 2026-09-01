@@ -76,14 +76,17 @@ julia --project -e 'using Pkg; Pkg.instantiate()'
 julia -t auto,1 --project examples/viewfinder_demo.jl
 
 # Flight simulator: fly around (and into) the black hole in real time
-julia -t auto,1 --project examples/flythrough_demo.jl
+# (RES=1080|1440|2160 picks the render resolution)
+julia --project examples/fly_native_demo.jl
 
 # Offline: the 4K "hero shot" (HERO_LOWRES=1 for a fast draft)
 julia -t auto --project examples/hero_shot.jl
 ```
 
 The `-t auto,1` launch matters for the GLMakie apps: renders run on worker
-threads while thread 1 stays interactive for the UI.
+threads while thread 1 stays interactive for the UI. The simulator needs no
+thread flags — it is a bare Metal window with no Makie, and the traced frame
+never leaves the GPU.
 
 ## Rendering videos
 
@@ -143,7 +146,7 @@ src/
   raytrace.jl        CPU renderer (DiffEq, static-observer tetrad)
   metal.jl           GPU renderer (Metal kernel, Kerr–Schild, DoF, reprojection)
   viewfinder.jl      camera tetrads + interactive photography app
-  flythrough.jl      real-time flight app
+  native_shell.jl    real-time simulator (bare Metal window, layered engine)
   disc_volume.jl     volumetric accretion disc
   disc_sim.jl        live fluid simulation on the disc grid
   blackbody.jl       Planck emission, white balance
