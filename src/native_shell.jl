@@ -20,7 +20,7 @@
 
 using GLFW
 using ObjectiveC: @objc, id, Object
-using Libdl: dlopen
+using Libdl: dlopen, dlsym
 using Metal: MTL
 
 # CGSize for -[CAMetalLayer setDrawableSize:] (two Cdoubles on 64-bit).
@@ -195,6 +195,7 @@ function _pack_bgra_kernel!(dst, src, bloomg, bloomw, blooms,
     g_wbr = grade[6]; g_wbg = grade[7]; g_wbb = grade[8]
     g_bloom = grade[9]; g_hue = grade[11]; g_gp = grade[12]
     g_grain = grade[13]; g_sfrac = grade[14]; g_sgain = grade[15]
+    g_qlev = grade[17]; g_dith = grade[18]
     e = g_exp * escale
     r = src[1, x, j] * e * g_wbr
     g = src[2, x, j] * e * g_wbg
@@ -271,6 +272,23 @@ function _pack_bgra_kernel!(dst, src, bloomg, bloomw, blooms,
     r = clamp(r, 0.0f0, 1.0f0)
     g = clamp(g, 0.0f0, 1.0f0)
     b = clamp(b, 0.0f0, 1.0f0)
+    # Arcade palette: quantize each channel to `g_qlev` levels, with a 4x4
+    # Bayer ordered dither so the disc's smooth temperature ramp breaks into
+    # a stable pattern instead of hard bands. Ordered rather than random on
+    # purpose — the pattern is fixed to the pixel grid, so it does not crawl
+    # when the camera moves, which is the failure mode that makes low-res
+    # rendering read as broken rather than stylised.
+    if g_qlev > 1.5f0
+        # 4x4 Bayer from the recursive 2x2 definition, branch-free.
+        bx0 = Int32((x - 1) & 1);  by0 = Int32((j - 1) & 1)
+        bx1 = Int32(((x - 1) >> 1) & 1);  by1 = Int32(((j - 1) >> 1) & 1)
+        m = 4 * (2 * bx1 + by1 * (3 - 4 * bx1)) + (2 * bx0 + by0 * (3 - 4 * bx0))
+        d = g_dith * ((Float32(m) + 0.5f0) * 0.0625f0 - 0.5f0)
+        L = g_qlev - 1.0f0
+        r = clamp(floor(r * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
+        g = clamp(floor(g * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
+        b = clamp(floor(b * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
+    end
     dst[i] = unsafe_trunc(UInt32, r * 255.0f0 + 0.5f0) << 16 |
              unsafe_trunc(UInt32, g * 255.0f0 + 0.5f0) << 8 |
              unsafe_trunc(UInt32, b * 255.0f0 + 0.5f0) | 0xff000000
@@ -300,8 +318,9 @@ mutable struct MetalPresenter{Q}
     height::Int
 end
 
-function MetalPresenter(win::GLFW.Window, width::Int, height::Int)
-    dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore")
+function MetalPresenter(win::GLFW.Window, width::Int, height::Int;
+                        nearest::Bool=false)
+    qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore")
     nsview = ccall((:glfwGetCocoaView, GLFW.libglfw), Ptr{Cvoid},
                    (Ptr{Cvoid},), win.handle)
     nsview == C_NULL && error("no Cocoa view for the GLFW window")
@@ -312,10 +331,22 @@ function MetalPresenter(win::GLFW.Window, width::Int, height::Int)
     @objc [layer::id{Object} setPixelFormat:UInt64(80)::UInt64]::Nothing  # BGRA8Unorm
     @objc [layer::id{Object} setFramebufferOnly:false::Bool]::Nothing
     @objc [layer::id{Object} setDrawableSize:_CGSize(width, height)::_CGSize]::Nothing
+    if nearest
+        # Arcade mode renders at a low internal resolution and lets the
+        # compositor blow it up. The default CAMetalLayer magnification filter
+        # is linear, which turns pixel art into mush; `kCAFilterNearest` keeps
+        # the pixel grid hard. Doing it here rather than in a shader means the
+        # upscale is free — the window server was going to scale the drawable
+        # either way.
+        nf = unsafe_load(convert(Ptr{id{Object}}, dlsym(qc, :kCAFilterNearest)))
+        @objc [layer::id{Object} setMagnificationFilter:nf::id{Object}]::Nothing
+        @objc [layer::id{Object} setMinificationFilter:nf::id{Object}]::Nothing
+    end
     @objc [view::id{Object} setWantsLayer:true::Bool]::Nothing
     @objc [view::id{Object} setLayer:layer::id{Object}]::Nothing
     queue = Metal.global_queue(dev)
-    grade_host = Float32[1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0.4545, 0, 0, 0, 0]
+    grade_host = Float32[1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0.4545, 0, 0, 0,
+                         0, 0, 0]
     grade = MtlArray(grade_host)
     bw, bh = cld(width, 4), cld(height, 4)
     ww, wh = cld(bw, 2), cld(bh, 2)
@@ -351,11 +382,14 @@ function set_grade!(p::MetalPresenter; exposure::Real=p.grade_host[1],
                     gamma_power::Real=p.grade_host[12],
                     grain::Real=p.grade_host[13],
                     streak_fraction::Real=p.grade_host[14],
-                    streak_gain::Real=p.grade_host[15])
+                    streak_gain::Real=p.grade_host[15],
+                    quantize::Real=p.grade_host[17],
+                    dither::Real=p.grade_host[18])
     p.grade_host .= Float32[exposure, filmic ? 1 : 0, crush, saturation,
                             vignette, wb[1], wb[2], wb[3], bloom,
                             bloom_threshold, hue_preserve, gamma_power,
-                            grain, streak_fraction, streak_gain, 0]
+                            grain, streak_fraction, streak_gain, 0,
+                            quantize, dither]
     copyto!(p.grade, p.grade_host)
     return nothing
 end
@@ -504,7 +538,7 @@ supersampled still, then the GPU parks until something changes.
 Telemetry lives in the window title. Runs on the calling (main) thread
 until the window closes.
 """
-function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
+function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, background;
                     disc::Union{AccretionDisc,Nothing}=nothing,
                     volume::Union{DiscVolume,Nothing}=nothing,
                     width::Int=960, height::Int=540,
@@ -514,8 +548,16 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     starfield::Bool=true, star_texture_weight::Real=0.0,
                     star_psf_pixels::Real=1.0,
                     quality::Symbol=:balanced, ring_rmin::Real=4.0,
+                    arcade::Bool=(spin(spacetime) != 0),
+                    quantize::Real=0, dither::Real=1.0,
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
+    # Arcade mode. The deflection fan needs spherical symmetry, so Kerr cannot
+    # use it -- a Kerr "fan" would be a 2D table the size of the frame. Every
+    # pixel is traced directly instead, which is only affordable at a low
+    # internal resolution, which is exactly the pixel-art look. On by default
+    # for any spinning spacetime; the layered Schwarzschild engine below is
+    # untouched and still runs whenever this is off.
     ctx = MetalPreviewContext(background, width, height;
                               dt=0.1, nmax=1000, disc=disc, volume=volume)
 
@@ -536,7 +578,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
 
     GLFW.WindowHint(GLFW.CLIENT_API, GLFW.NO_API)
     win = GLFW.CreateWindow(winwidth, winheight, title)
-    presenter = MetalPresenter(win, width, height)
+    presenter = MetalPresenter(win, width, height; nearest=arcade)
 
     # Camera state (single-threaded: no locks needed).
     state = FlyCamState(cam)
@@ -675,7 +717,16 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # the clock starts: first-call compilation costs seconds and would
     # otherwise hitch the opening frames.
     apply_grade!(2)   # default look: the film preset
+    # Palette settings survive every later `apply_grade!`, because `set_grade!`
+    # defaults them to whatever is already in the buffer.
+    set_grade!(presenter; quantize=quantize, dither=dither)
     let cam0 = build_cam()
+        if arcade
+            _trace_preview_gpu!(ctx, cam0, spacetime)
+            Metal.synchronize()
+            present!(presenter, ctx.out_gpu)
+            @goto warmed
+        end
         update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate)
         if ctx.has_volume
             set_volume_enabled!(ctx, false)
@@ -687,6 +738,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                             spacetime; trace_layer=layer_on)
         Metal.synchronize()
         present!(presenter, ctx.out_gpu)
+        @label warmed
     end
 
     down(k) = GLFW.GetKey(win, k)
@@ -903,6 +955,14 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             passes = 0
             refine_row = 0
             t0 = time()
+            if arcade
+                # One direct trace per frame, no fan and no layer ladder: at
+                # arcade resolutions the whole frame is cheaper than the fan
+                # alone would be, and there is nothing to schedule.
+                _trace_preview_gpu!(ctx, cam_now, spacetime;
+                                    fisheye_deg=fisheye,
+                                    relativistic=relativistic)
+            else
             update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
             if layer_on
                 # Fresh gas every frame — no history, nothing to echo. The
@@ -959,6 +1019,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                                     relativistic=relativistic,
                                     trace_layer=false)
             end
+            end
             # Keep input live while the GPU finishes. The deadline is its own
             # state, NOT a fraction of `frame_ms`: deriving it from the frame
             # time it is itself padding makes the loop self-sustaining. With
@@ -993,7 +1054,8 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
             last_move_time = time()
             nframes += 1
-        elseif passes < REFINE_PASSES && wall - last_move_time > 0.15
+        elseif !arcade && passes < REFINE_PASSES &&
+               wall - last_move_time > 0.15
             # At rest: time-sliced progressive refinement. Full-resolution
             # jittered passes (R2 low-discrepancy sequence) keep summing
             # into `accum` — every pass is real rays, so the still image

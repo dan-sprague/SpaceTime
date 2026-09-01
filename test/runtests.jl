@@ -566,3 +566,81 @@ end
                   SVector(0.0, 0.0, 1.0), Lens(24.0))
     @test SpaceTime._ring_screen_box(deep, M, R, 0.0, rw, rh) === nothing
 end
+
+@testset "Kerr metric" begin
+    # Kerr must reduce to Schwarzschild at a = 0 — not approximately, but as
+    # the same algebra in the same chart — and must conserve what Kerr
+    # conserves. Both are checked against the shipping Schwarzschild kernel
+    # and against exact invariants, so an algebra slip cannot hide behind a
+    # plausible-looking picture.
+    @test_throws ArgumentError Kerr(1.0, 1.5)          # |a| <= M
+    @test Kerr(1.0, 0.6).a == 0.6
+    @test SpaceTime.horizon_radius(Schwarzschild(1.0)) ≈ 2.0
+    @test SpaceTime.horizon_radius(Kerr(1.0, 0.6)) ≈ 1.0 + sqrt(1 - 0.36)
+    @test SpaceTime.horizon_radius(Kerr(1.0, 1.0)) ≈ 1.0        # extremal
+    @test SpaceTime.spin(Schwarzschild(1.0)) == 0.0
+
+    # Prograde photon orbit: 3M static, M extremal, monotone between.
+    @test SpaceTime.photon_orbit_min(Schwarzschild(1.0)) ≈ 3.0
+    @test SpaceTime.photon_orbit_min(Kerr(1.0, 0.0)) ≈ 3.0
+    @test SpaceTime.photon_orbit_min(Kerr(1.0, 1.0)) ≈ 1.0 atol = 1e-9
+    @test SpaceTime.photon_orbit_min(Kerr(1.0, 0.9)) <
+          SpaceTime.photon_orbit_min(Kerr(1.0, 0.5))
+    # It must sit strictly outside the horizon, or the capture test it drives
+    # would eat sky (or let the shadow leak).
+    for a in (0.0, 0.3, 0.6, 0.9, 0.99)
+        @test SpaceTime.photon_orbit_min(Kerr(1.0, a)) >=
+              SpaceTime.horizon_radius(Kerr(1.0, a)) - 1e-12
+    end
+
+    # a = 0 reduction of the geodesic RHS, in Float64 so this measures algebra
+    # rather than Float32 rounding.
+    K, S = SpaceTime.kerr_rhs_mtl, SpaceTime.ks_rhs_mtl
+    rng = Random.MersenneTwister(7)
+    worst = 0.0
+    for _ in 1:5000
+        x, y, z, px, py, pz = randn(rng, 6) .* 3
+        x^2 + y^2 + z^2 < 4 && continue
+        k = collect(K(x, y, z, px, py, pz, -1.0, 1.0, 0.0))
+        c = collect(S(x, y, z, px, py, pz, -1.0, 1.0))
+        worst = max(worst, maximum(abs.(k .- c) ./ max.(abs.(c), 1e-3)))
+    end
+    @test worst < 1e-9
+
+    # Axisymmetry: L_z = x·p_y − y·p_x is conserved along any Kerr geodesic.
+    # This is the invariant that actually exercises the spin terms.
+    function lz_drift(a; h = 0.005, nmax = 20000)
+        x, y, z = 12.0, 0.7, 0.9
+        px, py, pz = -1.0, 0.15, 0.05
+        Lz0 = x * py - y * px
+        rp = SpaceTime.horizon_radius(Kerr(1.0, a))
+        worst = 0.0
+        for _ in 1:nmax
+            sqrt(x^2 + y^2 + z^2) < 1.15rp + 0.35 && break
+            sqrt(x^2 + y^2 + z^2) > 80 && break
+            f(X, Y, Z, PX, PY, PZ) = K(X, Y, Z, PX, PY, PZ, -1.0, 1.0, a)
+            k1 = f(x, y, z, px, py, pz)
+            k2 = f(x + 0.5h*k1[1], y + 0.5h*k1[2], z + 0.5h*k1[3],
+                   px + 0.5h*k1[4], py + 0.5h*k1[5], pz + 0.5h*k1[6])
+            k3 = f(x + 0.5h*k2[1], y + 0.5h*k2[2], z + 0.5h*k2[3],
+                   px + 0.5h*k2[4], py + 0.5h*k2[5], pz + 0.5h*k2[6])
+            k4 = f(x + h*k3[1], y + h*k3[2], z + h*k3[3],
+                   px + h*k3[4], py + h*k3[5], pz + h*k3[6])
+            x += (h/6)*(k1[1]+2k2[1]+2k3[1]+k4[1])
+            y += (h/6)*(k1[2]+2k2[2]+2k3[2]+k4[2])
+            z += (h/6)*(k1[3]+2k2[3]+2k3[3]+k4[3])
+            px += (h/6)*(k1[4]+2k2[4]+2k3[4]+k4[4])
+            py += (h/6)*(k1[5]+2k2[5]+2k3[5]+k4[5])
+            pz += (h/6)*(k1[6]+2k2[6]+2k3[6]+k4[6])
+            worst = max(worst, abs((x*py - y*px) - Lz0) / abs(Lz0))
+        end
+        worst
+    end
+    for a in (0.0, 0.5, 0.9, 0.998)
+        @test lz_drift(a) < 1e-8
+    end
+
+    # The inverse metric agrees with the Schwarzschild one at a = 0.
+    q = SVector(0.0, 6.0, 2.0, 1.5)
+    @test metric_inverse(Kerr(1.0, 0.0), q) ≈ metric_inverse(Schwarzschild(1.0), q)
+end

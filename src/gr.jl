@@ -10,6 +10,64 @@ end
 
 
 """
+    Kerr(M, a)
+
+A rotating black hole of mass `M` and spin parameter `a` (`|a| ≤ M`; `a > 0`
+spins about `+z`). Used by the Metal renderer's Kerr mode, which integrates
+[`kerr_rhs_mtl`](@ref) in the same Cartesian Kerr–Schild chart the
+Schwarzschild path uses, and reduces to it exactly at `a = 0`.
+
+Kerr is axisymmetric rather than spherically symmetric, so deflection is a
+function of two parameters `(λ, η) = (L_z/E, Q/E²)` rather than the single
+angle `ψ`. That is what kills the deflection fan — a Kerr "fan" would be a 2D
+table the size of the image. Everything else the renderer leans on survives:
+`E`, `L_z` and Carter's constant `Q` are still conserved, so the geodesics are
+still integrable and the wound-ray tests still have closed forms.
+"""
+struct Kerr <: AbstractSpacetime
+    M::Float64
+    a::Float64
+    function Kerr(M::Real, a::Real)
+        abs(a) <= M || throw(ArgumentError("|a| must be <= M (got a=$a, M=$M)"))
+        new(Float64(M), Float64(a))
+    end
+end
+
+"""
+    horizon_radius(spacetime)
+
+Outer horizon in Kerr–Schild `r`: `2M` for Schwarzschild, `M + √(M² − a²)` for
+Kerr.
+"""
+horizon_radius(bh::Schwarzschild) = 2.0 * bh.M
+horizon_radius(bh::Kerr) = bh.M + sqrt(max(bh.M^2 - bh.a^2, 0.0))
+
+"""
+    photon_orbit_min(spacetime)
+
+Radius of the **prograde equatorial photon orbit** — the smallest periapsis any
+null geodesic reaching infinity can have, so anything below it is captured:
+
+    r_ph = 2M[1 + cos(⅔ arccos(−a/M))]
+
+`3M` at `a = 0`, falling to `M` at `a = M`. This is the Kerr generalisation of
+the Schwarzschild renderer's `2.95M` shadow test, and it is a *global* bound —
+off-equatorial spherical photon orbits all sit at larger radii — so no
+direction test is needed alongside it.
+"""
+photon_orbit_min(bh::Schwarzschild) = 3.0 * bh.M
+photon_orbit_min(bh::Kerr) =
+    2.0 * bh.M * (1.0 + cos((2.0 / 3.0) * acos(-bh.a / bh.M)))
+
+"""
+    spin(spacetime)
+
+Spin parameter `a`; zero for Schwarzschild.
+"""
+spin(::Schwarzschild) = 0.0
+spin(bh::Kerr) = bh.a
+
+"""
     Schwarzschild Geodesic Equations of Motion
 
 Defines the equations of motion for a photon in the Schwarzschild spacetime,
@@ -51,15 +109,6 @@ function (bh::Schwarzschild)(μ::SVector{8,T},p,t) where T
 end
 
 """
-    Kerr(M, a)
-Represents a Kerr black hole with mass `M` and spin parameter `a`. The Kerr
-"""
-struct Kerr <: AbstractSpacetime
-    M::Float64
-    a::Float64
-end
-
-"""
     Schwarzschild Metric Inverse
 Calculates the inverse of the Schwarzschild metric at a given position `q` in
 Cartesian Kerr–Schild coordinates `(t, x, y, z)`. The Kerr–Schild form
@@ -80,8 +129,27 @@ function metric_inverse(bh::Schwarzschild, q::SVector{4,T}) where T
     return η - f * (lU * lU')
 end
 
+"""
+    Kerr Metric Inverse
+
+Same Kerr–Schild structure as the Schwarzschild case, `g^μν = η^μν − f l^μ l^ν`,
+with the Kerr `f` and `l` (see [`kerr_rhs_mtl`](@ref)) and `r` from the
+implicit quartic `r⁴ − (ρ² − a²)r² − a²z² = 0`.
+"""
 function metric_inverse(bh::Kerr, q::SVector{4,T}) where T
-    @error "Kerr metric not implemented yet"
+    x, y, z = q[2], q[3], q[4]
+    a = bh.a
+    w = x^2 + y^2 + z^2 - a^2
+    r2 = 0.5 * (w + sqrt(w^2 + 4 * a^2 * z^2))
+    r = sqrt(max(r2, eps(Float64)))
+    f = 2 * bh.M * r^3 / (r2^2 + a^2 * z^2)
+    R2A = r2 + a^2
+    lU = SVector{4,T}(-1.0, (r * x + a * y) / R2A, (r * y - a * x) / R2A, z / r)
+    η = @SMatrix [-one(T) zero(T) zero(T) zero(T);
+                  zero(T)  one(T) zero(T) zero(T);
+                  zero(T) zero(T)  one(T) zero(T);
+                  zero(T) zero(T) zero(T)  one(T)]
+    return η - f * (lU * lU')
 end
 
 """ 

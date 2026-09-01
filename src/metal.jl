@@ -109,7 +109,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
     bg_gpu = _upload_background(background)
     out_gpu = MtlArray{Float32,3}(undef, 3, width, height)
     cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 6)
+    spacetime_params = MtlVector{Float32}(undef, 8)
     disc_params = MtlVector{Float32}(undef, 6)
     if isnothing(disc)
         copyto!(disc_params, zeros(Float32, 6))
@@ -304,6 +304,108 @@ function ks_rhs_mtl(x, y, z, px, py, pz, p_t, M)
     dpz = c1 * pz - c2 * z
     return dx, dy, dz, dpx, dpy, dpz
 end
+
+"""
+Pack the spacetime's spin and (padded) squared horizon for the kernel's
+`spacetime_params[7:8]`. The pad keeps rays from grazing the coordinate
+horizon and escaping as phantom sky.
+"""
+function _spin_horizon(spacetime)
+    a = Float32(spin(spacetime))
+    # Kill radius is the prograde photon orbit, not the horizon. Testing only
+    # the horizon lets near-critical rays bounce off the coordinate ridge and
+    # escape as phantom sky — visible as the lensed background reappearing
+    # inside the shadow. Nothing that reaches infinity ever dips below
+    # `photon_orbit_min`, so this needs no inward-motion test; the 0.5% margin
+    # is slack for Float32 error right at the boundary.
+    rk = Float32(0.995 * photon_orbit_min(spacetime))
+    return a, rk * rk
+end
+
+@inline _rhs_mtl(::Val{false}, x, y, z, px, py, pz, p_t, M, a) =
+    ks_rhs_mtl(x, y, z, px, py, pz, p_t, M)
+@inline _rhs_mtl(::Val{true}, x, y, z, px, py, pz, p_t, M, a) =
+    kerr_rhs_mtl(x, y, z, px, py, pz, p_t, M, a)
+
+"""
+    kerr_rhs_mtl(x, y, z, px, py, pz, p_t, M, a)
+
+Float32 null-geodesic RHS for **Kerr** in Cartesian Kerr–Schild coordinates,
+the same chart and Hamiltonian convention as [`ks_rhs_mtl`](@ref), which it
+reduces to exactly at `a = 0`.
+
+`g = η + f l⊗l` with
+
+    r²  = ½[(ρ² − a²) + √((ρ² − a²)² + 4a²z²)]      ρ² = x²+y²+z²
+    Σ   = r⁴ + a²z²
+    f   = 2Mr³/Σ
+    l_μ = (1, (rx + ay)/(r²+a²), (ry − ax)/(r²+a²), z/r)
+
+so `H = ½(−p_t² + |p|² − f ℓ²)` with `ℓ = l^μ p_μ = −p_t + L⃗·p⃗`, giving
+
+    dxⁱ/dλ = pᵢ − f ℓ Lᵢ
+    dpᵢ/dλ = ½ (∂ᵢf) ℓ² + f ℓ (∂ᵢℓ)
+
+`r` is an implicit function of position, so the position derivatives go through
+it: differentiating the quartic `r⁴ − (ρ²−a²)r² − a²z² = 0` gives
+
+    ∂r/∂x = x r³/Σ,   ∂r/∂y = y r³/Σ,   ∂r/∂z = z r (r²+a²)/Σ
+
+Routing both `f` and `ℓ` through `∂r/∂xⁱ` plus their explicit position
+dependence costs four derivative expressions rather than the nine partials a
+direct `∂ᵢLⱼ` expansion would need. `p_t` is conserved; the spacetime is
+stationary and axisymmetric, so `p_φ` is too, but nothing here needs it.
+"""
+@inline function kerr_rhs_mtl(x, y, z, px, py, pz, p_t, M, a)
+    a2 = a * a
+    z2 = z * z
+    w = x * x + y * y + z2 - a2
+    r2 = 0.5f0 * (w + sqrt(w * w + 4.0f0 * a2 * z2))
+    r2 = max(r2, 1.0f-12)
+    r = sqrt(r2)
+    r3 = r2 * r
+    invΣ = 1.0f0 / (r2 * r2 + a2 * z2)
+    R2A = r2 + a2
+    iRA = 1.0f0 / R2A
+    inv_r = 1.0f0 / r
+
+    Lx = (r * x + a * y) * iRA
+    Ly = (r * y - a * x) * iRA
+    Lz = z * inv_r
+    ℓ = -p_t + Lx * px + Ly * py + Lz * pz
+    f = 2.0f0 * M * r3 * invΣ
+    fl = f * ℓ
+
+    # ∂r/∂xⁱ from the implicit quartic.
+    drx = x * r3 * invΣ
+    dry = y * r3 * invΣ
+    drz = z * r * R2A * invΣ
+
+    # f depends on position through r and (explicitly) through z.
+    dfdr = 2.0f0 * M * r2 * (3.0f0 * a2 * z2 - r2 * r2) * invΣ * invΣ
+    dfz0 = -4.0f0 * M * r3 * a2 * z * invΣ * invΣ
+
+    # ℓ likewise: ∂ℓ/∂xⁱ at fixed r, plus ∂ℓ/∂r.
+    dlx0 = (r * px - a * py) * iRA
+    dly0 = (a * px + r * py) * iRA
+    dlz0 = pz * inv_r
+    dldr = (px * (x * R2A - 2.0f0 * r * (r * x + a * y)) +
+            py * (y * R2A - 2.0f0 * r * (r * y - a * x))) * iRA * iRA -
+           z * pz * inv_r * inv_r
+
+    hl2 = 0.5f0 * ℓ * ℓ
+    dpx = hl2 * (dfdr * drx) + fl * (dldr * drx + dlx0)
+    dpy = hl2 * (dfdr * dry) + fl * (dldr * dry + dly0)
+    dpz = hl2 * (dfdr * drz + dfz0) + fl * (dldr * drz + dlz0)
+    return (px - fl * Lx, py - fl * Ly, pz - fl * Lz, dpx, dpy, dpz)
+end
+
+"""
+    kerr_horizon(M, a)
+
+Outer horizon radius `r₊ = M + √(M² − a²)` in Kerr–Schild `r`.
+"""
+kerr_horizon(M, a) = M + sqrt(max(M * M - a * a, 0.0))
 
 """
     sample_background_mtl(bg, theta, phi, W, H)
@@ -546,7 +648,8 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                            substride, subx, suby,
                            ring_rmin,
                            ::Val{VOL}, ::Val{NB},
-                           ::Val{LAYER}, ::Val{ORD}) where {VOL, NB, LAYER, ORD}
+                           ::Val{LAYER}, ::Val{ORD},
+                           ::Val{KERR}) where {VOL, NB, LAYER, ORD, KERR}
     idx = thread_position_in_grid().x
     total = cols * rows
     if idx > total
@@ -580,6 +683,10 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
 
     M = spacetime_params[1]
     r_escape = spacetime_params[3]
+    # Kerr spin, and the squared capture radius in Kerr-Schild r (the prograde
+    # photon orbit — see `_spin_horizon`). Both are inert when !KERR.
+    spin_a = spacetime_params[7]
+    rkill2 = spacetime_params[8]
 
     # Unpack camera position, field of view and the orthonormal tetrad
     # (forward/right/up axes + observer 4-velocity, all contravariant,
@@ -830,7 +937,20 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
             end
             r_layer_prev = r
         end
-        if r < 3.2f0 * M   # strong-field zone: kill checks live only here
+        if KERR
+            # rho != r in Kerr-Schild, so the capture test has to be written
+            # in KS r. The threshold is the prograde photon orbit rather than
+            # the horizon: no ray reaching infinity dips below it, and testing
+            # only the horizon let near-critical rays bounce off the
+            # coordinate ridge and escape as phantom sky.
+            aw = r2 - spin_a * spin_a
+            rk2 = 0.5f0 * (aw + sqrt(aw * aw +
+                           4.0f0 * spin_a * spin_a * z * z))
+            if rk2 < rkill2
+                hit_horizon = true
+                break
+            end
+        elseif r < 3.2f0 * M   # strong-field zone: kill checks live only here
             # Exact criterion: an escaping null geodesic never has a turning
             # point below the photon sphere (periapsis > 3M requires
             # b > b_crit), so a ray moving inward below ~2.95M can never
@@ -856,11 +976,20 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
         # wander to the step limit — slower AND wrong).
         hcap = (VOL && r2 < vol_rb2) ? 2.0f0 : spacetime_params[6]
         h = dt * min(max(spacetime_params[5] * r / M, 1.0f0), hcap)
+        if KERR
+            # The capture radius and the horizon converge as a -> M (1.074M
+            # against 1.063M at a = 0.998), and a step floored at `dt` cannot
+            # resolve that gap — rays cross the band in one step, miss the
+            # test, and escape as phantom sky. Shrink the step as the ray
+            # closes on capture; far away this is a no-op.
+            fr = clamp((rk2 - rkill2) / max(rkill2, 1.0f-6), 0.0f0, 1.0f0)
+            h *= 0.12f0 + 0.88f0 * fr
+        end
 
         xp = x; yp = y; zp = z
         pxp = px; pyp = py; pzp = pz
 
-        k1 = ks_rhs_mtl(x, y, z, px, py, pz, p_t, M)
+        k1 = _rhs_mtl(Val(KERR), x, y, z, px, py, pz, p_t, M, spin_a)
         if NB > 0
             ell += h * sqrt(k1[1] * k1[1] + k1[2] * k1[2] + k1[3] * k1[3])
         end
@@ -933,18 +1062,18 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
         # photon's coordinate velocity — so Euler adds no evaluation at all
         # and midpoint adds exactly one.
         if ORD == 4
-            k2 = ks_rhs_mtl(
+            k2 = _rhs_mtl(Val(KERR), 
                 x + 0.5f0 * h * k1[1], y + 0.5f0 * h * k1[2], z + 0.5f0 * h * k1[3],
                 px + 0.5f0 * h * k1[4], py + 0.5f0 * h * k1[5], pz + 0.5f0 * h * k1[6],
-                p_t, M)
-            k3 = ks_rhs_mtl(
+                p_t, M, spin_a)
+            k3 = _rhs_mtl(Val(KERR), 
                 x + 0.5f0 * h * k2[1], y + 0.5f0 * h * k2[2], z + 0.5f0 * h * k2[3],
                 px + 0.5f0 * h * k2[4], py + 0.5f0 * h * k2[5], pz + 0.5f0 * h * k2[6],
-                p_t, M)
-            k4 = ks_rhs_mtl(
+                p_t, M, spin_a)
+            k4 = _rhs_mtl(Val(KERR), 
                 x + h * k3[1], y + h * k3[2], z + h * k3[3],
                 px + h * k3[4], py + h * k3[5], pz + h * k3[6],
-                p_t, M)
+                p_t, M, spin_a)
 
             x  += (h / 6.0f0) * (k1[1] + 2.0f0 * k2[1] + 2.0f0 * k3[1] + k4[1])
             y  += (h / 6.0f0) * (k1[2] + 2.0f0 * k2[2] + 2.0f0 * k3[2] + k4[2])
@@ -953,10 +1082,10 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
             py += (h / 6.0f0) * (k1[5] + 2.0f0 * k2[5] + 2.0f0 * k3[5] + k4[5])
             pz += (h / 6.0f0) * (k1[6] + 2.0f0 * k2[6] + 2.0f0 * k3[6] + k4[6])
         elseif ORD == 2
-            k2 = ks_rhs_mtl(
+            k2 = _rhs_mtl(Val(KERR), 
                 x + 0.5f0 * h * k1[1], y + 0.5f0 * h * k1[2], z + 0.5f0 * h * k1[3],
                 px + 0.5f0 * h * k1[4], py + 0.5f0 * h * k1[5], pz + 0.5f0 * h * k1[6],
-                p_t, M)
+                p_t, M, spin_a)
             x  += h * k2[1];  y  += h * k2[2];  z  += h * k2[3]
             px += h * k2[4];  py += h * k2[5];  pz += h * k2[6]
         else
@@ -1072,13 +1201,14 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
         # along the way. Sample by the asymptotic momentum direction, not the
         # escape position: position sampling parallax-shifts stars by up to
         # ~b/r_escape radians for disc-grazing rays.
-        inv_rf = 1.0f0 / rf
-        ff = 2.0f0 * M * inv_rf
-        κf = (x * px + y * py + z * pz) * inv_rf
-        c1f = ff * (-p_t + κf) * inv_rf
-        vx = px - c1f * x
-        vy = py - c1f * y
-        vz = pz - c1f * z
+        # Asymptotic direction is the photon's coordinate velocity, i.e. the
+        # integrator's own dx/dλ — correct for Kerr as well as Schwarzschild,
+        # where the previous hand-inlined form was not.
+        vfx, vfy, vfz, _, _, _ = _rhs_mtl(Val(KERR), x, y, z, px, py, pz,
+                                          p_t, M, spin_a)
+        vx = vfx
+        vy = vfy
+        vz = vfz
         vl = max(sqrt(vx * vx + vy * vy + vz * vz), 1.0f-20)
         θbg = acos(clamp(vz / vl, -1.0f0, 1.0f0))
         φbg = atan(vy, vx)
@@ -1162,7 +1292,7 @@ end
 
 """
     render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
-                       spacetime::Schwarzschild)
+                       spacetime::AbstractSpacetime)
 
 Render one preview frame on the GPU using `ctx`.  Returns a `width × height`
 `Matrix{RGBf}` suitable for display.
@@ -1175,7 +1305,7 @@ In-place variant for render loops: writes into a caller-owned `img`
 allocates nothing per frame.
 """
 function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
-                            spacetime::Schwarzschild; fisheye_deg::Real=0.0,
+                            spacetime::AbstractSpacetime; fisheye_deg::Real=0.0,
                             relativistic::Bool=false)
     img = Matrix{RGBf}(undef, ctx.width, ctx.height)
     host = Array{Float32,3}(undef, 3, ctx.width, ctx.height)
@@ -1186,7 +1316,7 @@ end
 
 function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              ctx::MetalPreviewContext, cam::Camera,
-                             spacetime::Schwarzschild; fisheye_deg::Real=0.0,
+                             spacetime::AbstractSpacetime; fisheye_deg::Real=0.0,
                              relativistic::Bool=false,
                              band_rows::Int=0,
                              on_band::Union{Nothing,Function}=nothing)
@@ -1206,7 +1336,7 @@ to the host. The native shell presents `out_gpu` straight to a CAMetalLayer;
 `render_preview_mtl!` adds the host download for CPU consumers.
 """
 function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
-                             spacetime::Schwarzschild; fisheye_deg::Real=0.0,
+                             spacetime::AbstractSpacetime; fisheye_deg::Real=0.0,
                              relativistic::Bool=false,
                              band_rows::Int=0,
                              on_band::Union{Nothing,Function}=nothing)
@@ -1226,15 +1356,17 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
     # Update reusable GPU parameter buffers with a single host-to-device copy.
     copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
                                            fisheye_deg=fisheye_deg))
+    spin_a, rkill2 = _spin_horizon(spacetime)
+    is_kerr = spin_a != 0
     copyto!(ctx.spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
-                    HSTEP_COEF[], HSTEP_CAP[]])
+                    HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
 
     fill!(ctx.out_gpu, 0.0f0)
     if band_rows <= 0 || on_band === nothing
         _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params, ctx.spacetime_params,
                        ctx.width, ctx.height, nmax, dt,
-                       0.5f0, 0.5f0, 1.0f0, 0, ctx.height)
+                       0.5f0, 0.5f0, 1.0f0, 0, ctx.height; kerr=is_kerr)
     else
         # Banded dispatch: split the frame into row bands and call `on_band`
         # after each one, so a flight loop can slot cheap reprojection
@@ -1246,7 +1378,8 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
             rows = min(band_rows, ctx.height - row0)
             _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params,
                            ctx.spacetime_params, ctx.width, ctx.height,
-                           nmax, dt, 0.5f0, 0.5f0, 1.0f0, row0, rows)
+                           nmax, dt, 0.5f0, 0.5f0, 1.0f0, row0, rows;
+                           kerr=is_kerr)
             row0 += rows
             row0 < ctx.height && on_band()
         end
@@ -1266,13 +1399,13 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         fan=nothing, sky_params=nothing, layer::Bool=false,
                         substride::Int=1, subx::Int=0, suby::Int=0,
                         ring_rmin::Real=0.0, col0::Int=0, cols::Int=-1,
-                        order::Int=4)
+                        order::Int=4, kerr::Bool=false)
     cols < 0 && (cols = width)
     von = ctx.vol_on[]
     fan_b = fan === nothing ? _dummy_fan() : fan
     skyp_b = sky_params === nothing ? _dummy_skyp() : sky_params
     kernels = ctx.kernel[]::Dict{Any,Any}
-    key = (von, nb, layer, order)
+    key = (von, nb, layer, order, kerr)
     if !haskey(kernels, key)
         kernels[key] = @metal launch=false trace_kernel_mtl!(
             out, ctx.bg_gpu, ctx.bb_lut, ctx.star_lut, ctx.vol_gpu,
@@ -1281,7 +1414,7 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
             fan_b, skyp_b,
             width, height, nmax, dt, ju, jv, weight, row0, rows,
             col0, cols, substride, subx, suby, Float32(ring_rmin),
-            Val(von), Val(nb), Val(layer), Val(order))
+            Val(von), Val(nb), Val(layer), Val(order), Val(kerr))
     end
     kernel = kernels[key]
     n = cols * rows
@@ -1293,7 +1426,7 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
            fan_b, skyp_b,
            width, height, nmax, dt, ju, jv, weight, row0, rows,
            col0, cols, substride, subx, suby, Float32(ring_rmin),
-           Val(von), Val(nb), Val(layer), Val(order);
+           Val(von), Val(nb), Val(layer), Val(order), Val(kerr);
            threads=threads, groups=groups)
     return nothing
 end
@@ -1309,7 +1442,7 @@ background at infinity). Returns a `(3*nbuckets, width, height)`
 operation at any aperture/focus, without re-rendering.
 """
 function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
-                          spacetime::Schwarzschild;
+                          spacetime::AbstractSpacetime;
                           width::Int=1920, height::Int=1080,
                           samples::Int=2, dt::Real=0.02,
                           nbuckets::Int=10, fisheye_deg::Real=0.0,
@@ -1325,12 +1458,14 @@ function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt32)),
                40_000)
     cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 6)
+    spacetime_params = MtlVector{Float32}(undef, 8)
     copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
                                        fisheye_deg=fisheye_deg))
+    spin_a, rkill2 = _spin_horizon(spacetime)
+    is_kerr = spin_a != 0
     copyto!(spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
-                    HSTEP_COEF[], HSTEP_CAP[]])
+                    HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
     out = MtlArray{Float32,3}(undef, 3 * nbuckets, width, height)
     fill!(out, 0.0f0)
     rows_per_tile = clamp(ceil(Int, 2.0e9 / (width * nmax)), 16, height)
@@ -1342,7 +1477,7 @@ function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
         rows = min(rows_per_tile, height - row0)
         _launch_trace!(ctx, out, cam_params, spacetime_params, width, height,
                        nmax, dt32, Float32(off[1]), Float32(off[2]), weight,
-                       row0, rows; nb=nbuckets)
+                       row0, rows; nb=nbuckets, kerr=is_kerr)
     end
     Metal.synchronize()
     return Array(out)
@@ -1387,7 +1522,7 @@ motion path drives either renderer. It used to return `(Camera, beta)` on the
 GPU and a bare `Camera` on the CPU; velocity now lives on the camera itself.
 """
 function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
-                          spacetime::Schwarzschild;
+                          spacetime::AbstractSpacetime;
                           width::Int=1920, height::Int=1080,
                           samples::Int=2, dt::Real=0.02,
                           rng::Random.AbstractRNG=Random.default_rng(),
@@ -1409,13 +1544,15 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     # Own parameter buffers: preview frames may update ctx's buffers while the
     # draft's tiles are still dispatching.
     cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 6)
+    spacetime_params = MtlVector{Float32}(undef, 8)
     base_params = _ks_cam_params(cam, spacetime.M; fisheye_deg=fisheye_deg,
                                  focus_dist=focus_dist)
     copyto!(cam_params, base_params)
+    spin_a, rkill2 = _spin_horizon(spacetime)
+    is_kerr = spin_a != 0
     copyto!(spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
-                    HSTEP_COEF[], HSTEP_CAP[]])
+                    HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
     # Depth of field: each supersampling pass gets its own aperture sample,
     # so `samples²` passes double as the bokeh samples. Fisheye stays pinhole.
     use_dof = aperture_world > 0.0 && fisheye_deg <= 0.0
@@ -1479,7 +1616,8 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
             rows = min(rows_per_tile, height - row0)
             _launch_trace!(ctx, out, cam_params, spacetime_params,
                            width, height, nmax, dt32,
-                           Float32(du), Float32(dv), weight, row0, rows)
+                           Float32(du), Float32(dv), weight, row0, rows;
+                           kerr=is_kerr)
             Metal.synchronize()
             done += 1
             isnothing(progress) || progress(done / ndispatch)
@@ -1490,7 +1628,7 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
 end
 
 function render_draft_mtl(ctx::MetalPreviewContext, cam::ThinLensCamera,
-                          spacetime::Schwarzschild; kwargs...)
+                          spacetime::AbstractSpacetime; kwargs...)
     fov = (cam.sensor_width / 2.0) / cam.focal_length
     pinhole = Camera(cam.pos, cam.pos + cam.fwd, cam.up_local, fov)
     # Same world-space aperture as the CPU get_ray: diameter = focus/f_number.
@@ -1500,7 +1638,7 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::ThinLensCamera,
 end
 
 function render_preview_mtl(ctx::MetalPreviewContext, cam::ThinLensCamera,
-                            spacetime::Schwarzschild)
+                            spacetime::AbstractSpacetime)
     fov = (cam.sensor_width / 2.0) / cam.focal_length
     pinhole = Camera(cam.pos, cam.pos + cam.fwd, cam.up_local, fov)
     return render_preview_mtl(ctx, pinhole, spacetime)
@@ -1508,7 +1646,7 @@ end
 
 function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              ctx::MetalPreviewContext, cam::ThinLensCamera,
-                             spacetime::Schwarzschild; kwargs...)
+                             spacetime::AbstractSpacetime; kwargs...)
     fov = (cam.sensor_width / 2.0) / cam.focal_length
     pinhole = Camera(cam.pos, cam.pos + cam.fwd, cam.up_local, fov)
     return render_preview_mtl!(img, host, ctx, pinhole, spacetime; kwargs...)
@@ -2221,7 +2359,7 @@ column). Also refreshes `sky_params`: the radial tetrad axis ê_r at `pos`,
 `(M, r_escape)`, and the gas gate radius.
 """
 function update_sky_fan!(sky::SkyFanState, ctx::MetalPreviewContext,
-                         pos::SVector{3,Float64}, spacetime::Schwarzschild;
+                         pos::SVector{3,Float64}, spacetime::AbstractSpacetime;
                          gate::Real, dt::Real=Float64(ctx.dt))
     M = spacetime.M
     r = norm(pos)
@@ -2284,7 +2422,7 @@ the current camera position first.
 """
 function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                              sky::SkyFanState, cam::Camera,
-                             spacetime::Schwarzschild;
+                             spacetime::AbstractSpacetime;
                              fisheye_deg::Real=0.0, relativistic::Bool=false,
                              dt::Real=Float64(ctx.dt), trace_layer::Bool=true,
                              substride::Int=1, subx::Int=0, suby::Int=0,
@@ -2302,9 +2440,11 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                20_000)
     copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
                                            fisheye_deg=fisheye_deg))
+    spin_a, rkill2 = _spin_horizon(spacetime)
+    is_kerr = spin_a != 0
     copyto!(ctx.spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
-                    HSTEP_COEF[], HSTEP_CAP[]])
+                    HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
 
     lw, lh = size(layer_out, 2), size(layer_out, 3)
     width, height = size(comp_out, 2), size(comp_out, 3)
@@ -2326,7 +2466,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                        sw, sh, nmax, Float32(dt), Float32(ju), Float32(jv),
                        1.0f0, lrow0, lrows;
                        fan=sky.fan, sky_params=sky.sky_params, layer=true,
-                       substride=substride, subx=subx, suby=suby, order=order)
+                       substride=substride, subx=subx, suby=suby, order=order,
+                       kerr=is_kerr)
     end
     # With trace_layer=false the caller keeps `layer_out` pre-filled with
     # α = 1 (fully transparent): the frame is the fan-driven sky alone.
@@ -2351,7 +2492,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                        rw, rh, nmax, Float32(dt), Float32(ju), Float32(jv),
                        1.0f0, rr0, rrn;
                        fan=sky.fan, sky_params=sky.sky_params, layer=true,
-                       ring_rmin=ring_rmin, col0=rc0, cols=rcn, order=order)
+                       ring_rmin=ring_rmin, col0=rc0, cols=rcn, order=order,
+                       kerr=is_kerr)
     end
 
     acc = accumulate ? 1.0f0 : 0.0f0
