@@ -183,7 +183,7 @@ end
                          (x * (2.43f0 * x + 0.59f0) + 0.14f0), 0.0f0, 1.0f0)
 
 function _pack_bgra_kernel!(dst, src, bloomg, bloomw, blooms,
-                            W, H, BW, BH, WW, WH, grade, escale)
+                            W, H, BW, BH, WW, WH, grade, palette, escale)
     i = thread_position_in_grid().x
     i > W * H && return
     x = (i - 1) % W + 1
@@ -195,7 +195,7 @@ function _pack_bgra_kernel!(dst, src, bloomg, bloomw, blooms,
     g_wbr = grade[6]; g_wbg = grade[7]; g_wbb = grade[8]
     g_bloom = grade[9]; g_hue = grade[11]; g_gp = grade[12]
     g_grain = grade[13]; g_sfrac = grade[14]; g_sgain = grade[15]
-    g_qlev = grade[17]; g_dith = grade[18]
+    g_qlev = grade[17]; g_dith = grade[18]; g_pal = grade[19]
     e = g_exp * escale
     r = src[1, x, j] * e * g_wbr
     g = src[2, x, j] * e * g_wbg
@@ -278,16 +278,28 @@ function _pack_bgra_kernel!(dst, src, bloomg, bloomw, blooms,
     # purpose — the pattern is fixed to the pixel grid, so it does not crawl
     # when the camera moves, which is the failure mode that makes low-res
     # rendering read as broken rather than stylised.
-    if g_qlev > 1.5f0
+    if g_pal > 1.5f0 || g_qlev > 1.5f0
         # 4x4 Bayer from the recursive 2x2 definition, branch-free.
         bx0 = Int32((x - 1) & 1);  by0 = Int32((j - 1) & 1)
         bx1 = Int32(((x - 1) >> 1) & 1);  by1 = Int32(((j - 1) >> 1) & 1)
         m = 4 * (2 * bx1 + by1 * (3 - 4 * bx1)) + (2 * bx0 + by0 * (3 - 4 * bx0))
         d = g_dith * ((Float32(m) + 0.5f0) * 0.0625f0 - 0.5f0)
-        L = g_qlev - 1.0f0
-        r = clamp(floor(r * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
-        g = clamp(floor(g * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
-        b = clamp(floor(b * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
+        if g_pal > 1.5f0
+            # Palette mode: collapse to N tones by LUMINANCE, not per channel.
+            # Per-channel quantization keeps three independent ramps and so
+            # keeps the picture colourful; mapping brightness onto one ramp is
+            # what actually reduces the tone count, and lets entry 1 be true
+            # black so the sky reads as empty rather than tinted.
+            n = g_pal
+            lum = 0.2126f0 * r + 0.7152f0 * g + 0.0722f0 * b
+            k = unsafe_trunc(Int32, clamp(lum * n + d, 0.0f0, n - 1.0f0)) + Int32(1)
+            r = palette[1, k]; g = palette[2, k]; b = palette[3, k]
+        else
+            L = g_qlev - 1.0f0
+            r = clamp(floor(r * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
+            g = clamp(floor(g * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
+            b = clamp(floor(b * L + 0.5f0 + d) / L, 0.0f0, 1.0f0)
+        end
     end
     dst[i] = unsafe_trunc(UInt32, r * 255.0f0 + 0.5f0) << 16 |
              unsafe_trunc(UInt32, g * 255.0f0 + 0.5f0) << 8 |
@@ -307,8 +319,9 @@ mutable struct MetalPresenter{Q}
     pack_gpu::MtlArray{UInt32,1}
     pack_kernel::Base.RefValue{Any}   # compiled-once kernels, like _WARP_KERNEL
     bloom_kernels::Base.RefValue{Any}
-    grade::MtlVector{Float32}         # 16-float display-grade block
+    grade::MtlVector{Float32}         # display-grade block (see set_grade!)
     grade_host::Vector{Float32}
+    palette::MtlArray{Float32,2}      # (3, PALETTE_MAX) arcade palette
     bloom_a::MtlArray{Float32,3}      # quarter-res bloom ping-pong
     bloom_b::MtlArray{Float32,3}
     bloom_s::MtlArray{Float32,3}      # quarter-res streaks
@@ -316,6 +329,74 @@ mutable struct MetalPresenter{Q}
     bloom_w2::MtlArray{Float32,3}
     width::Int
     height::Int
+end
+
+"""
+Matplotlib's **plasma** ramp at deciles: dark blue-violet through magenta and
+orange to yellow. Sampled and interpolated by [`plasma_palette`](@ref).
+"""
+const PALETTE_MAX = 32
+
+const PLASMA_ANCHORS = (
+    (0.050f0, 0.030f0, 0.528f0), (0.255f0, 0.014f0, 0.615f0),
+    (0.418f0, 0.001f0, 0.658f0), (0.563f0, 0.052f0, 0.642f0),
+    (0.693f0, 0.165f0, 0.565f0), (0.798f0, 0.280f0, 0.470f0),
+    (0.881f0, 0.393f0, 0.383f0), (0.949f0, 0.518f0, 0.296f0),
+    (0.987f0, 0.652f0, 0.211f0), (0.988f0, 0.816f0, 0.145f0),
+    (0.940f0, 0.975f0, 0.131f0))
+
+"""
+    plasma_palette(n; black=true, lo=0.0, hi=1.0)
+
+`(3, n)` array of plasma colours for the arcade palette. With `black`, the
+first entry is pure black and the remaining `n-1` span `lo`..`hi` of the ramp —
+so the sky bottoms out at true black rather than plasma's dark violet, and the
+tones above it are few and deliberate.
+"""
+function plasma_palette(n::Int; black::Bool=true, lo::Real=0.0, hi::Real=1.0)
+    n >= 2 || throw(ArgumentError("palette needs at least 2 entries"))
+    pal = Array{Float32}(undef, 3, n)
+    k0 = black ? 2 : 1
+    if black
+        pal[:, 1] .= 0.0f0
+    end
+    m = n - k0
+    for k in k0:n
+        t = m == 0 ? Float64(hi) : lo + (hi - lo) * (k - k0) / m
+        u = clamp(t, 0.0, 1.0) * (length(PLASMA_ANCHORS) - 1)
+        i = clamp(floor(Int, u), 0, length(PLASMA_ANCHORS) - 2)
+        f = Float32(u - i)
+        a = PLASMA_ANCHORS[i + 1]; b = PLASMA_ANCHORS[i + 2]
+        for c in 1:3
+            pal[c, k] = a[c] + f * (b[c] - a[c])
+        end
+    end
+    return pal
+end
+
+"""
+    set_palette!(p::MetalPresenter, pal)
+
+Install an arcade palette: a `(3, n)` array of linear RGB. The pack kernel maps
+each pixel's **luminance** to one of the `n` entries (ordered-dithered), so the
+frame collapses to exactly `n` tones. `set_palette!(p, nothing)` restores the
+full-colour path.
+"""
+function set_palette!(p::MetalPresenter, pal::Union{AbstractMatrix,Nothing})
+    if pal === nothing
+        p.grade_host[19] = 0.0f0
+    else
+        size(pal, 1) == 3 || throw(ArgumentError("palette must be (3, n)"))
+        n = size(pal, 2)
+        n <= size(p.palette, 2) ||
+            throw(ArgumentError("palette has $n entries; buffer holds $(size(p.palette, 2))"))
+        host = zeros(Float32, 3, size(p.palette, 2))
+        host[:, 1:n] .= Float32.(pal)
+        copyto!(p.palette, host)
+        p.grade_host[19] = Float32(n)
+    end
+    copyto!(p.grade, p.grade_host)
+    return nothing
 end
 
 function MetalPresenter(win::GLFW.Window, width::Int, height::Int;
@@ -346,7 +427,7 @@ function MetalPresenter(win::GLFW.Window, width::Int, height::Int;
     @objc [view::id{Object} setLayer:layer::id{Object}]::Nothing
     queue = Metal.global_queue(dev)
     grade_host = Float32[1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0.4545, 0, 0, 0,
-                         0, 0, 0]
+                         0, 0, 0, 0, 0]
     grade = MtlArray(grade_host)
     bw, bh = cld(width, 4), cld(height, 4)
     ww, wh = cld(bw, 2), cld(bh, 2)
@@ -354,6 +435,7 @@ function MetalPresenter(win::GLFW.Window, width::Int, height::Int;
                                   MtlArray{UInt32}(undef, width * height),
                                   Ref{Any}(nothing), Ref{Any}(nothing),
                                   grade, grade_host,
+                                  MtlArray(zeros(Float32, 3, PALETTE_MAX)),
                                   MtlArray{Float32,3}(undef, 3, bw, bh),
                                   MtlArray{Float32,3}(undef, 3, bw, bh),
                                   MtlArray{Float32,3}(undef, 3, bw, bh),
@@ -385,7 +467,7 @@ function set_grade!(p::MetalPresenter; exposure::Real=p.grade_host[1],
                     streak_gain::Real=p.grade_host[15],
                     quantize::Real=p.grade_host[17],
                     dither::Real=p.grade_host[18])
-    p.grade_host .= Float32[exposure, filmic ? 1 : 0, crush, saturation,
+    p.grade_host[1:18] .= Float32[exposure, filmic ? 1 : 0, crush, saturation,
                             vignette, wb[1], wb[2], wb[3], bloom,
                             bloom_threshold, hue_preserve, gamma_power,
                             grain, streak_fraction, streak_gain, 0,
@@ -462,12 +544,12 @@ function present!(p::MetalPresenter, src::MtlArray{Float32,3};
     if p.pack_kernel[] === nothing
         p.pack_kernel[] = @metal launch=false _pack_bgra_kernel!(
             p.pack_gpu, src, p.bloom_a, p.bloom_w1, p.bloom_s,
-            W, H, BW, BH, WW, WH, p.grade, escale)
+            W, H, BW, BH, WW, WH, p.grade, p.palette, escale)
     end
     kern = p.pack_kernel[]
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
     kern(p.pack_gpu, src, p.bloom_a, p.bloom_w1, p.bloom_s,
-         W, H, BW, BH, WW, WH, p.grade, escale;
+         W, H, BW, BH, WW, WH, p.grade, p.palette, escale;
          threads=threads, groups=cld(n, threads))
     Metal.flush!()
     drawable = @objc [p.layer::id{Object} nextDrawable]::id{Object}
@@ -546,10 +628,11 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
                     fan_n::Int=4096,
                     title::String="Spacetime Simulator",
                     starfield::Bool=true, star_texture_weight::Real=0.0,
-                    star_psf_pixels::Real=1.0,
+                    star_psf_pixels::Real=1.0, star_density::Real=384,
                     quality::Symbol=:balanced, ring_rmin::Real=4.0,
                     arcade::Bool=(spin(spacetime) != 0),
                     quantize::Real=0, dither::Real=1.0,
+                    palette::Union{Nothing,Integer,AbstractMatrix}=nothing,
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
     # Arcade mode. The deflection fan needs spherical symmetry, so Kerr cannot
@@ -571,9 +654,20 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
     star_tw = Float64(star_texture_weight)
     star_on = starfield
     if star_on
+        # `starfield_mtl` scans a fixed 3x3 cell neighbourhood, which is only
+        # valid while the PSF is narrower than one cell. The PSF width is
+        # sigma = psf_pixels * 2 * fov_factor / height, so it grows as the
+        # render gets shorter: what is 0.5 cells at 1440 rows is 9 cells at
+        # 144, and every star gets truncated at the window edge into a clipped
+        # square. Cap the density so a cell always covers 5 sigma.
+        σ = star_psf_pixels * 2 * cam.fov_factor / height
+        dmax = floor(2π / max(5σ, 1e-9))
+        dens = min(Float64(star_density), dmax)
+        dens < star_density &&
+            @info "starfield density capped for this render height" star_density dens height
         set_starfield!(ctx; strength=1.0, texture_weight=star_tw,
                        height=height, fov_factor=cam.fov_factor,
-                       psf_pixels=star_psf_pixels)
+                       psf_pixels=star_psf_pixels, density=dens)
     end
 
     GLFW.WindowHint(GLFW.CLIENT_API, GLFW.NO_API)
@@ -720,6 +814,11 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
     # Palette settings survive every later `apply_grade!`, because `set_grade!`
     # defaults them to whatever is already in the buffer.
     set_grade!(presenter; quantize=quantize, dither=dither)
+    # A palette overrides per-channel quantization: it maps luminance onto one
+    # ramp, which is what actually cuts the tone count. An Integer asks for
+    # that many plasma steps with black at the bottom.
+    palette === nothing || set_palette!(presenter,
+        palette isa Integer ? plasma_palette(palette) : palette)
     let cam0 = build_cam()
         if arcade
             _trace_preview_gpu!(ctx, cam0, spacetime)

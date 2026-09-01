@@ -36,8 +36,18 @@ fly_native(cam, spacetime, bg;
            width = 256, height = 144,        # internal; x10 -> 2560x1440
            winwidth = 1280, winheight = 720,
            arcade = true,
-           quantize = 12,                    # levels per channel
-           dither = 1.0,                     # 4x4 Bayer, one quantization step
-           star_texture_weight = 0.25,
+           # Black plus a handful of plasma steps. The mapping is on
+           # LUMINANCE, so the whole frame collapses to exactly this many
+           # tones and the empty sky lands on entry 1, which is true black.
+           palette = 8,
+           dither = 1.0,                     # 4x4 Bayer, one palette step
+           # No starmap nebulosity: it is a broad low-level glow, which under a
+           # luminance palette lifts the whole sky off black. Stars only.
+           star_texture_weight = 0.0,
            star_psf_pixels = 0.9,
+           # A 3x3 cell scan only holds while a cell covers 5 sigma, and sigma
+           # scales as 1/height: at 144 rows the 1440p default of 384 would
+           # truncate every star into a clipped square. Fewer, bigger stars is
+           # also just what 256x144 wants.
+           star_density = 110,
            title = "Spacetime — Kerr arcade")

@@ -94,7 +94,7 @@ export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
 # --- Interactive apps and flight dynamics
 export PreviewSettings, render_preview, viewfinder, postprocessor
 export ShipState, step_ship!, ship_velocity
-export fly_native
+export fly_native, plasma_palette, set_palette!
 
 # --- Look and Sampling: resolution-independent grade, device-independent effort
 export Look, with_look, LOOK_FILM, LOOK_HERO, apply_look!
