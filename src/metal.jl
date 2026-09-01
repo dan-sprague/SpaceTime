@@ -45,6 +45,13 @@ struct MetalPreviewContext{B<:MtlArray{Float32,3}, O<:MtlArray{Float32,3},
     r_escape_factor::Float32
     has_volume::Bool
     vol_on::Base.RefValue{Bool}  # runtime volumetric toggle
+    # Host mirror of "does the sky texture contribute at all": stars off, or
+    # stars on with a non-zero `texture_weight`. The composite gathers the 4k
+    # equirectangular map per native pixel, so when the weight is zero — the
+    # shipped stars-only default — that gather is a cache-hostile read of a
+    # value about to be multiplied by zero. Kept on the host because the
+    # decision is frame-uniform and so belongs in a `Val`, not a branch.
+    sky_tex::Base.RefValue{Bool}
     # Compiled kernel per volume mode (Val-specialised, so the no-volume
     # variant keeps the lean kernel's register budget), built lazily.
     kernel::Base.RefValue{Any}
@@ -102,7 +109,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
     bg_gpu = _upload_background(background)
     out_gpu = MtlArray{Float32,3}(undef, 3, width, height)
     cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 4)
+    spacetime_params = MtlVector{Float32}(undef, 6)
     disc_params = MtlVector{Float32}(undef, 6)
     if isnothing(disc)
         copyto!(disc_params, zeros(Float32, 6))
@@ -142,6 +149,7 @@ function MetalPreviewContext(background, width::Int, height::Int;
                                nmax, Float32(r_escape_factor),
                                !isnothing(volume),
                                Base.RefValue{Bool}(!isnothing(volume)),
+                               Base.RefValue{Bool}(true),   # stars off until set_starfield!
                                Base.RefValue{Any}(Dict{Any,Any}()))
 end
 
@@ -246,6 +254,9 @@ function set_starfield!(ctx::MetalPreviewContext; strength::Real=1.0,
                     gx / gn, gy / gn, gz / gn, concentration,
                     temp_min, temp_max - temp_min,
                     lut[1], lut[2], lut[3], seed, texture_weight])
+    # With stars on and `texture_weight` zero the sky texture contributes
+    # nothing, and the composite can skip the gather entirely.
+    ctx.sky_tex[] = strength <= 0 || texture_weight > 0
     return nothing
 end
 
@@ -531,18 +542,26 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                            star_params, cam_params,
                            spacetime_params, disc_params, fan, sky_params,
                            width, height, nmax, dt, jitter_u, jitter_v,
-                           weight, row0, rows, substride, subx, suby,
+                           weight, row0, rows, col0, cols,
+                           substride, subx, suby,
                            ring_rmin,
                            ::Val{VOL}, ::Val{NB},
-                           ::Val{LAYER}) where {VOL, NB, LAYER}
+                           ::Val{LAYER}, ::Val{ORD}) where {VOL, NB, LAYER, ORD}
     idx = thread_position_in_grid().x
-    total = width * rows
+    total = cols * rows
     if idx > total
         return
     end
-    j = (idx - 1) ÷ width + 1 + row0
-    i = (idx - 1) % width + 1
-    if j > height
+    # Dispatch covers the sub-rectangle [col0, col0+cols) x [row0, row0+rows);
+    # `col0 = 0, cols = width` is the whole frame. The ring pass uses a real
+    # sub-rectangle (see `_ring_screen_box`): it owns a filled disc around the
+    # hole, so dispatching the whole frame and culling per pixel made a region
+    # covering a few percent of the image cost a near-full-resolution trace —
+    # every culled thread still paid the tetrad read, the ray construction, an
+    # `acos` and a fan gather before it could return.
+    j = (idx - 1) ÷ cols + 1 + row0
+    i = (idx - 1) % cols + 1 + col0
+    if j > height || i > width
         return
     end
 
@@ -835,8 +854,8 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
         # bounding sphere contains the strong field, where the shadow-kill
         # criteria need small steps (a larger cap makes near-critical rays
         # wander to the step limit — slower AND wrong).
-        hcap = (VOL && r2 < vol_rb2) ? 2.0f0 : 8.0f0
-        h = dt * min(max(0.16f0 * r / M, 1.0f0), hcap)
+        hcap = (VOL && r2 < vol_rb2) ? 2.0f0 : spacetime_params[6]
+        h = dt * min(max(spacetime_params[5] * r / M, 1.0f0), hcap)
 
         xp = x; yp = y; zp = z
         pxp = px; pyp = py; pzp = pz
@@ -908,25 +927,42 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
             end
         end
 
-        k2 = ks_rhs_mtl(
-            x + 0.5f0 * h * k1[1], y + 0.5f0 * h * k1[2], z + 0.5f0 * h * k1[3],
-            px + 0.5f0 * h * k1[4], py + 0.5f0 * h * k1[5], pz + 0.5f0 * h * k1[6],
-            p_t, M)
-        k3 = ks_rhs_mtl(
-            x + 0.5f0 * h * k2[1], y + 0.5f0 * h * k2[2], z + 0.5f0 * h * k2[3],
-            px + 0.5f0 * h * k2[4], py + 0.5f0 * h * k2[5], pz + 0.5f0 * h * k2[6],
-            p_t, M)
-        k4 = ks_rhs_mtl(
-            x + h * k3[1], y + h * k3[2], z + h * k3[3],
-            px + h * k3[4], py + h * k3[5], pz + h * k3[6],
-            p_t, M)
+        # `ORD` picks the integrator at compile time: 4 = classical RK4 (4 RHS
+        # evaluations per step), 2 = explicit midpoint (2), 1 = Euler (1).
+        # `k1` is already in hand above — the volumetric sampler needs the
+        # photon's coordinate velocity — so Euler adds no evaluation at all
+        # and midpoint adds exactly one.
+        if ORD == 4
+            k2 = ks_rhs_mtl(
+                x + 0.5f0 * h * k1[1], y + 0.5f0 * h * k1[2], z + 0.5f0 * h * k1[3],
+                px + 0.5f0 * h * k1[4], py + 0.5f0 * h * k1[5], pz + 0.5f0 * h * k1[6],
+                p_t, M)
+            k3 = ks_rhs_mtl(
+                x + 0.5f0 * h * k2[1], y + 0.5f0 * h * k2[2], z + 0.5f0 * h * k2[3],
+                px + 0.5f0 * h * k2[4], py + 0.5f0 * h * k2[5], pz + 0.5f0 * h * k2[6],
+                p_t, M)
+            k4 = ks_rhs_mtl(
+                x + h * k3[1], y + h * k3[2], z + h * k3[3],
+                px + h * k3[4], py + h * k3[5], pz + h * k3[6],
+                p_t, M)
 
-        x  += (h / 6.0f0) * (k1[1] + 2.0f0 * k2[1] + 2.0f0 * k3[1] + k4[1])
-        y  += (h / 6.0f0) * (k1[2] + 2.0f0 * k2[2] + 2.0f0 * k3[2] + k4[2])
-        z  += (h / 6.0f0) * (k1[3] + 2.0f0 * k2[3] + 2.0f0 * k3[3] + k4[3])
-        px += (h / 6.0f0) * (k1[4] + 2.0f0 * k2[4] + 2.0f0 * k3[4] + k4[4])
-        py += (h / 6.0f0) * (k1[5] + 2.0f0 * k2[5] + 2.0f0 * k3[5] + k4[5])
-        pz += (h / 6.0f0) * (k1[6] + 2.0f0 * k2[6] + 2.0f0 * k3[6] + k4[6])
+            x  += (h / 6.0f0) * (k1[1] + 2.0f0 * k2[1] + 2.0f0 * k3[1] + k4[1])
+            y  += (h / 6.0f0) * (k1[2] + 2.0f0 * k2[2] + 2.0f0 * k3[2] + k4[2])
+            z  += (h / 6.0f0) * (k1[3] + 2.0f0 * k2[3] + 2.0f0 * k3[3] + k4[3])
+            px += (h / 6.0f0) * (k1[4] + 2.0f0 * k2[4] + 2.0f0 * k3[4] + k4[4])
+            py += (h / 6.0f0) * (k1[5] + 2.0f0 * k2[5] + 2.0f0 * k3[5] + k4[5])
+            pz += (h / 6.0f0) * (k1[6] + 2.0f0 * k2[6] + 2.0f0 * k3[6] + k4[6])
+        elseif ORD == 2
+            k2 = ks_rhs_mtl(
+                x + 0.5f0 * h * k1[1], y + 0.5f0 * h * k1[2], z + 0.5f0 * h * k1[3],
+                px + 0.5f0 * h * k1[4], py + 0.5f0 * h * k1[5], pz + 0.5f0 * h * k1[6],
+                p_t, M)
+            x  += h * k2[1];  y  += h * k2[2];  z  += h * k2[3]
+            px += h * k2[4];  py += h * k2[5];  pz += h * k2[6]
+        else
+            x  += h * k1[1];  y  += h * k1[2];  z  += h * k1[3]
+            px += h * k1[4];  py += h * k1[5];  pz += h * k1[6]
+        end
 
         # A non-finite ray can never satisfy the exit tests and would reach
         # the background sampler as NaN, trapping the kernel. Paint it black
@@ -1191,7 +1227,8 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
     copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
                                            fisheye_deg=fisheye_deg))
     copyto!(ctx.spacetime_params,
-            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
+            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
+                    HSTEP_COEF[], HSTEP_CAP[]])
 
     fill!(ctx.out_gpu, 0.0f0)
     if band_rows <= 0 || on_band === nothing
@@ -1228,12 +1265,14 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         weight::Float32, row0::Int, rows::Int; nb::Int=0,
                         fan=nothing, sky_params=nothing, layer::Bool=false,
                         substride::Int=1, subx::Int=0, suby::Int=0,
-                        ring_rmin::Real=0.0)
+                        ring_rmin::Real=0.0, col0::Int=0, cols::Int=-1,
+                        order::Int=4)
+    cols < 0 && (cols = width)
     von = ctx.vol_on[]
     fan_b = fan === nothing ? _dummy_fan() : fan
     skyp_b = sky_params === nothing ? _dummy_skyp() : sky_params
     kernels = ctx.kernel[]::Dict{Any,Any}
-    key = (von, nb, layer)
+    key = (von, nb, layer, order)
     if !haskey(kernels, key)
         kernels[key] = @metal launch=false trace_kernel_mtl!(
             out, ctx.bg_gpu, ctx.bb_lut, ctx.star_lut, ctx.vol_gpu,
@@ -1241,11 +1280,11 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
             ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
             fan_b, skyp_b,
             width, height, nmax, dt, ju, jv, weight, row0, rows,
-            substride, subx, suby, Float32(ring_rmin),
-            Val(von), Val(nb), Val(layer))
+            col0, cols, substride, subx, suby, Float32(ring_rmin),
+            Val(von), Val(nb), Val(layer), Val(order))
     end
     kernel = kernels[key]
-    n = width * rows
+    n = cols * rows
     threads = min(kernel.pipeline.maxTotalThreadsPerThreadgroup, n)
     groups = cld(n, threads)
     kernel(out, ctx.bg_gpu, ctx.bb_lut, ctx.star_lut, ctx.vol_gpu,
@@ -1253,8 +1292,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
            ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
            fan_b, skyp_b,
            width, height, nmax, dt, ju, jv, weight, row0, rows,
-           substride, subx, suby, Float32(ring_rmin),
-           Val(von), Val(nb), Val(layer);
+           col0, cols, substride, subx, suby, Float32(ring_rmin),
+           Val(von), Val(nb), Val(layer), Val(order);
            threads=threads, groups=groups)
     return nothing
 end
@@ -1286,11 +1325,12 @@ function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt32)),
                40_000)
     cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 4)
+    spacetime_params = MtlVector{Float32}(undef, 6)
     copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
                                        fisheye_deg=fisheye_deg))
     copyto!(spacetime_params,
-            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
+            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
+                    HSTEP_COEF[], HSTEP_CAP[]])
     out = MtlArray{Float32,3}(undef, 3 * nbuckets, width, height)
     fill!(out, 0.0f0)
     rows_per_tile = clamp(ceil(Int, 2.0e9 / (width * nmax)), 16, height)
@@ -1369,12 +1409,13 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     # Own parameter buffers: preview frames may update ctx's buffers while the
     # draft's tiles are still dispatching.
     cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 4)
+    spacetime_params = MtlVector{Float32}(undef, 6)
     base_params = _ks_cam_params(cam, spacetime.M; fisheye_deg=fisheye_deg,
                                  focus_dist=focus_dist)
     copyto!(cam_params, base_params)
     copyto!(spacetime_params,
-            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
+            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
+                    HSTEP_COEF[], HSTEP_CAP[]])
     # Depth of field: each supersampling pass gets its own aperture sample,
     # so `samples²` passes double as the bokeh samples. Fisheye stays pinhole.
     use_dof = aperture_world > 0.0 && fisheye_deg <= 0.0
@@ -1731,7 +1772,147 @@ feathers back into the bulk layer. The two layers are traced at different
 resolutions, so they never agree exactly; switching between them abruptly
 would replace a stair-stepped ring with a seam ring.
 """
+# Affine step rule `h = dt * clamp(COEF*r/M, 1, CAP)`, exposed so the shape of
+# the heuristic can be swept and measured rather than guessed at.
+const HSTEP_COEF = Ref(0.16f0)
+const HSTEP_CAP  = Ref(8.0f0)
+
 const RING_FEATHER = 0.8f0
+
+"""
+Safety factor on the impact-parameter bound used to size the ring dispatch.
+The box only has to *contain* the wound region; clipping it would eat the
+photon ring, so the bound is deliberately loose — the cost of 6% extra
+radius is a few percent of a box that is itself a small fraction of the frame.
+"""
+const RING_B_MARGIN = 1.06
+
+"""
+    _wound_impact_parameter(M, ring_rmin)
+
+Impact parameter below which a null geodesic's periapsis falls under
+`ring_rmin` — the ring pass's selector, expressed as a conserved quantity.
+
+Periapsis `r_p` and impact parameter `b` satisfy `b = r_p / sqrt(1 - 2M/r_p)`,
+whose right-hand side is *increasing* for `r_p > 3M` and has its minimum
+`b_c = 3√3 M` at the photon sphere. So for `ring_rmin > 3M` the condition
+`r_p < ring_rmin` is exactly `b < b(ring_rmin)`: captured rays (`b < b_c`,
+no turning point at all) sit below the bound too, which is what we want —
+they carry the shadow and its edge.
+"""
+function _wound_impact_parameter(M::Real, ring_rmin::Real)
+    R = Float64(ring_rmin)
+    R > 2 * M || return Inf
+    return R / sqrt(1 - 2 * M / R)
+end
+
+"""
+    _ring_screen_box(cam, M, ring_rmin, fisheye_deg, rw, rh; probes, margin)
+
+Screen-space bounding box, in the ring buffer's own `rw × rh` pixel grid, of
+the rays the ring pass keeps. Returns `(col0, cols, row0, rows)`, or `nothing`
+meaning "no useful bound — dispatch the whole frame".
+
+The wound set is `b < b_R` ([`_wound_impact_parameter`](@ref)), a *filled disc*
+on screen around the hole rather than a thin annulus, because captured rays
+are wound too. Its bound is found by evaluating the real ray construction —
+the same tetrad, the same rectilinear/fisheye mapping, the same index-lowering
+as `trace_kernel_mtl!` — on a coarse grid of probe pixels, then taking the box
+of the probes that pass. Going through the actual construction rather than a
+closed form in `r` is what makes this correct under camera roll, fisheye, and
+relativistic aberration: all three live in the tetrad and the mapping, and none
+of them survive a static-observer formula.
+
+`b = L/E` with `E = -p_t` and `L = |x × p|`, both conserved in a spherically
+symmetric spacetime, so a single evaluation at the camera decides the whole
+geodesic without integrating it.
+"""
+function _ring_screen_box(cam::Camera, M::Real, ring_rmin::Real,
+                          fisheye_deg::Real, rw::Int, rh::Int;
+                          probes::Int=81, margin::Int=3)
+    bR = _wound_impact_parameter(M, ring_rmin) * RING_B_MARGIN
+    isfinite(bR) || return nothing
+    Mf = Float64(M)
+    u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
+                                      cam.up_local, Mf; beta=camera_beta(cam))
+    fov = Float64(cam.fov_factor)
+    fish = fisheye_deg > 0
+    θmax = deg2rad(max(Float64(fisheye_deg), 0.0))
+    x, y, z = cam.pos
+    r = sqrt(x * x + y * y + z * z)
+    r > 2 * Mf || return nothing
+    f = 2 * Mf / r
+
+    # Probe grid over the ring buffer, matching the kernel's pixel-centre
+    # convention (`ju = jv = 0.5`).
+    nv = max(9, probes)
+    nu = max(9, round(Int, probes * rw / rh))
+    half_h = rh / 2
+    imin, imax = typemax(Int), typemin(Int)
+    jmin, jmax = typemax(Int), typemin(Int)
+    bbest, ibest, jbest = Inf, 1, 1
+    for pj in 1:nv, pi in 1:nu
+        # Probe pixel centre, mapped to the kernel's (u, v).
+        ipx = 1 + (pi - 1) * (rw - 1) / (nu - 1)
+        jpx = 1 + (pj - 1) * (rh - 1) / (nv - 1)
+        u = (ipx - 1 + 0.5 - rw / 2) / half_h
+        v = (jpx - 1 + 0.5 - rh / 2) / half_h
+        if fish
+            ρ = sqrt(u * u + v * v)
+            θp = ρ * θmax
+            sθ = sin(θp)
+            invρ = ρ > 1e-8 ? 1 / ρ : 0.0
+            cr, cu, cf = sθ * u * invρ, sθ * v * invρ, cos(θp)
+        else
+            dxl, dyl = u * fov, v * fov
+            ν = sqrt(dxl * dxl + dyl * dyl + 1)
+            cr, cu, cf = dxl / ν, dyl / ν, 1 / ν
+        end
+        qt = cf * Ef[1] + cr * Er[1] + cu * Eu[1] - u4[1]
+        qx = cf * Ef[2] + cr * Er[2] + cu * Eu[2] - u4[2]
+        qy = cf * Ef[3] + cr * Er[3] + cu * Eu[3] - u4[3]
+        qz = cf * Ef[4] + cr * Er[4] + cu * Eu[4] - u4[4]
+        lq = qt + (x * qx + y * qy + z * qz) / r
+        p_t = -qt + f * lq
+        flr = f * lq / r
+        px = qx + flr * x
+        py = qy + flr * y
+        pz = qz + flr * z
+        E = abs(p_t)
+        E > 1e-12 || continue
+        Lx = y * pz - z * py
+        Ly = z * px - x * pz
+        Lz = x * py - y * px
+        b = sqrt(Lx * Lx + Ly * Ly + Lz * Lz) / E
+        if b < bbest
+            bbest, ibest, jbest = b, round(Int, ipx), round(Int, jpx)
+        end
+        if b < bR
+            ip, jp = round(Int, ipx), round(Int, jpx)
+            imin = min(imin, ip); imax = max(imax, ip)
+            jmin = min(jmin, jp); jmax = max(jmax, jp)
+        end
+    end
+    # A wound region smaller than the probe spacing lands between probes. The
+    # nearest-approach probe is then within one spacing of it, so seeding the
+    # box there and padding by two spacings still contains it.
+    if imin > imax
+        imin = imax = ibest
+        jmin = jmax = jbest
+    end
+    du = 2 * ceil(Int, (rw - 1) / (nu - 1)) + margin
+    dv = 2 * ceil(Int, (rh - 1) / (nv - 1)) + margin
+    c0 = clamp(imin - du, 1, rw) - 1
+    c1 = clamp(imax + du, 1, rw)
+    r0 = clamp(jmin - dv, 1, rh) - 1
+    r1 = clamp(jmax + dv, 1, rh)
+    cols, rows = c1 - c0, r1 - r0
+    # Below roughly r = 6M the wound cone swallows the sky and the box is the
+    # frame; skip the bookkeeping and let the pass run whole.
+    (cols * rows) > 0.55 * rw * rh && return nothing
+    return (c0, cols, r0, rows)
+end
+
 
 """Bilinear tap of a premultiplied `(4, lw, lh)` layer at display pixel `i, j`."""
 @inline function _layer_bilinear(layer, i, j, width, height, lw, lh)
@@ -1776,7 +1957,7 @@ function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
                                star_lut, ring,
                                width, height, lw, lh, rw, rh, ring_rmin,
                                ju, jv, accumulate,
-                               row0, rows)
+                               row0, rows, ::Val{SKYTEX}) where {SKYTEX}
     idx = thread_position_in_grid().x
     idx > width * rows && return
     j = (idx - 1) ÷ width + 1 + row0
@@ -1871,19 +2052,29 @@ function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
         dx = cθ * e1x + sθ * lx
         dy = cθ * e1y + sθ * ly
         dz = cθ * e1z + sθ * lz
-        θbg = acos(clamp(dz / max(sqrt(dx * dx + dy * dy + dz * dz), 1.0f-9),
-                         -1.0f0, 1.0f0))
-        φbg = atan(dy, dx)
-        sky_r, sky_g, sky_b = sample_background_mtl(bg, θbg, φbg,
-                                                    size(bg, 2), size(bg, 3))
+        # `SKYTEX` is false exactly when the texture's contribution is
+        # multiplied by zero downstream (stars on, `texture_weight` 0 — the
+        # shipped default). The gather is a random access into the 4k
+        # equirectangular map for every native pixel, so specialising it out
+        # is worth a `Val`; a runtime branch on the same frame-uniform value
+        # measured *slower*, costing more in scheduling than the gather saved.
+        if SKYTEX
+            θbg = acos(clamp(dz / max(sqrt(dx * dx + dy * dy + dz * dz), 1.0f-9),
+                             -1.0f0, 1.0f0))
+            φbg = atan(dy, dx)
+            sky_r, sky_g, sky_b = sample_background_mtl(bg, θbg, φbg,
+                                                        size(bg, 2), size(bg, 3))
+        end
         # Procedural stars, as in the trace kernel: evaluated along the
         # asymptotic direction, so the fan's exact deflection lenses them the
         # same way it lenses the texture. `star_params[16]` dims the texture,
         # so the two crossfade rather than only swapping.
         if star_params[1] > 0.0f0
             dl = max(sqrt(dx * dx + dy * dy + dz * dz), 1.0f-20)
-            tw = star_params[16]
-            sky_r *= tw; sky_g *= tw; sky_b *= tw
+            if SKYTEX
+                tw = star_params[16]
+                sky_r *= tw; sky_g *= tw; sky_b *= tw
+            end
             sr, sg, sb = starfield_mtl(dx / dl, dy / dl, dz / dl,
                                        star_params, star_lut)
             sky_r += star_params[1] * sr
@@ -1994,7 +2185,7 @@ end
 # Compiled-once pipelines and dummy buffers for the layered engine.
 const _SKY_FAN_KERNEL = Ref{Any}(nothing)
 const _FAN_BAND_KERNEL = Ref{Any}(nothing)
-const _COMPOSITE_KERNEL = Ref{Any}(nothing)
+const _COMPOSITE_KERNEL = Dict{Any,Any}()
 const _DUMMY_FAN = Ref{Any}(nothing)
 const _DUMMY_SKYP = Ref{Any}(nothing)
 _dummy_fan() = _DUMMY_FAN[] === nothing ?
@@ -2100,7 +2291,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                              ju::Real=0.5, jv::Real=0.5,
                              accumulate::Bool=false,
                              row0::Int=0, rows::Int=-1,
-                             ring_out=nothing, ring_rmin::Real=0.0)
+                             ring_out=nothing, ring_rmin::Real=0.0,
+                             ring_box::Bool=true, order::Int=4)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -2111,7 +2303,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
     copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
                                            fisheye_deg=fisheye_deg))
     copyto!(ctx.spacetime_params,
-            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
+            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
+                    HSTEP_COEF[], HSTEP_CAP[]])
 
     lw, lh = size(layer_out, 2), size(layer_out, 3)
     width, height = size(comp_out, 2), size(comp_out, 3)
@@ -2133,7 +2326,7 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                        sw, sh, nmax, Float32(dt), Float32(ju), Float32(jv),
                        1.0f0, lrow0, lrows;
                        fan=sky.fan, sky_params=sky.sky_params, layer=true,
-                       substride=substride, subx=subx, suby=suby)
+                       substride=substride, subx=subx, suby=suby, order=order)
     end
     # With trace_layer=false the caller keeps `layer_out` pre-filled with
     # α = 1 (fully transparent): the frame is the fan-driven sky alone.
@@ -2147,31 +2340,39 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
     rw, rh = use_ring ? (size(ring_out, 2), size(ring_out, 3)) : (lw, lh)
     ring_b = use_ring ? ring_out : layer_out
     if use_ring
+        # Dispatch only the box that can contain wound rays. Everything outside
+        # it would have been culled per-pixel anyway, so the pass is unchanged
+        # where it matters and simply absent where it was writing transparency.
+        box = ring_box ?
+              _ring_screen_box(cam, spacetime.M, ring_rmin, fisheye_deg,
+                               rw, rh) : nothing
+        rc0, rcn, rr0, rrn = box === nothing ? (0, rw, 0, rh) : box
         _launch_trace!(ctx, ring_out, ctx.cam_params, ctx.spacetime_params,
                        rw, rh, nmax, Float32(dt), Float32(ju), Float32(jv),
-                       1.0f0, 0, rh;
+                       1.0f0, rr0, rrn;
                        fan=sky.fan, sky_params=sky.sky_params, layer=true,
-                       ring_rmin=ring_rmin)
+                       ring_rmin=ring_rmin, col0=rc0, cols=rcn, order=order)
     end
 
     acc = accumulate ? 1.0f0 : 0.0f0
-    if _COMPOSITE_KERNEL[] === nothing
-        _COMPOSITE_KERNEL[] = @metal launch=false sky_composite_kernel!(
+    skytex = ctx.sky_tex[]
+    if !haskey(_COMPOSITE_KERNEL, skytex)
+        _COMPOSITE_KERNEL[skytex] = @metal launch=false sky_composite_kernel!(
             comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out,
             ctx.cam_params, ctx.spacetime_params, sky.sky_params,
             ctx.star_params, ctx.star_lut, ring_b,
             width, height, lw, lh, rw, rh,
             use_ring ? Float32(ring_rmin) : 0.0f0,
-            Float32(ju), Float32(jv), acc, row0, rows)
+            Float32(ju), Float32(jv), acc, row0, rows, Val(skytex))
     end
-    kern = _COMPOSITE_KERNEL[]
+    kern = _COMPOSITE_KERNEL[skytex]
     n = width * rows
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
     kern(comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out, ctx.cam_params,
          ctx.spacetime_params, sky.sky_params, ctx.star_params, ctx.star_lut,
          ring_b, width, height, lw, lh, rw, rh,
          use_ring ? Float32(ring_rmin) : 0.0f0,
-         Float32(ju), Float32(jv), acc, row0, rows;
+         Float32(ju), Float32(jv), acc, row0, rows, Val(skytex);
          threads=threads, groups=cld(n, threads))
     return nothing
 end

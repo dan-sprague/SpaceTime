@@ -369,6 +369,15 @@ Command-buffer order on the shared global queue keeps the pack after any
 in-flight render kernels; an explicit flush publishes Metal.jl's batched
 launches before ours commits.
 """
+# Input-pump deadline control (see the pump call site in `fly_native`).
+# `PUMP_BLOCKED_MS` is the `present!` block above which we conclude something
+# other than the pump set the frame's pace, making its elapsed time a true
+# measurement rather than the pump's own padding.
+const PUMP_BLOCKED_MS = 0.5
+const PUMP_MIN_MS = 1.0
+const PUMP_MAX_MS = 120.0
+const PUMP_DECAY = 0.85
+
 function present!(p::MetalPresenter, src::MtlArray{Float32,3};
                   escale::Float32=1.0f0)
     W, H = p.width, p.height
@@ -484,7 +493,8 @@ layer at stride 2, for 24% of the frame cost (21.6 ms against 89.4 ms), and a
 stride-1 ring beats it outright at under half the cost. `ring_rmin` (4M) is
 the periapsis below which a ray counts as wound.
 
-Other keys: drag to look; Z/C roll; V volumetric gas; B sky; O quality;
+Other keys: drag to look; Z/C roll; 5 (or V) thin-disc/volumetric gas;
+B sky; O quality;
 R relativistic shading; L lens (rectilinear/fisheye); **1/2/3/4 grade presets**
 (neutral / film / hectic / **porthole** — the escape-video recipe:
 hue-preserving ACES, gamma-0.2 crush, 4-spike streaks, grain); T/G
@@ -614,9 +624,35 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     qi = findfirst(==(quality), QUALITY)
     ring_bufs = Dict{Int,MtlArray{Float32,3}}()
     ring_buf(s) = get!(ring_bufs, s) do
-        MtlArray{Float32,3}(undef, 4, cld(width, s), cld(height, s))
+        # Seeded fully transparent, not `undef`: the ring pass dispatches only
+        # the box that can hold wound rays, so every pixel outside it keeps
+        # whatever the buffer already held. The composite never samples there
+        # (its blend weight is the same periapsis test the pass culls on), but
+        # a buffer that starts as garbage would make any future widening of
+        # that box a debugging problem rather than a no-op.
+        b = MtlArray{Float32,3}(undef, 4, cld(width, s), cld(height, s))
+        seed = zeros(Float32, 4, cld(width, s), cld(height, s))
+        seed[4, :, :] .= 1.0f0
+        copyto!(b, seed)
+        b
     end
-    rung = 2
+    # The combined quality ladder the controller walks: (bulk rung, ring
+    # stride), coarsest ring last and `0` for no ring pass at all. `quality`
+    # sets the *finest* ring the ladder may use, not a fixed one — otherwise
+    # the ring escapes the frame budget exactly where it is most expensive.
+    function build_levels(q)
+        f = RING_STRIDE[q]
+        nr = length(rungs)
+        lv = [(min(k, nr), f) for k in 1:nr]
+        for m in (2, 4)
+            push!(lv, (nr, min(f * m, 8)))
+        end
+        push!(lv, (nr, 0))
+        return lv
+    end
+    LEVELS = build_levels(quality)
+    level = 1
+    rung = 1     # derived from LEVELS each frame; seed for the no-layer path
     last_rung_change = time()
     last_move_time = time()
     cur_stride = 2          # volumetric march stride currently set on ctx
@@ -668,6 +704,10 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     last_wall = time()
     last_title = 0.0
     frame_ms = 16.0
+    # Input-pump deadline, in ms, tracked independently of `frame_ms` (see the
+    # pump call site). Additive-increase to 90% of a measured GPU frame,
+    # multiplicative-decrease whenever the pump outlasts the GPU.
+    pump_ms = 8.0
     nframes = 0
     β = SVector(0.0, 0.0, 0.0)
     γ = 1.0
@@ -703,13 +743,19 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         end
         state.roll += ((down(GLFW.KEY_C) ? 1.0 : 0.0) -
                        (down(GLFW.KEY_Z) ? 1.0 : 0.0)) * 1.5 * dwall
-        pressed_once(GLFW.KEY_V) && ctx.has_volume &&
-            set_volume_enabled!(ctx, !ctx.vol_on[])
+        # Thin plane vs volumetric gas. 5 sits with the numeric row; V is the
+        # original binding and still works.
+        (pressed_once(GLFW.KEY_V) || pressed_once(GLFW.KEY_5)) &&
+            ctx.has_volume && set_volume_enabled!(ctx, !ctx.vol_on[])
         pressed_once(GLFW.KEY_R) && (relativistic = !relativistic)
         # O cycles graphics quality (the photon-ring pass); it changes what is
         # rendered, so the still has to be thrown away and retraced.
-        pressed_once(GLFW.KEY_O) && (qi = qi % length(QUALITY) + 1;
-                                     grade_rev += 1)
+        if pressed_once(GLFW.KEY_O)
+            qi = qi % length(QUALITY) + 1
+            LEVELS = build_levels(QUALITY[qi])
+            level = clamp(level, 1, length(LEVELS))
+            grade_rev += 1
+        end
         pressed_once(GLFW.KEY_L) && (fisheye = fisheye > 0.0 ? 0.0 : 100.0)
         # B cycles the sky: procedural stars → the starmap → both. Direct A/B
         # is the only honest way to judge a starfield.
@@ -757,6 +803,48 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         # --- movement --------------------------------------------------
         fwd, right, _ = _flycam_basis(state)
         upr = _flycam_up(state)
+
+        # Free-camera motion as a function of a time slice, so it can be run
+        # both once per frame and again inside the GPU wait below. It re-reads
+        # the key state and the camera basis every call, so a release lands on
+        # the very next slice.
+        function step_freecam!(dt)
+            dt <= 0.0 && return
+            f, rt, _ = _flycam_basis(state)
+            v = speed * dt * (down(GLFW.KEY_LEFT_SHIFT) ? 5.0 : 1.0)
+            rn = norm(state.pos)
+            v *= clamp(0.12 * max(rn - 1.9 * M, 0.25 * rn), 0.02, 8.0)
+            world_z = SVector(0.0, 0.0, 1.0)
+            down(GLFW.KEY_W) && (state.pos += v * f)
+            down(GLFW.KEY_S) && (state.pos -= v * f)
+            down(GLFW.KEY_A) && (state.pos -= v * rt)
+            down(GLFW.KEY_D) && (state.pos += v * rt)
+            down(GLFW.KEY_Q) && (state.pos -= v * world_z)
+            down(GLFW.KEY_E) && (state.pos += v * world_z)
+            rn = norm(state.pos)
+            rn < 0.45 * M && (state.pos *= 0.45 * M / rn)
+            return
+        end
+
+        # The frame is enqueued in well under a millisecond and the CPU then
+        # sits idle for the whole GPU frame — measured 98-99% idle at 1440p,
+        # 0.4 ms of enqueue against 20-53 ms of waiting. Input was sampled once
+        # per frame, so that entire idle window was also the input latency, and
+        # the camera kept moving long after a key was released. Spending the
+        # wait on `PollEvents` costs nothing that was being used. GLFW's own
+        # guidance is that `PollEvents` — not `WaitEventsTimeout`, which sleeps
+        # and adds latency of its own — is the primitive for continuous
+        # rendering.
+        function pump_input!(deadline)
+            while time() < deadline
+                GLFW.PollEvents()
+                now = time()
+                flight || step_freecam!(clamp(now - last_wall, 0.0, 0.02))
+                last_wall = now
+                sleep(0.001)
+            end
+            return
+        end
         if flight
             # GR ship: the point-mass worldline of `src/ship.jl`.
             dτ = twarp * dwall
@@ -794,19 +882,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             state.pos = ship.x
             β, γ = ship_velocity(ship, M, fwd, right, upr)   # telemetry
         else
-            # Omnipotent free camera: flat velocity while keys are held.
-            v = speed * dwall * (down(GLFW.KEY_LEFT_SHIFT) ? 5.0 : 1.0)
-            rn = norm(state.pos)
-            v *= clamp(0.12 * max(rn - 1.9 * M, 0.25 * rn), 0.02, 8.0)
-            world_z = SVector(0.0, 0.0, 1.0)
-            down(GLFW.KEY_W) && (state.pos += v * fwd)
-            down(GLFW.KEY_S) && (state.pos -= v * fwd)
-            down(GLFW.KEY_A) && (state.pos -= v * right)
-            down(GLFW.KEY_D) && (state.pos += v * right)
-            down(GLFW.KEY_Q) && (state.pos -= v * world_z)
-            down(GLFW.KEY_E) && (state.pos += v * world_z)
-            rn = norm(state.pos)
-            rn < 0.45 * M && (state.pos *= 0.45 * M / rn)
+            step_freecam!(dwall)
         end
 
         # --- render: fan + layer + composite, all on the GPU -----------
@@ -829,21 +905,41 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
             t0 = time()
             update_sky_fan!(sky, ctx, state.pos, spacetime; gate=gate, dt=0.05)
             if layer_on
-                # Fresh gas every frame at the current rung — no history:
-                # nothing to echo. The rung controller walks the ladder with
-                # dwell and hysteresis: down fast when over budget, up
-                # slowly when there is clear headroom.
-                if frame_ms > 22.0 && rung < length(rungs) &&
-                   wall - last_rung_change > 0.25
-                    rung += 1
+                # Fresh gas every frame — no history, nothing to echo. The
+                # controller walks a combined ladder of (bulk rung, ring
+                # stride): the ring pass has to be on it, because near the
+                # hole the wound-ray annulus grows and those rays are the
+                # dearest in the frame. Measured at 1440p with the bulk
+                # pinned at stride 8, the bulk stays flat at 13-16 ms from
+                # 26M down to 6M while a fixed stride-2 ring goes 20 -> 66 ms.
+                # A ring outside the controller's authority means it drops the
+                # bulk rung, which changes nothing, and the frame stays long.
+                #
+                # Down-steps take no dwell: entering the annulus can quadruple
+                # the frame in one step, and one level per 0.25 s took seconds
+                # to escape — which is felt as the camera failing to stop,
+                # since input is polled once per rendered frame. Up-steps keep
+                # the dwell so the ladder cannot flip-flop.
+                # Two budgets. Dropping a *bulk* rung is nearly free
+                # visually — the gas is smooth and downscales well — so it
+                # happens at 22 ms. Coarsening the *ring* is the one step that
+                # visibly costs, so it waits for a genuinely bad frame. That
+                # split is only safe because input no longer rides on the frame
+                # time; while it did, the controller had to buy latency with
+                # image quality, and the ring was what it spent.
+                budget = LEVELS[min(level + 1, length(LEVELS))][2] !=
+                         LEVELS[level][2] ? 45.0 : 22.0
+                if frame_ms > budget && level < length(LEVELS)
+                    level += 1
                     last_rung_change = wall
-                    frame_ms = 16.0    # reseed the EMA at the new rung
-                elseif frame_ms < 11.0 && rung > 1 &&
+                    frame_ms = 16.0    # reseed the EMA at the new level
+                elseif frame_ms < 11.0 && level > 1 &&
                        wall - last_rung_change > 1.0
-                    rung -= 1
+                    level -= 1
                     last_rung_change = wall
                     frame_ms = 16.0
                 end
+                rung, rs = LEVELS[level]
                 # Coarser rungs also march the gas more coarsely — the
                 # in-slab cost is dominated by volume sampling.
                 want = rung == 1 ? 2 : 4
@@ -851,22 +947,51 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     set_march_stride!(ctx, want)
                     cur_stride = want
                 end
-                rs = RING_STRIDE[QUALITY[qi]]
                 render_layered_gpu!(ctx.out_gpu, rungs[rung],
                                     ctx, sky, cam_now, spacetime;
                                     fisheye_deg=fisheye,
                                     relativistic=relativistic,
-                                    ring_out=ring_buf(rs),
-                                    ring_rmin=ring_rmin)
+                                    ring_out=rs > 0 ? ring_buf(rs) : nothing,
+                                    ring_rmin=rs > 0 ? ring_rmin : 0.0)
             else
                 render_layered_gpu!(ctx.out_gpu, L, ctx, sky, cam_now,
                                     spacetime; fisheye_deg=fisheye,
                                     relativistic=relativistic,
                                     trace_layer=false)
             end
+            # Keep input live while the GPU finishes. The deadline is its own
+            # state, NOT a fraction of `frame_ms`: deriving it from the frame
+            # time it is itself padding makes the loop self-sustaining. With
+            # `deadline = t0 + 0.0009*frame_ms` and the pump inside the
+            # measurement, a frame whose GPU cost collapses still decays at
+            # only 1% per frame and settles at ten times the residual cost —
+            # simulated, a 6.5 ms frame seeded at 16 ms still reads 15.0 ms
+            # after 400 frames. The controller then spends image quality
+            # paying off the loop's own padding.
+            #
+            # The signal that separates the two is how long `present!` blocks.
+            # It waits on the drawable queue, which backs up behind the GPU and
+            # the display refresh alike, so a real block means something other
+            # than this pump is setting the pace — the pump is not the limiter
+            # and may track the frame. Returning immediately means the pump WAS
+            # the limiter, so back it off geometrically until a frame blocks
+            # again. That converges in ~10 frames rather than ~400 and has no
+            # spurious fixed point.
+            #
+            # Deliberately NOT a `Metal.synchronize()` here, which would be the
+            # more direct measurement: it waits for our own command buffers and
+            # so drains the pipeline every frame, costing the CPU/GPU overlap
+            # the loop depends on. Measured at 1440p, that cost far more than
+            # the better estimate was worth.
+            pump_input!(t0 + 0.001 * pump_ms)
+            t_present = time()
             present!(presenter, ctx.out_gpu)
+            block_ms = 1000 * (time() - t_present)
+            pump_ms = block_ms > PUMP_BLOCKED_MS ?
+                      clamp(0.9 * frame_ms, PUMP_MIN_MS, PUMP_MAX_MS) :
+                      max(PUMP_MIN_MS, PUMP_DECAY * pump_ms)
             frame_ms = 0.9 * frame_ms + 0.1 * 1000 * (time() - t0)
-            last_move_time = wall
+            last_move_time = time()
             nframes += 1
         elseif passes < REFINE_PASSES && wall - last_move_time > 0.15
             # At rest: time-sliced progressive refinement. Full-resolution

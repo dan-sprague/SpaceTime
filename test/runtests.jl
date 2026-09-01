@@ -491,3 +491,78 @@ end
     @test br(SpaceTime.STAR_WB_TEMPERATURE) ≈ 1.0 atol = 0.02   # white point
     @test br(15000.0) > 1.2                                 # hot star is blue
 end
+
+@testset "Ring dispatch box" begin
+    # The ring pass owns the strongly-wound rays. It used to dispatch the whole
+    # frame and cull per pixel; it now dispatches only the box that can contain
+    # them. The box is computed from `b = L/E` against the periapsis bound, so
+    # what it must guarantee is containment: a box that clips would eat the
+    # photon ring, which is the one thing the pass exists to render.
+    M = 1.0
+    R = 4.0
+    bR = SpaceTime._wound_impact_parameter(M, R)
+
+    # b(r_p) = r_p/sqrt(1-2M/r_p) is increasing above the photon sphere and
+    # bottoms out at the critical impact parameter, so `b < bR` really is
+    # "periapsis below R, or captured".
+    @test bR ≈ R / sqrt(1 - 2M / R)
+    @test bR > 3 * sqrt(3) * M                       # above b_crit
+    @test SpaceTime._wound_impact_parameter(M, 1.5) == Inf   # inside horizon
+
+    # Containment, checked against the same construction the kernel uses, on a
+    # much finer grid than the box's own probes.
+    function wound_extent(cam, rw, rh)
+        u4, Ef, Er, Eu = SpaceTime.ks_camera_tetrad(
+            cam.pos, cam.fwd, cam.right, cam.up_local, M;
+            beta=SpaceTime.camera_beta(cam))
+        x, y, z = cam.pos
+        r = norm(cam.pos); f = 2M / r; fov = cam.fov_factor
+        i0, i1, j0, j1 = typemax(Int), typemin(Int), typemax(Int), typemin(Int)
+        for j in 1:rh, i in 1:rw
+            u = (i - 1 + 0.5 - rw / 2) / (rh / 2)
+            v = (j - 1 + 0.5 - rh / 2) / (rh / 2)
+            dxl, dyl = u * fov, v * fov
+            ν = sqrt(dxl^2 + dyl^2 + 1)
+            cr, cu, cf = dxl / ν, dyl / ν, 1 / ν
+            q = (cf .* Ef .+ cr .* Er .+ cu .* Eu) .- u4
+            lq = q[1] + (x * q[2] + y * q[3] + z * q[4]) / r
+            p_t = -q[1] + f * lq
+            flr = f * lq / r
+            p = (q[2] + flr * x, q[3] + flr * y, q[4] + flr * z)
+            L = norm(cross(SVector(x, y, z), SVector(p...)))
+            L / abs(p_t) < bR || continue
+            i0 = min(i0, i); i1 = max(i1, i); j0 = min(j0, j); j1 = max(j1, j)
+        end
+        i0 > i1 ? nothing : (i0, i1, j0, j1)
+    end
+
+    rw, rh = 160, 90
+    for (label, cam) in (
+        ("on-axis",  Camera(SVector(30.0, 1.1, 1.6), SVector(0.0, 0.0, 0.0),
+                            SVector(0.0, 0.0, 1.0), Lens(24.0))),
+        ("off-axis", Camera(SVector(30.0, 1.1, 1.6), SVector(22.0, 9.0, 6.0),
+                            SVector(0.0, 0.0, 1.0), Lens(24.0))),
+        ("far",      Camera(SVector(300.0, 0.0, 0.0), SVector(0.0, 0.0, 0.0),
+                            SVector(0.0, 0.0, 1.0), Lens(24.0))),
+        ("rolled",   Camera(SVector(30.0, 1.1, 1.6), SVector(0.0, 0.0, 0.0),
+                            SVector(0.3, 0.4, 0.87), Lens(24.0))))
+        box = SpaceTime._ring_screen_box(cam, M, R, 0.0, rw, rh)
+        truth = wound_extent(cam, rw, rh)
+        if box === nothing
+            @test true                                  # full frame contains all
+        elseif truth === nothing
+            @test box[2] > 0 && box[4] > 0               # non-degenerate
+        else
+            c0, cols, r0, rows = box
+            i0, i1, j0, j1 = truth
+            @test c0 < i0 && c0 + cols >= i1             # (label, "columns")
+            @test r0 < j0 && r0 + rows >= j1             # (label, "rows")
+        end
+    end
+
+    # Deep inside the wound cone swallows the sky and the box stops paying for
+    # itself; the pass must then be told to run whole rather than be clipped.
+    deep = Camera(SVector(4.0, 0.0, 0.0), SVector(0.0, 0.0, 0.0),
+                  SVector(0.0, 0.0, 1.0), Lens(24.0))
+    @test SpaceTime._ring_screen_box(deep, M, R, 0.0, rw, rh) === nothing
+end
