@@ -95,6 +95,7 @@ export sensor_coordinate, jittered_grid, sample_lens_point
 export render, render_no_doppler, render_motion
 
 # --- GPU renderer (Metal)
+export bake_warp_map, bake_track_maps, render_baked!, BakedTrack
 export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
        render_draft_mtl, set_volume_enabled!, set_disc_enabled!,
        set_march_stride!, set_starfield!

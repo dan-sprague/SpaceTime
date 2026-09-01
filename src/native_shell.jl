@@ -685,6 +685,13 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
                     # since `velocity` boosts the observer tetrad. Mouse-look
                     # still works, as an offset from the track's own frame.
                     track=nothing, track_speed::Real=1.0, track_loop::Bool=true,
+                    # Bake the lensing into warp maps along the track instead of
+                    # tracing it every frame. Lensing maps a world direction to a
+                    # world direction, so one map per POSITION serves every
+                    # orientation -- free look, roll and field of view all come
+                    # free from the same table.
+                    baked::Bool=false, bake_n::Int=64, bake_res::Int=1024,
+                    focal::Real=24.0,
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
     # Arcade mode. The deflection fan needs spherical symmetry, so Kerr cannot
@@ -732,7 +739,7 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
     spawn_pos = SVector{3,Float64}(cam.pos)
     ship = ShipState(spawn_pos, M)
     flight = false          # F toggles the GR ship; default is the free cam
-    focal = 24.0
+    focal = Float64(focal)
     fisheye = 0.0
     relativistic = false
     speed = 2.0             # free-cam speed at reference altitude
@@ -917,6 +924,20 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
     t_start = time()
     last_wall = time()
     last_title = 0.0
+    # Bake the warp maps up front. Cost is set by total texel count rather than
+    # how it is split, and it is seconds -- a loading screen, not a build step.
+    # That is what makes mass, spin and disc geometry free per-level parameters.
+    baked_track = nothing
+    if baked
+        track === nothing &&
+            throw(ArgumentError("baked = true needs a `track` to bake along"))
+        baked_track = bake_track_maps(ctx, spacetime, track;
+                                      n=bake_n, mapw=bake_res,
+                                      maph=bake_res ÷ 2,
+                                      relativistic=relativistic)
+    end
+    τ_now = track === nothing ? 0.0 : track.τ[1]
+
     frame_ms = 16.0
     # Input-pump deadline, in ms, tracked independently of `frame_ms` (see the
     # pump call site). Additive-increase to 90% of a measured GPU frame,
@@ -1115,6 +1136,7 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
             span = track.τ[end] - track.τ[1]
             τr = (time() - t_start) * track_speed
             τn = track_loop ? track.τ[1] + mod(τr, span) : track.τ[1] + τr
+            τ_now = τn
             tp, tf, tu, tv, _ = track_sample(track, τn)
             # Mouse-look as a rotation off the track's own frame rather than a
             # replacement for it, so the roll the worldline carries survives.
@@ -1135,7 +1157,9 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
             passes = 0
             refine_row = 0
             t0 = time()
-            if arcade
+            if baked_track !== nothing
+                render_baked!(ctx.out_gpu, baked_track, τ_now, cam_now)
+            elseif arcade
                 # One direct trace per frame, no fan and no layer ladder: at
                 # arcade resolutions the whole frame is cheaper than the fan
                 # alone would be, and there is nothing to schedule.

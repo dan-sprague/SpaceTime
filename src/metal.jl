@@ -55,6 +55,12 @@ struct MetalPreviewContext{B<:MtlArray{Float32,3}, O<:MtlArray{Float32,3},
     # Compiled kernel per volume mode (Val-specialised, so the no-volume
     # variant keeps the lean kernel's register budget), built lazily.
     kernel::Base.RefValue{Any}
+    # Host views that ALIAS the shared-storage parameter buffers above. Apple
+    # silicon has unified memory, so the per-frame `copyto!` was staging bytes
+    # the GPU could already see -- ~7.5 kB of allocation per frame to move 228.
+    # Filling these in place instead costs nothing and needs no copy.
+    cam_host::Vector{Float32}
+    st_host::Vector{Float32}
 end
 
 """
@@ -108,8 +114,10 @@ function MetalPreviewContext(background, width::Int, height::Int;
                               volume::Union{DiscVolume,Nothing}=nothing)
     bg_gpu = _upload_background(background)
     out_gpu = MtlArray{Float32,3}(undef, 3, width, height)
-    cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 8)
+    cam_params = MtlArray{Float32,1,Metal.SharedStorage}(undef, CAM_PARAMS_N)
+    spacetime_params = MtlArray{Float32,1,Metal.SharedStorage}(undef, 8)
+    cam_host = unsafe_wrap(Array, cam_params); fill!(cam_host, 0.0f0)
+    st_host = unsafe_wrap(Array, spacetime_params); fill!(st_host, 0.0f0)
     disc_params = MtlVector{Float32}(undef, 6)
     if isnothing(disc)
         copyto!(disc_params, zeros(Float32, 6))
@@ -150,7 +158,8 @@ function MetalPreviewContext(background, width::Int, height::Int;
                                !isnothing(volume),
                                Base.RefValue{Bool}(!isnothing(volume)),
                                Base.RefValue{Bool}(true),   # stars off until set_starfield!
-                               Base.RefValue{Any}(Dict{Any,Any}()))
+                               Base.RefValue{Any}(Dict{Any,Any}()),
+                               cam_host, st_host)
 end
 
 """
@@ -783,7 +792,23 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     cr = 0.0f0
     cu = 0.0f0
     cf = 1.0f0
-    if cam_params[21] > 0.5f0
+    if cam_params[21] > 1.5f0
+        # Equirectangular over the whole sphere, used to BAKE a warp map (see
+        # `bake_warp_map`). The map must be indexed by a direction that means
+        # the same thing at bake time and at lookup time, so the angles are
+        # measured against the camera's own axes: θ from forward, φ around it
+        # from right toward up. Baking with a world-aligned camera makes that
+        # index a world direction, which is what the sampler assumes.
+        #
+        # u spans [-W/H, W/H] and v spans [-1, 1], so a 2:1 map covers
+        # φ ∈ [-π, π] and θ ∈ [0, π] exactly.
+        φe = u * 1.5707963f0
+        θe = (v + 1.0f0) * 1.5707963f0
+        sθe = sin(θe)
+        cf = cos(θe)
+        cr = sθe * cos(φe)
+        cu = sθe * sin(φe)
+    elseif cam_params[21] > 0.5f0
         ρ = sqrt(u * u + v * v)
         θp = ρ * cam_params[22]
         sθ = sin(θp)
@@ -1277,13 +1302,34 @@ vertical half-angle at the image's top edge (pixel radius ∝ view angle, so
 fields wider than 180° render cleanly — a rectilinear pinhole caps below
 180° at any focal length). See [`CAM_PARAMS_N`](@ref) for the layout.
 """
+function _ks_cam_params!(dest::Vector{Float32}, cam::Camera, M::Float64;
+                         fisheye_deg::Real=0.0, focus_dist::Real=1.0,
+                         equirect::Bool=false)
+    u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
+                                      cam.up_local, M; beta=camera_beta(cam))
+    fill!(dest, 0.0f0)
+    @inbounds begin
+        dest[1] = cam.pos[1]; dest[2] = cam.pos[2]; dest[3] = cam.pos[3]
+        dest[4] = cam.fov_factor
+        for k in 1:4
+            dest[4 + k]  = Ef[k]; dest[8 + k]  = Er[k]
+            dest[12 + k] = Eu[k]; dest[16 + k] = u4[k]
+        end
+        dest[21] = equirect ? 2.0f0 : (fisheye_deg > 0 ? 1.0f0 : 0.0f0)
+        dest[22] = deg2rad(max(fisheye_deg, 0.0))
+        dest[25] = focus_dist
+    end
+    return dest
+end
+
 function _ks_cam_params(cam::Camera, M::Float64; fisheye_deg::Real=0.0,
-                        focus_dist::Real=1.0)
+                        focus_dist::Real=1.0, equirect::Bool=false)
     u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
                                       cam.up_local, M; beta=camera_beta(cam))
     p = Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
                 Ef..., Er..., Eu..., u4...,
-                fisheye_deg > 0 ? 1.0 : 0.0, deg2rad(max(fisheye_deg, 0.0)),
+                equirect ? 2.0 : (fisheye_deg > 0 ? 1.0 : 0.0),
+                deg2rad(max(fisheye_deg, 0.0)),
                 0.0, 0.0, focus_dist,
                 0.0, 0.0, 0.0]   # lens stratum origin/width, radius, seed
     # Motion-blur block off: seed 0, end pose unused.
@@ -1354,13 +1400,16 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
                20_000)
 
     # Update reusable GPU parameter buffers with a single host-to-device copy.
-    copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
-                                           fisheye_deg=fisheye_deg))
+    _ks_cam_params!(ctx.cam_host, cam, spacetime.M; fisheye_deg=fisheye_deg)
     spin_a, rkill2 = _spin_horizon(spacetime)
     is_kerr = spin_a != 0
-    copyto!(ctx.spacetime_params,
-            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
-                    HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
+    sh = ctx.st_host
+    @inbounds begin
+        sh[1] = M; sh[2] = r_band; sh[3] = r_escape
+        sh[4] = relativistic ? 1.0f0 : 0.0f0
+        sh[5] = HSTEP_COEF[]; sh[6] = HSTEP_CAP[]
+        sh[7] = spin_a; sh[8] = rkill2
+    end
 
     fill!(ctx.out_gpu, 0.0f0)
     if band_rows <= 0 || on_band === nothing
@@ -1457,8 +1506,10 @@ function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
     nmax = min(max(ctx.nmax,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt32)),
                40_000)
-    cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 8)
+    cam_params = MtlArray{Float32,1,Metal.SharedStorage}(undef, CAM_PARAMS_N)
+    spacetime_params = MtlArray{Float32,1,Metal.SharedStorage}(undef, 8)
+    cam_host = unsafe_wrap(Array, cam_params); fill!(cam_host, 0.0f0)
+    st_host = unsafe_wrap(Array, spacetime_params); fill!(st_host, 0.0f0)
     copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
                                        fisheye_deg=fisheye_deg))
     spin_a, rkill2 = _spin_horizon(spacetime)
@@ -1543,8 +1594,10 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
 
     # Own parameter buffers: preview frames may update ctx's buffers while the
     # draft's tiles are still dispatching.
-    cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
-    spacetime_params = MtlVector{Float32}(undef, 8)
+    cam_params = MtlArray{Float32,1,Metal.SharedStorage}(undef, CAM_PARAMS_N)
+    spacetime_params = MtlArray{Float32,1,Metal.SharedStorage}(undef, 8)
+    cam_host = unsafe_wrap(Array, cam_params); fill!(cam_host, 0.0f0)
+    st_host = unsafe_wrap(Array, spacetime_params); fill!(st_host, 0.0f0)
     base_params = _ks_cam_params(cam, spacetime.M; fisheye_deg=fisheye_deg,
                                  focus_dist=focus_dist)
     copyto!(cam_params, base_params)
@@ -2438,13 +2491,16 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
     nmax = min(max(ctx.nmax,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)),
                20_000)
-    copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
-                                           fisheye_deg=fisheye_deg))
+    _ks_cam_params!(ctx.cam_host, cam, spacetime.M; fisheye_deg=fisheye_deg)
     spin_a, rkill2 = _spin_horizon(spacetime)
     is_kerr = spin_a != 0
-    copyto!(ctx.spacetime_params,
-            Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0,
-                    HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
+    sh = ctx.st_host
+    @inbounds begin
+        sh[1] = M; sh[2] = r_band; sh[3] = r_escape
+        sh[4] = relativistic ? 1.0f0 : 0.0f0
+        sh[5] = HSTEP_COEF[]; sh[6] = HSTEP_CAP[]
+        sh[7] = spin_a; sh[8] = rkill2
+    end
 
     lw, lh = size(layer_out, 2), size(layer_out, 3)
     width, height = size(comp_out, 2), size(comp_out, 3)
@@ -2546,4 +2602,244 @@ function _warp_gpu!(ctx::MetalPreviewContext, warp_out, prev, warp_params,
     kern(warp_out, prev, warp_params, width, height, Val(channels);
          threads=threads, groups=cld(n, threads))
     return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Baked warp maps
+# ---------------------------------------------------------------------------
+#
+# Live Kerr tracing costs ~170 ns/pixel: every pixel is a full RK4 geodesic with
+# a hundred-odd steps. A texture lookup costs ~3 ns/pixel. That ratio is not a
+# speedup so much as a change of category — you stop paying for physics per
+# pixel and start paying for bandwidth per pixel.
+#
+# What makes it work here is that lensing maps a WORLD direction to a world
+# direction. It has no dependence on where the camera is pointing, only on
+# where it is. So one map per position serves every orientation: free look,
+# arbitrary roll, any field of view, all from the same table. A racing game can
+# exploit that harder than a free-flight simulator can, because the track
+# constrains the camera to a curve rather than a volume.
+#
+# Two things this v1 does NOT do, both noted where they bite:
+#   * the disc is baked as colour, so it does not animate between bakes;
+#   * the shadow edge is a discontinuity in the map and blending across two
+#     maps there will ghost. Bardeen's closed-form Kerr shadow outline is the
+#     fix, interpolating only the smooth part.
+
+"""
+    bake_warp_map(ctx, spacetime, pos, vel; mapw, maph, relativistic)
+
+Trace one equirectangular environment map at `pos`, for a ship moving at
+coordinate 3-velocity `vel`. Returns `(map_gpu, basis)` where `basis` is the
+world-aligned camera frame the map is indexed against.
+
+The map is baked with a **world-aligned** camera rather than the ship's, which
+is what makes the index a world direction and therefore orientation-independent.
+`vel` still matters: it boosts the observer tetrad, so aberration, Doppler and
+beaming are baked in as the ship at that point would see them.
+"""
+function bake_warp_map(ctx::MetalPreviewContext, spacetime::AbstractSpacetime,
+                       pos::SVector{3,Float64}, vel::SVector{3,Float64};
+                       mapw::Int=1024, maph::Int=512, relativistic::Bool=false)
+    # Camera(pos, pos + x̂, ẑ) — the resulting basis is (x̂, −ŷ, ẑ); the sampler
+    # is handed it explicitly rather than assuming it.
+    cam = Camera(pos, pos + SVector(1.0, 0.0, 0.0), SVector(0.0, 0.0, 1.0),
+                 1.0; velocity = vel)
+    M = Float32(spacetime.M)
+    r_escape = Float32(ctx.r_escape_factor * max(norm(pos), 15.0 * spacetime.M))
+    dt = ctx.dt
+    nmax = min(max(ctx.nmax,
+                   ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)), 20_000)
+    cp = MtlArray(_ks_cam_params(cam, spacetime.M; equirect = true))
+    spin_a, rkill2 = _spin_horizon(spacetime)
+    sp = MtlArray(Float32[M, Float32(2.05 * spacetime.M), r_escape,
+                          relativistic ? 1.0f0 : 0.0f0,
+                          HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
+    out = MtlArray{Float32}(undef, 3, mapw, maph)
+    fill!(out, 0.0f0)
+    _launch_trace!(ctx, out, cp, sp, mapw, maph, nmax, dt,
+                   0.5f0, 0.5f0, 1.0f0, 0, maph; kerr = (spin_a != 0))
+    return out, (cam.fwd, cam.right, cam.up_local)
+end
+
+"""
+Sample two baked maps and cross-fade. `p` carries the field of view, the
+runtime camera basis, the bake basis, and the blend weight — 20 floats.
+
+Blending two maps is a linear interpolation of the lensed sky, which is right
+everywhere the map is smooth and wrong across the shadow edge, where rays
+either escape or are captured and there is no in-between to interpolate. At
+the sample densities here that edge moves less than a texel between bakes, so
+it reads as a slightly soft rim rather than a ghost.
+"""
+function warp_sample_kernel!(out, m0, m1, p, width, height)
+    idx = thread_position_in_grid().x
+    if idx > width * height
+        return
+    end
+    j = (idx - 1) ÷ width + 1
+    i = (idx - 1) % width + 1
+
+    fov = p[1]
+    half_h = Float32(height) / 2.0f0
+    uu = (Float32(i) - 0.5f0 - Float32(width) / 2.0f0) / half_h
+    vv = (Float32(j) - 0.5f0 - Float32(height) / 2.0f0) / half_h
+    dlx = uu * fov
+    dly = vv * fov
+    ν = sqrt(dlx * dlx + dly * dly + 1.0f0)
+    cr = dlx / ν
+    cu = dly / ν
+    cf = 1.0f0 / ν
+
+    # Pixel direction in world coordinates, via the runtime camera basis...
+    dx = cf * p[2] + cr * p[5] + cu * p[8]
+    dy = cf * p[3] + cr * p[6] + cu * p[9]
+    dz = cf * p[4] + cr * p[7] + cu * p[10]
+    # ...then re-expressed on the bake basis, which is how the map is indexed.
+    bf = dx * p[11] + dy * p[12] + dz * p[13]
+    br = dx * p[14] + dy * p[15] + dz * p[16]
+    bu = dx * p[17] + dy * p[18] + dz * p[19]
+
+    θ = acos(clamp(bf, -1.0f0, 1.0f0))
+    φ = atan(bu, br)
+
+    W = size(m0, 2)
+    H = size(m0, 3)
+    fH = Float32(H)
+    fu = φ * fH / 3.1415927f0 + Float32(W) / 2.0f0
+    fv = θ * fH / 3.1415927f0
+
+    i0 = unsafe_trunc(Int32, floor(fu - 0.5f0))
+    j0 = unsafe_trunc(Int32, floor(fv - 0.5f0))
+    tu = fu - 0.5f0 - Float32(i0)
+    tv = fv - 0.5f0 - Float32(j0)
+    # φ wraps, θ clamps: the poles are single points, not a seam. Branches
+    # rather than `mod` — integer modulo is a multi-cycle op and this kernel is
+    # doing two of them per pixel for no reason; fu is already within one
+    # period of range.
+    iW = Int32(W)
+    ia = i0 < Int32(0) ? i0 + iW : (i0 >= iW ? i0 - iW : i0)
+    i1 = i0 + Int32(1)
+    ib = i1 < Int32(0) ? i1 + iW : (i1 >= iW ? i1 - iW : i1)
+    ia += Int32(1); ib += Int32(1)
+    ja = clamp(j0, Int32(0), Int32(H - 1)) + Int32(1)
+    jb = clamp(j0 + Int32(1), Int32(0), Int32(H - 1)) + Int32(1)
+
+    w = p[20]
+    @inbounds for c in 1:3
+        a0 = m0[c, ia, ja] * (1.0f0 - tu) + m0[c, ib, ja] * tu
+        a1 = m0[c, ia, jb] * (1.0f0 - tu) + m0[c, ib, jb] * tu
+        s0 = a0 * (1.0f0 - tv) + a1 * tv
+        b0 = m1[c, ia, ja] * (1.0f0 - tu) + m1[c, ib, ja] * tu
+        b1 = m1[c, ia, jb] * (1.0f0 - tu) + m1[c, ib, jb] * tu
+        s1 = b0 * (1.0f0 - tv) + b1 * tv
+        out[c, i, j] = s0 * (1.0f0 - w) + s1 * w
+    end
+    return nothing
+end
+
+"""
+    BakedTrack
+
+Warp maps baked along a track, plus the persistent buffers the sampler needs.
+The parameter buffer lives here rather than being built per frame: allocating a
+GPU buffer every frame cost ~2.5 ms of fixed overhead, which at 256x144 was
+most of the frame.
+"""
+struct BakedTrack{M,K}
+    maps::Vector{M}
+    τ::Vector{Float64}
+    basis::NTuple{3,SVector{3,Float64}}
+    # Shared storage plus a host view that ALIASES it. Apple silicon has
+    # unified memory, so staging 20 floats through a host vector and calling
+    # `copyto!` was copying a buffer to itself -- 989 B of allocation per frame
+    # to move 80 bytes that were already visible to the GPU. Writing through
+    # `host` is free and the kernel sees it immediately.
+    params::MtlVector{Float32,Metal.SharedStorage}
+    host::Vector{Float32}
+    kernel::K
+end
+
+"""
+    render_baked!(out, bt, τ, cam)
+
+Composite one frame from the two maps bracketing proper time `τ`. This is the
+whole runtime cost of the lensing: two bilinear fetches per pixel and a lerp,
+with not one geodesic integrated.
+"""
+function render_baked!(out, bt::BakedTrack, τ::Real, cam::Camera)
+    n = length(bt.τ)
+    k = clamp(searchsortedfirst(bt.τ, τ), 2, n)
+    w = n == 1 ? 0.0 :
+        clamp((τ - bt.τ[k-1]) / (bt.τ[k] - bt.τ[k-1]), 0.0, 1.0)
+    Fb, Rb, Ub = bt.basis
+    h = bt.host
+    h[1] = cam.fov_factor
+    h[2], h[3], h[4] = cam.fwd
+    h[5], h[6], h[7] = cam.right
+    h[8], h[9], h[10] = cam.up_local
+    h[11], h[12], h[13] = Fb
+    h[14], h[15], h[16] = Rb
+    h[17], h[18], h[19] = Ub
+    h[20] = Float32(w)
+    width = size(out, 2); height = size(out, 3)
+    m0 = bt.maps[k-1]; m1 = bt.maps[k]
+    # `maps` and `kernel` are both concretely typed (see `bake_track_maps`), so
+    # this whole function is allocation-free apart from what Metal's own launch
+    # path does. It ran as Vector{Any} first, which boxed a map handle on every
+    # frame for no reason.
+    N = width * height
+    threads = min(bt.kernel.pipeline.maxTotalThreadsPerThreadgroup, N)
+    bt.kernel(out, m0, m1, bt.params, width, height;
+              threads=threads, groups=cld(N, threads))
+    return nothing
+end
+
+"""
+    bake_track_maps(ctx, spacetime, track; n, mapw, maph)
+
+Bake `n` warp maps evenly spaced in proper time along `track`, as a
+[`BakedTrack`](@ref).
+
+Bake cost is set by total texel count, not by how it is split: ~33M geodesics
+takes a couple of seconds on an M3, which is a loading screen, not a build
+step. That is what makes mass, spin and disc geometry free per-level
+parameters — the table does not have to ship.
+"""
+function bake_track_maps(ctx::MetalPreviewContext, spacetime::AbstractSpacetime,
+                         track; n::Int=64, mapw::Int=1024, maph::Int=512,
+                         relativistic::Bool=false, verbose::Bool=true)
+    τ0, τ1 = track.τ[1], track.τ[end]
+    τs = collect(range(τ0, τ1; length=n))
+    t0 = time()
+    # Bake the first map to learn its concrete type, then allocate the vector
+    # for it. Vector{Any} here propagates into BakedTrack{Any} and costs a
+    # dynamic dispatch and a box on every single rendered frame.
+    p1, _, _, v1, _ = track_sample(track, τs[1])
+    m1, basis = bake_warp_map(ctx, spacetime, p1, v1;
+                              mapw=mapw, maph=maph, relativistic=relativistic)
+    maps = Vector{typeof(m1)}(undef, n)
+    maps[1] = m1
+    for k in 2:n
+        pos, _, _, vel, _ = track_sample(track, τs[k])
+        maps[k], _ = bake_warp_map(ctx, spacetime, pos, vel;
+                                   mapw=mapw, maph=maph,
+                                   relativistic=relativistic)
+    end
+    Metal.synchronize()
+    if verbose
+        rays = n * mapw * maph
+        @printf("baked %d maps (%dx%d, %.1fM geodesics) in %.2f s — %.1f MB\n",
+                n, mapw, maph, rays / 1e6, time() - t0,
+                n * 3 * mapw * maph * 4 / 1e6)
+    end
+    # Compile the sampler eagerly against a dummy output so the kernel object
+    # can be stored concretely rather than fetched from a Ref{Any} per frame.
+    pbuf = MtlArray{Float32,1,Metal.SharedStorage}(undef, 20)
+    phost = unsafe_wrap(Array, pbuf)
+    fill!(phost, 0.0f0)
+    dummy = MtlArray{Float32}(undef, 3, 1, 1)
+    kern = @metal launch=false warp_sample_kernel!(dummy, maps[1], maps[1],
+                                                   pbuf, 1, 1)
+    return BakedTrack(maps, τs, basis, pbuf, phost, kern)
 end

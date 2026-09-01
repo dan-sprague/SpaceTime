@@ -42,13 +42,20 @@ disc = AccretionDisc(inner_radius = 3.0, outer_radius = 20.0,
                      blackbody = Blackbody(wb_temperature = 5000.0),
                      density_falloff = 0.8)
 
-cam = Camera(track.pos[1], track.pos[1] + track.fwd[1], track.up[1], Lens(24.0))
+cam = Camera(track.pos[1], track.pos[1] + track.fwd[1], track.up[1], Lens(10.0))
 
 fly_native(cam, spacetime, bg;
            disc = disc,
            track = track,
            track_speed = 2.5,       # proper seconds of ship time per wall second
            track_loop = true,
+           focal = 10.0,             # 10mm: the wide field is where lensing reads
+           # Bake the lensing into warp maps along the track instead of tracing
+           # it every frame. Lensing maps a world direction to a world
+           # direction, so ONE map per position serves every orientation --
+           # look around all you like, it costs nothing extra. Set false to
+           # trace live and compare; the image should be the same.
+           baked = true, bake_n = 48, bake_res = 1024,
            width = 256, height = 144,
            winwidth = 1280, winheight = 720,
            arcade = true,
