@@ -108,7 +108,8 @@ for f in 1:NFRAMES
     post = postprocess(img; gain=1.0, exposure=0.8, gamma=0.2, bloom_strength=1.0,
                        threshold=0.5, bloom_radius=10.0, bloom_power=1.5,
                        streak_strength=2.0, streak_length=0.1, streak_width=1.0,
-                       n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75)
+                       n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75,
+                       ref_height=360)
     sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0, saturation=1.0e6)
     apply_vignette!(post; strength=0.3)
     rot = map(clamp01nan, rotr90(post))

@@ -61,20 +61,31 @@ function _lens_dust_speck!(image::Matrix{RGBf}, cx::Float64, cy::Float64,
 end
 
 """
-    apply_lens_dust!(image; lens_dust::LensDust=LensDust(), rng=default_rng())
+    apply_lens_dust!(image; lens_dust::LensDust=LensDust(), ref_height=nothing,
+                     rng=default_rng())
 
 Apply random lens dust specks to `image` in-place.  Each speck is a small
 dark circular patch with soft edges, simulating dust on the lens or sensor.
+
+`LensDust` speck radii are in pixels, so the same numbers make specks that
+cover six times less of the frame at 2160 lines than at 360 — but a real mote
+on the glass covers a fixed *fraction* of the frame no matter what sensor is
+behind it. Pass `ref_height`, the height the sizes were chosen at, to scale
+them and keep the dust the same physical size. Left off, behaviour is
+unchanged.
 """
 function apply_lens_dust!(image::Matrix{RGBf}; lens_dust::LensDust=LensDust(),
+                          ref_height::Union{Real,Nothing}=nothing,
                           rng::Random.AbstractRNG=Random.default_rng())
     lens_dust.count <= 0 && return image
     w, h = size(image)
+    sc = ref_height === nothing ? 1.0 : h / Float64(ref_height)
 
     for _ in 1:lens_dust.count
         cx = rand(rng) * (w - 1) + 1.0
         cy = rand(rng) * (h - 1) + 1.0
-        radius = lens_dust.size_min + rand(rng) * (lens_dust.size_max - lens_dust.size_min)
+        radius = sc * (lens_dust.size_min +
+                       rand(rng) * (lens_dust.size_max - lens_dust.size_min))
         opacity = lens_dust.opacity_min + rand(rng) * (lens_dust.opacity_max - lens_dust.opacity_min)
         _lens_dust_speck!(image, cx, cy, radius, opacity, lens_dust.edge_softness)
     end
@@ -178,18 +189,26 @@ end
 
 """
     apply_micro_streaks!(image; streaks::MicroStreaks=MicroStreaks(),
-                          rng=default_rng())
+                          ref_height=nothing, rng=default_rng())
 
 Add random micrometeoroid streaks to `image` in-place.  Streaks are
 concentrated near the equatorial plane (accretion disc plane) and have a
 warm colour cast.
+
+Streak lengths and widths are in pixels, so like lens dust they shrink
+relative to the frame as resolution rises — a particle crossing the field
+during an exposure sweeps a fixed fraction of the frame, not a fixed pixel
+count. Pass `ref_height`, the height the sizes were chosen at, to scale them.
+Left off, behaviour is unchanged.
 """
 function apply_micro_streaks!(image::Matrix{RGBf};
                               streaks::MicroStreaks=MicroStreaks(),
+                              ref_height::Union{Real,Nothing}=nothing,
                               rng::Random.AbstractRNG=Random.default_rng())
     streaks.count <= 0 && return image
     w, h = size(image)
     cx, cy = w / 2.0, h / 2.0
+    sc = ref_height === nothing ? 1.0 : h / Float64(ref_height)
 
     for _ in 1:streaks.count
         # Random angle, biased toward the disc plane (horizontal)
@@ -198,8 +217,10 @@ function apply_micro_streaks!(image::Matrix{RGBf};
         angle = base_angle + disc_tilt
 
         cos_a, sin_a = cos(angle), sin(angle)
-        length_s = streaks.length_min + rand(rng) * (streaks.length_max - streaks.length_min)
-        sigma = streaks.width_min + rand(rng) * (streaks.width_max - streaks.width_min)
+        length_s = sc * (streaks.length_min +
+                         rand(rng) * (streaks.length_max - streaks.length_min))
+        sigma = sc * (streaks.width_min +
+                      rand(rng) * (streaks.width_max - streaks.width_min))
         brightness = streaks.brightness_min + rand(rng) * (streaks.brightness_max - streaks.brightness_min)
 
         # Random midpoint position

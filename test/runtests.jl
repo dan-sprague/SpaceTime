@@ -135,6 +135,45 @@ end
     @test size(img2) == (20, 20)
 end
 
+@testset "Resolution-independent post" begin
+    # Bloom radius and streak width are given in pixels, so the same numbers
+    # produce a tighter look on a larger frame unless `ref_height` rescales
+    # them. Measure the glow around a lone bright pixel as a fraction of frame
+    # height and require the two resolutions to agree.
+    function glow_fraction(w, h; kwargs...)
+        img = fill(RGBf(0, 0, 0), w, h)
+        img[w ÷ 2, h ÷ 2] = RGBf(50, 50, 50)
+        p = postprocess(img; gain=1.0, exposure=0.0, gamma=1.0,
+                        bloom_strength=1.0, threshold=0.5, bloom_radius=10.0,
+                        bloom_power=1.5, streak_strength=0.0, tonemap=:none,
+                        kwargs...)
+        cx, cy = w ÷ 2, h ÷ 2
+        prof = [Float64(p[cx + k, cy].r) for k in 1:min(cx, cy) - 2]
+        r = findfirst(<(0.05 * prof[1]), prof)
+        return (r === nothing ? length(prof) : r) / h
+    end
+
+    small = glow_fraction(320, 180)
+    big_unscaled = glow_fraction(960, 540)
+    big_scaled = glow_fraction(960, 540; ref_height=180)
+
+    # Unscaled, tripling the frame shrinks the glow to about a third of it.
+    @test big_unscaled < 0.5 * small
+    # Scaled, the glow covers the same fraction of the frame at both sizes.
+    @test big_scaled ≈ small rtol = 0.15
+
+    # Lens-plane effects take the same treatment: a speck of dust covers a
+    # fixed fraction of the frame regardless of the sensor behind it.
+    darkness(img) = 1.0 - sum(Float64(c.r) for c in img) / length(img)
+    dust = LensDust(count=12, size_min=3.0, size_max=3.0,
+                    opacity_min=0.8, opacity_max=0.8)
+    a = fill(RGBf(1, 1, 1), 320, 180)
+    b = fill(RGBf(1, 1, 1), 960, 540)
+    apply_lens_dust!(a; lens_dust=dust, rng=Xoshiro(1))
+    apply_lens_dust!(b; lens_dust=dust, ref_height=180, rng=Xoshiro(1))
+    @test darkness(b) ≈ darkness(a) rtol = 0.25
+end
+
 @testset "Ship dynamics" begin
     M = 1.0
 

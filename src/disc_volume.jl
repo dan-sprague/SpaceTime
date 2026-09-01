@@ -14,13 +14,84 @@ renderers won't know the difference.
 """
 
 """
+Grid resolution and noise depth the shipped look was tuned at: 192×256×48
+cells over 4 fBm octaves, composed and graded at 360-line proxy renders.
+[`volume_resolution`](@ref) scales from here.
+"""
+const VOLUME_BASE_DIMS = (192, 256, 48)
+const VOLUME_BASE_OCTAVES = 4
+const VOLUME_REF_HEIGHT = 360
+
+"""
+    volume_resolution(target_height; ref_height=360, base=VOLUME_BASE_DIMS,
+                      base_octaves=4, max_cells=64_000_000)
+        -> (nr, nphi, nz, octaves)
+
+Grid dimensions and fBm depth for rendering at `target_height` lines.
+
+**Measured result: this does not make the gas look more detailed.** Keep the
+default grid unless you have a specific reason not to; this exists so the
+experiment does not have to be repeated.
+
+The reasoning that motivates it is sound as far as it goes — the gas grid is
+independent of output resolution, so at 2160 lines an azimuthal cell at the
+disc's outer edge spans ~0.49M against a pixel footprint near 0.0085M, one
+cell covering tens of pixels. Scaling cells alone would only resolve the same
+four octaves more smoothly, so octaves are scaled too (the finest sits at
+9.26× the base frequency, already near Nyquist across 192 radial cells).
+
+What that misses is why the extra structure never reaches the image:
+
+- fBm halves its amplitude every octave, so a fifth octave carries about **3%**
+  of the signal. Depth is nearly invisible by construction.
+- Emission is alpha-composited along each ray, and a line integral is a
+  low-pass filter. Every pixel already averages over many cells along its path,
+  so fine 3-D structure is smeared out unless it is coherent along the line of
+  sight — and isotropic fBm is not.
+
+Going from 2.4M to 63.7M cells (255 MB, 11 s of bake) and 4 to 5 octaves
+changed high-frequency image energy by **0.98×**, i.e. not at all; adding a 5×
+finer ray march on top of that gave 0.95×. The gas look is limited by the
+noise *spectrum*, not by resolution. The lever that does work is the amplitude
+falloff in `_fbm` (`amp *= 0.5`), which costs nothing to change.
+
+Cells grow linearly with resolution until `max_cells` (64M ≈ 256 MB at
+Float32), then all three axes are scaled back together to preserve the aspect
+of the base grid. Octaves grow as log2 of the linear scale.
+"""
+function volume_resolution(target_height::Real;
+                           ref_height::Real=VOLUME_REF_HEIGHT,
+                           base::NTuple{3,Int}=VOLUME_BASE_DIMS,
+                           base_octaves::Int=VOLUME_BASE_OCTAVES,
+                           max_cells::Int=64_000_000)
+    s = max(Float64(target_height) / Float64(ref_height), 1.0)
+    nr, nphi, nz = ceil.(Int, base .* s)
+    cells = nr * nphi * nz
+    if cells > max_cells
+        # Shrink all axes by a common factor so the grid keeps its shape.
+        f = (max_cells / cells)^(1 / 3)
+        nr = max(base[1], floor(Int, nr * f))
+        nphi = max(base[2], floor(Int, nphi * f))
+        nz = max(base[3], floor(Int, nz * f))
+    end
+    octaves = base_octaves + max(0, floor(Int, log2(s)))
+    return (nr, nphi, nz, octaves)
+end
+
+"""
     DiscVolume(disc::AccretionDisc; M=1.0, nr=192, nphi=256, nz=48,
-               scale_height=0.08, turbulence=0.8, spiral_twist=4.0,
-               noise_octaves=4, emission_scale=0.8, opacity_scale=1.2,
-               rng=Random.default_rng())
+               target_height=nothing, scale_height=0.08, turbulence=0.8,
+               spiral_twist=4.0, noise_octaves=4, emission_scale=0.8,
+               opacity_scale=1.2, rng=Random.default_rng())
 
 Build a volumetric disc for `disc`'s annulus around a black hole of mass `M`.
 
+- `target_height`: output frame height this grid will be rendered at, sizing
+  `nr`/`nphi`/`nz`/`noise_octaves` via [`volume_resolution`](@ref) and
+  overriding those four arguments. **Measured not to improve the look** — see
+  `volume_resolution` for why (the fBm amplitude spectrum and the line
+  integral along each ray, not the grid, are what limit gas detail). Off by
+  default; the shipped look is 192×256×48 at 4 octaves.
 - `scale_height`: H(s) = scale_height · s (flared slab); the grid spans
   ±3 scale heights at the outer edge.
 - `turbulence`: relative amplitude of the fractal density modulation.
@@ -45,11 +116,16 @@ end
 const WRAP_BLEND = deg2rad(18.0)
 
 function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
-                    nphi::Int=256, nz::Int=48, scale_height::Real=0.08,
+                    nphi::Int=256, nz::Int=48,
+                    target_height::Union{Real,Nothing}=nothing,
+                    scale_height::Real=0.08,
                     turbulence::Real=0.8, spiral_twist::Real=4.0,
                     noise_octaves::Int=4,
                     emission_scale::Real=0.8, opacity_scale::Real=1.2,
                     rng::Random.AbstractRNG=Random.default_rng())
+    if target_height !== nothing
+        nr, nphi, nz, noise_octaves = volume_resolution(target_height)
+    end
     s_in = disc.inner_radius
     s_out = disc.outer_radius
     z_max = 3.0 * scale_height * s_out

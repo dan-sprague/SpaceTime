@@ -58,7 +58,10 @@ post = postprocess(img;
                    streak_width=1.0,
                    n_spikes=4,
                    tonemap=:aces,
-                   tonemap_hue_preserve=0.75)
+                   tonemap_hue_preserve=0.75,
+                   # The 4K frame is the deliverable, so the look is anchored
+                   # there and SKIM_LOWRES drafts scale down to match it.
+                   ref_height=2160)
 
 sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0, saturation=1.0e6)
 apply_vignette!(post; strength=0.3)
