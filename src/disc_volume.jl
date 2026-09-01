@@ -39,6 +39,11 @@ struct DiscVolume
     opacity_scale::Float32
 end
 
+# Width of the azimuthal crossfade that closes the noise seam at the ϕ=0↔2π
+# wrap: a couple of base-frequency filament arcs, so the blend hides among
+# the turbulence it is stitching.
+const WRAP_BLEND = deg2rad(18.0)
+
 function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
                     nphi::Int=256, nz::Int=48, scale_height::Real=0.08,
                     turbulence::Real=0.8, spiral_twist::Real=4.0,
@@ -66,6 +71,18 @@ function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
                 u = ϕ + spiral_twist * log(s / s_in)
                 n = _fbm(lattice, 10.0 * log(s), 6.0 * u, 2.0 * z / H,
                          noise_octaves)
+                # `u` is not periodic in ϕ (the noise argument jumps 6·2π
+                # lattice units across the 0↔2π wrap), which printed a
+                # filament seam along the ϕ=0 half-plane. Crossfade the last
+                # WRAP_BLEND of azimuth onto the ϕ−2π branch so the wrap
+                # column rejoins ϕ=0; only this sector's filaments change.
+                if ϕ > 2π - WRAP_BLEND
+                    w = (ϕ - (2π - WRAP_BLEND)) / WRAP_BLEND
+                    w = w * w * (3.0 - 2.0 * w)
+                    n2 = _fbm(lattice, 10.0 * log(s), 6.0 * (u - 2π),
+                              2.0 * z / H, noise_octaves)
+                    n = (1.0 - w) * n + w * n2
+                end
                 # Log-normal modulation: fBm has a small linear variance
                 # (~±0.12), so exponentiate to get filament-scale density
                 # contrast (turbulence=1 → roughly 20× between wisp and gap).
@@ -164,6 +181,128 @@ function sample_disc_volume(vol::DiscVolume, s, ϕ, z)
     c0 = c00 + tp * (c10 - c00)
     c1 = c01 + tp * (c11 - c01)
     return Float64(c0 + tz * (c1 - c0))
+end
+
+# ---------------------------------------------------------------------------
+# Slow disc flares: subtle brightness dynamics on the static grid
+# ---------------------------------------------------------------------------
+
+"""
+One flare event: a Gaussian patch in (log s, φ) that rises over `rise`
+seconds of footage, decays over `decay` seconds, and drifts at its radius's
+Keplerian rate. `amp` is the peak fractional density gain (the brightness
+bump is at most that, since opacity responds sublinearly).
+"""
+struct DiscFlare
+    t0::Float64        # onset, footage seconds
+    rise::Float64      # attack, seconds
+    decay::Float64     # exponential decay constant, seconds
+    amp::Float64       # peak density gain − 1
+    s0::Float64        # patch radius (M)
+    φ0::Float64        # patch azimuth at t = 0
+    σls::Float64       # radial width in log s
+    σφ::Float64        # azimuthal width (rad)
+end
+
+"""
+    DiscFlares(vol; duration=30.0, nflares=8, M_per_s=4.0,
+               amp=(0.5, 1.1), rise=(2.0, 4.0), decay=(4.0, 8.0),
+               rng=Xoshiro(11))
+
+Seeded schedule of slow, subtle flares for a video of `duration` footage
+seconds. Events are stretched into arcs (σφ ≫ σls, matching the sheared
+filaments) and stagger across the timeline. `M_per_s` maps footage seconds to
+coordinate M-time so the drift matches the shot's own time-lapse rate.
+
+Flares live in the **outer** disc (roughly 12-19M for a 3-20M annulus), and
+`amp` is a density gain of order 1 rather than a few percent, because
+brightness saturates as `a = 1 − exp(−τ)`: the inner disc is optically thick,
+so density there buys almost no light (measured: +300% density at 10M moves
+under 5% of pixels by 0.02), while the thin outer gas responds nearly
+linearly. Emission also falls with radius, so an outer flare reads as a
+gentle swell of the extended glow — not a hotspot.
+
+The intended use is the **static** gas grid: call
+[`apply_flares!`](@ref) once per frame before rendering. The live fluid sim
+owns `ctx.vol_gpu` and would overwrite the modulation — don't combine them.
+"""
+struct DiscFlares
+    events::Vector{DiscFlare}
+    M_per_s::Float64
+    gain::Matrix{Float32}        # (nr, nphi) scratch
+    scratch::Array{Float32,3}    # modulated density upload buffer
+end
+
+function DiscFlares(vol::DiscVolume;
+                    duration::Real=30.0, nflares::Int=8, M_per_s::Real=4.0,
+                    amp::NTuple{2,Real}=(0.5, 1.1),
+                    rise::NTuple{2,Real}=(2.0, 4.0),
+                    decay::NTuple{2,Real}=(4.0, 8.0),
+                    rng::Random.AbstractRNG=Random.Xoshiro(11))
+    nr, nphi, _ = size(vol.density)
+    lsin, lsout = Float64(vol.log_s_in), Float64(vol.log_s_out)
+    lerp(a, b, u) = a + (b - a) * u
+    events = [DiscFlare(rand(rng) * duration,
+                        lerp(rise..., rand(rng)),
+                        lerp(decay..., rand(rng)),
+                        lerp(amp..., rand(rng)),
+                        # Outer band of the log-radius range: optically thin
+                        # enough that density reads as brightness, and slow
+                        # enough (a couple of deg/s) not to whip around.
+                        exp(lerp(lsin, lsout, 0.75 + 0.22 * rand(rng))),
+                        rand(rng) * 2π,
+                        0.14 + 0.08 * rand(rng),
+                        0.40 + 0.30 * rand(rng)) for _ in 1:nflares]
+    return DiscFlares(events, Float64(M_per_s),
+                      Matrix{Float32}(undef, nr, nphi),
+                      similar(vol.density))
+end
+
+"""
+    apply_flares!(ctx::MetalPreviewContext, vol::DiscVolume,
+                  fl::DiscFlares, t::Real)
+
+Upload `vol`'s density modulated by the flare gain field at footage time `t`
+(seconds) into `ctx.vol_gpu`. Deterministic in `t`, so approval frames match
+the final run. ~ms of CPU work and a ~9 MB upload per call.
+
+`ctx` is a `MetalPreviewContext`; it is untyped here because this file is
+included before the Metal renderer defines that type.
+"""
+function apply_flares!(ctx, vol::DiscVolume, fl::DiscFlares, t::Real)
+    g = fl.gain
+    nr, nphi = size(g)
+    lsin, lsout = Float64(vol.log_s_in), Float64(vol.log_s_out)
+    fill!(g, 1.0f0)
+    for ev in fl.events
+        τ = t - ev.t0
+        env = τ <= 0.0 ? 0.0 :
+              τ < ev.rise ? (u = τ / ev.rise; u * u * (3.0 - 2.0 * u)) :
+              exp(-(τ - ev.rise) / ev.decay)
+        env < 1.0e-3 && continue
+        a = ev.amp * env
+        # Keplerian co-rotation at the shot's time-lapse rate (M = 1).
+        φc = ev.φ0 + sqrt(1.0 / ev.s0^3) * fl.M_per_s * t
+        ls0 = log(ev.s0)
+        for j in 1:nphi
+            dφ = rem((j - 1) / nphi * 2π - φc, 2π, RoundNearest)
+            wφ = a * exp(-dφ^2 / (2.0 * ev.σφ^2))
+            wφ < 1.0e-3 && continue
+            for i in 1:nr
+                dls = lsin + (i - 1) / (nr - 1) * (lsout - lsin) - ls0
+                g[i, j] += Float32(wφ * exp(-dls^2 / (2.0 * ev.σls^2)))
+            end
+        end
+    end
+    d = vol.density
+    sc = fl.scratch
+    Threads.@threads for k in axes(d, 3)
+        @inbounds for j in axes(d, 2), i in axes(d, 1)
+            sc[i, j, k] = d[i, j, k] * g[i, j]
+        end
+    end
+    copyto!(ctx.vol_gpu, sc)
+    return nothing
 end
 
 # ---------------------------------------------------------------------------

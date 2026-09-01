@@ -72,6 +72,7 @@ export visualize_solution, trace_fan, compare_hamiltonian_drift, shadow_radius
 # --- Accretion disc and emission
 export Blackbody, AccretionDisc, get_disc_color_doppler
 export DiscVolume, sample_disc_volume
+export DiscFlare, DiscFlares, apply_flares!
 export DiscFluidSim, step_sim!
 
 # --- Cameras

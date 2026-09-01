@@ -21,19 +21,29 @@
 #                     seeded per index, so approved frames are bit-identical
 #                     to the same frames of the full render.
 #   ONLY=n            render just frame n and exit (no mp4).
-#   SAMPLES=n         rays-per-pixel-axis (default 2)
+#   SAMPLES=n         rays-per-pixel-axis for the fisheye flight (default 2)
+#   TAIL_SAMPLES=n    rays-per-pixel-axis for the rectilinear tail (default 4:
+#                     the landing must match the CPU hero, and at 2 the gas
+#                     halo speckles — verified sampling noise, not sensor
+#                     grain. The flight hides 2-sample noise under motion.)
 #   NFRAMES=n         frame count (default 720 = 30 s at 24 fps); OUT=path
 #                     overrides the mp4 path
 #   REL=1|0           observer-frame relativity (default 1): boosts the camera
 #                     tetrad by the ship velocity along the path — aberration,
 #                     motion Doppler, beaming. Output name gains "_rel".
 #   T_M=x             flight duration in M-time for REL (default 140, ~0.5c peak)
-#   HUD=1|0           burn the telemetry overlay into the frames (default = REL)
+#   HUD=1|0           burn the telemetry overlay into the frames (default 0)
 #   GAS=static|live|smooth  disc gas (default static: frozen fBm filaments —
 #                     deterministic, no per-frame sim cost). live steps the
 #                     fluid sim through the flight like render_escape.jl.
 #                     The volume parameters are the hero shot's (dense, thin,
 #                     bright), not render_escape.jl's dilute flythrough haze.
+#   FLARES=n          slow brightness flares on the static gas (default 8;
+#                     0 disables). Gaussian arcs in the optically thin outer
+#                     disc (12-19M) that swell over 2-4 s, decay over 4-8 s,
+#                     and drift at their radius's Keplerian rate — subtle,
+#                     and much slower than the live fluid sim. Ignored for
+#                     GAS=live, which owns the density buffer itself.
 #   F_NUMBER=n        f-stop of the 33mm tail (default 11 — deep DoF; the
 #                     hero was f/5.6)
 #   MOTION=1|0        180-degree-shutter motion blur (default 1): the samples^2
@@ -62,12 +72,14 @@ const FPS = 24
 const W = parse(Int, get(ENV, "WIDTH", "3840"))
 const H = parse(Int, get(ENV, "HEIGHT", "2160"))
 const SAMPLES = parse(Int, get(ENV, "SAMPLES", "2"))
+const TAIL_SAMPLES = parse(Int, get(ENV, "TAIL_SAMPLES", "4"))
 const NFRAMES = parse(Int, get(ENV, "NFRAMES", "720"))
 const REL = get(ENV, "REL", "1") == "1"
 const T_M = parse(Float64, get(ENV, "T_M", "140.0"))
-const HUD = get(ENV, "HUD", REL ? "1" : "0") == "1"
+const HUD = get(ENV, "HUD", "0") == "1"
 const GAS = get(ENV, "GAS", "static")
 const F_NUMBER = parse(Float64, get(ENV, "F_NUMBER", "11.0"))
+const FLARES = parse(Int, get(ENV, "FLARES", "8"))
 const MOTION = get(ENV, "MOTION", "1") == "1"
 const JITTER = get(ENV, "JITTER", "1") == "1"
 const BETA_SMOOTH = parse(Float64, get(ENV, "BETA_SMOOTH", "0.015"))
@@ -102,6 +114,12 @@ if sim !== nothing
         step_sim!(sim, ctx; dt=0.08)
     end
 end
+# Slow flares modulate the static grid; the fluid sim owns that buffer itself,
+# so the two are mutually exclusive. Events are scheduled over the footage
+# duration at the flight's own M-time rate (T_M over the shot).
+flares = (FLARES > 0 && sim === nothing) ?
+    DiscFlares(vol; duration=NFRAMES / FPS, nflares=FLARES,
+               M_per_s=T_M / (NFRAMES / FPS), rng=Xoshiro(11)) : nothing
 
 # Ship velocity from the path: wide central difference (low-passes keyframe
 # acceleration kinks), smooth tanh speed limit, smoothstep taper to zero at
@@ -128,6 +146,7 @@ const FE33 = rad2deg(atan(FOV33))         # FOV-matched fisheye half-angle ≈ 2
 const T_LENS0, T_LENS1 = 0.50, 0.72
 fe_frame = Vector{Float64}(undef, NFRAMES)     # fisheye half-angle (0 = rectilinear)
 morph_a = Vector{Float64}(undef, NFRAMES)      # projection morph weight
+k1_frame = Vector{Float64}(undef, NFRAMES)     # hero barrel distortion, ramped in
 for f in 1:NFRAMES
     t = (f - 1) / (NFRAMES - 1)
     _, _, _, fe_path = path_at(t)
@@ -140,6 +159,9 @@ for f in 1:NFRAMES
     else
         fe_frame[f], morph_a[f] = 0.0, 0.0
     end
+    # The hero's k1 = -0.02 barrel, eased in over the tail's first second so
+    # the landing grades identically to hero_shot.jl without a mid-shot pop.
+    k1_frame[f] = -0.02 * clamp((t - T_LENS1) / 0.033, 0.0, 1.0)
 end
 
 """
@@ -221,6 +243,7 @@ workers = map(1:NPOST) do _
         sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0,
                        saturation=1.0e6, rng=Xoshiro(70_000 + f))
         apply_vignette!(post; strength=0.3)
+        k1_frame[f] != 0.0 && apply_lens_distortion!(post; k1=k1_frame[f])
         rot = map(clamp01nan, rotr90(post))
         HUD && draw_hud!(rot, hud_lines[f])
         save(joinpath(pngdir, @sprintf("f%04d.png", f)), rot)
@@ -265,6 +288,9 @@ for f in 1:NFRAMES
     t = (f - 1) / (NFRAMES - 1)
     sim !== nothing && step_sim!(sim, ctx; dt=2.5 / FPS)
     f in render_set || continue
+    # Flare gain is a pure function of footage time, so a sampled subset of
+    # frames is exact — no need to advance it on skipped frames.
+    flares !== nothing && apply_flares!(ctx, vol, flares, (f - 1) / FPS)
 
     # Pose at shutter fraction s ∈ [0,1): path time and jitter both advance
     # across the open shutter (jitter lerped toward the next frame's state).
@@ -282,7 +308,8 @@ for f in 1:NFRAMES
     fo = 0.9 * norm(cam.pos)
     ap = fe_frame[f] > 0.0 ? 0.0 : fo / F_NUMBER
 
-    img = render_draft_mtl(ctx, cam, st; width=W, height=H, samples=SAMPLES,
+    img = render_draft_mtl(ctx, cam, st; width=W, height=H,
+                           samples=(fe_frame[f] > 0.0 ? SAMPLES : TAIL_SAMPLES),
                            dt=0.02, fisheye_deg=fe_frame[f], relativistic=REL,
                            beta=βl, aperture_world=ap, focus_dist=fo,
                            camera_at=(MOTION ? pose_at : nothing),

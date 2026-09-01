@@ -10,6 +10,11 @@
 #                     for grading in post. Losslessly deflate-compressed in
 #                     place (~1.3x — sampling noise limits it); final ~17 GB.
 #   SAMPLES=n         override lens samples per axis (default 4 => 16 passes)
+#   FLARES=n          slow brightness flares on the gas (default 8; 0 off).
+#                     Gaussian arcs in the optically thin outer disc (12-19M)
+#                     that swell over 2-4 s, decay over 4-8 s, and drift at
+#                     their radius's Keplerian rate (~1-2 deg/s) — a gentle
+#                     swell of the extended glow over the 30 s of footage.
 #   NFRAMES=n         frame count (default 900); OUT=path overrides the mp4
 #   RESUME=1|0        skip frames already on disk (default 1) — a long render
 #                     can be run in daily chunks; the last existing frame is
@@ -33,6 +38,7 @@ const W, H = RES == "4k" ? (3840, 2160) :
              RES == "final" ? (1920, 1080) : (640, 360)
 const SAMPLES = parse(Int, get(ENV, "SAMPLES", "4"))
 const NFRAMES = parse(Int, get(ENV, "NFRAMES", "900"))
+const FLARES = parse(Int, get(ENV, "FLARES", "8"))
 # Pixel-unit effects (dust size, streak length) were tuned at 360p; scale with res.
 const SC = H / 360.0
 
@@ -50,6 +56,15 @@ disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
                      blackbody=Blackbody(wb_temperature=10000.0), density_falloff=0.8)
 vol = DiscVolume(disc; M=1.0, rng=Xoshiro(3))
 ctx = MetalPreviewContext(bg, 480, 270; dt=0.1, nmax=1000, disc=disc, volume=vol)
+
+# Slow gas flares over the footage. The shot is real-time: the ARC_DEG sweep
+# of the r = |P0| orbit fixes how much M-time one second of footage covers,
+# so flare drift matches the camera's own orbital rate.
+const DUR_S = NFRAMES / 30
+const M_PER_S = (deg2rad(ARC_DEG) * sqrt(norm(P0)^3)) / DUR_S
+flares = FLARES > 0 ?
+    DiscFlares(vol; duration=DUR_S, nflares=FLARES, M_per_s=M_PER_S,
+               rng=Xoshiro(11)) : nothing
 
 J = Jitter(21)
 ev_rng = Xoshiro(555)
@@ -79,6 +94,9 @@ for f in 1:NFRAMES
     pos, tgt, up = orbit_cam(t, jx)
     cam = ThinLensCamera(pos, tgt, up; focal_length=33.0, f_number=5.6,
                          focus_distance=norm(pos))
+    # Flare gain is a pure function of footage time, so resumed runs and
+    # skipped frames stay exact.
+    flares !== nothing && apply_flares!(ctx, vol, flares, (f - 1) / 30)
     img = render_draft_mtl(ctx, cam, st; width=W, height=H, samples=SAMPLES,
                            dt=0.02, rng=Xoshiro(1000 + f))
     # Linear HDR frame, untouched by any grading — the master for post.
