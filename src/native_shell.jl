@@ -337,23 +337,56 @@ orange to yellow. Sampled and interpolated by [`plasma_palette`](@ref).
 """
 const PALETTE_MAX = 32
 
-const PLASMA_ANCHORS = (
-    (0.050f0, 0.030f0, 0.528f0), (0.255f0, 0.014f0, 0.615f0),
-    (0.418f0, 0.001f0, 0.658f0), (0.563f0, 0.052f0, 0.642f0),
-    (0.693f0, 0.165f0, 0.565f0), (0.798f0, 0.280f0, 0.470f0),
-    (0.881f0, 0.393f0, 0.383f0), (0.949f0, 0.518f0, 0.296f0),
-    (0.987f0, 0.652f0, 0.211f0), (0.988f0, 0.816f0, 0.145f0),
-    (0.940f0, 0.975f0, 0.131f0))
+"""
+Perceptually-ordered colour ramps at deciles, for [`arcade_palette`](@ref).
+
+`:magma` is the calmest of the three — near-black through purple and rose to
+cream, with no acid yellow — and is the default for that reason. `:inferno` is
+the same shape run warmer. `:plasma` is the most saturated: blue-violet through
+magenta to an electric yellow that takes over any frame it lands in.
+"""
+const RAMP_ANCHORS = Dict(
+    :magma => ((0.001f0,0.000f0,0.014f0), (0.079f0,0.054f0,0.212f0),
+               (0.232f0,0.060f0,0.438f0), (0.390f0,0.100f0,0.502f0),
+               (0.550f0,0.161f0,0.506f0), (0.716f0,0.215f0,0.475f0),
+               (0.869f0,0.288f0,0.409f0), (0.968f0,0.440f0,0.360f0),
+               (0.995f0,0.624f0,0.427f0), (0.997f0,0.813f0,0.584f0),
+               (0.987f0,0.991f0,0.750f0)),
+    :inferno => ((0.001f0,0.000f0,0.014f0), (0.087f0,0.045f0,0.225f0),
+                 (0.258f0,0.039f0,0.406f0), (0.416f0,0.090f0,0.433f0),
+                 (0.578f0,0.148f0,0.404f0), (0.736f0,0.216f0,0.330f0),
+                 (0.865f0,0.317f0,0.226f0), (0.955f0,0.469f0,0.100f0),
+                 (0.988f0,0.645f0,0.040f0), (0.964f0,0.844f0,0.273f0),
+                 (0.988f0,0.998f0,0.645f0)),
+    :plasma => ((0.050f0,0.030f0,0.528f0), (0.255f0,0.014f0,0.615f0),
+                (0.418f0,0.001f0,0.658f0), (0.563f0,0.052f0,0.642f0),
+                (0.693f0,0.165f0,0.565f0), (0.798f0,0.280f0,0.470f0),
+                (0.881f0,0.393f0,0.383f0), (0.949f0,0.518f0,0.296f0),
+                (0.987f0,0.652f0,0.211f0), (0.988f0,0.816f0,0.145f0),
+                (0.940f0,0.975f0,0.131f0)))
 
 """
-    plasma_palette(n; black=true, lo=0.0, hi=1.0)
+    arcade_palette(n; ramp=:magma, black=true, lo=0.0, hi=1.0)
 
-`(3, n)` array of plasma colours for the arcade palette. With `black`, the
-first entry is pure black and the remaining `n-1` span `lo`..`hi` of the ramp —
-so the sky bottoms out at true black rather than plasma's dark violet, and the
-tones above it are few and deliberate.
+`(3, n)` array of colours for the arcade palette, sampled from one of
+[`RAMP_ANCHORS`](@ref). With `black`, the first entry is pure black and the
+remaining `n-1` span `lo`..`hi` of the ramp — so empty sky bottoms out at true
+black rather than the ramp's darkest tone, and everything above it is a small
+deliberate set.
+
+`lo` is the useful dial for taste: raising it drops the muddiest low end, and
+lowering `hi` drops the blown-out top, which is where these ramps are hardest
+on the eyes.
+
+    plasma_palette(n; kw...)
+
+Kept as the `:plasma` shorthand.
 """
-function plasma_palette(n::Int; black::Bool=true, lo::Real=0.0, hi::Real=1.0)
+function arcade_palette(n::Int; ramp::Symbol=:magma, black::Bool=true,
+                        lo::Real=0.0, hi::Real=1.0)
+    haskey(RAMP_ANCHORS, ramp) ||
+        throw(ArgumentError("unknown ramp $ramp; have $(keys(RAMP_ANCHORS))"))
+    anchors = RAMP_ANCHORS[ramp]
     n >= 2 || throw(ArgumentError("palette needs at least 2 entries"))
     pal = Array{Float32}(undef, 3, n)
     k0 = black ? 2 : 1
@@ -363,16 +396,18 @@ function plasma_palette(n::Int; black::Bool=true, lo::Real=0.0, hi::Real=1.0)
     m = n - k0
     for k in k0:n
         t = m == 0 ? Float64(hi) : lo + (hi - lo) * (k - k0) / m
-        u = clamp(t, 0.0, 1.0) * (length(PLASMA_ANCHORS) - 1)
-        i = clamp(floor(Int, u), 0, length(PLASMA_ANCHORS) - 2)
+        u = clamp(t, 0.0, 1.0) * (length(anchors) - 1)
+        i = clamp(floor(Int, u), 0, length(anchors) - 2)
         f = Float32(u - i)
-        a = PLASMA_ANCHORS[i + 1]; b = PLASMA_ANCHORS[i + 2]
+        a = anchors[i + 1]; b = anchors[i + 2]
         for c in 1:3
             pal[c, k] = a[c] + f * (b[c] - a[c])
         end
     end
     return pal
 end
+
+plasma_palette(n::Int; kw...) = arcade_palette(n; ramp=:plasma, kw...)
 
 """
     set_palette!(p::MetalPresenter, pal)
@@ -400,7 +435,7 @@ function set_palette!(p::MetalPresenter, pal::Union{AbstractMatrix,Nothing})
 end
 
 function MetalPresenter(win::GLFW.Window, width::Int, height::Int;
-                        nearest::Bool=false)
+                        nearest::Bool=false, vsync::Bool=true)
     qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore")
     nsview = ccall((:glfwGetCocoaView, GLFW.libglfw), Ptr{Cvoid},
                    (Ptr{Cvoid},), win.handle)
@@ -412,6 +447,15 @@ function MetalPresenter(win::GLFW.Window, width::Int, height::Int;
     @objc [layer::id{Object} setPixelFormat:UInt64(80)::UInt64]::Nothing  # BGRA8Unorm
     @objc [layer::id{Object} setFramebufferOnly:false::Bool]::Nothing
     @objc [layer::id{Object} setDrawableSize:_CGSize(width, height)::_CGSize]::Nothing
+    if !vsync
+        # CAMetalLayer syncs to the display by default, so `nextDrawable`
+        # blocks and the loop presents at a refresh boundary no matter how
+        # cheap the frame is — an 11 ms frame on a 60 Hz-locked window reads
+        # as exactly 60 fps and every renderer saving vanishes. Off means the
+        # loop runs at whatever the GPU can do, which is what you want while
+        # measuring, and for a game on a high-refresh panel.
+        @objc [layer::id{Object} setDisplaySyncEnabled:false::Bool]::Nothing
+    end
     if nearest
         # Arcade mode renders at a low internal resolution and lets the
         # compositor blow it up. The default CAMetalLayer magnification filter
@@ -633,6 +677,7 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
                     arcade::Bool=(spin(spacetime) != 0),
                     quantize::Real=0, dither::Real=1.0,
                     palette::Union{Nothing,Integer,AbstractMatrix}=nothing,
+                    vsync::Bool=true,
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
     # Arcade mode. The deflection fan needs spherical symmetry, so Kerr cannot
@@ -672,7 +717,8 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
 
     GLFW.WindowHint(GLFW.CLIENT_API, GLFW.NO_API)
     win = GLFW.CreateWindow(winwidth, winheight, title)
-    presenter = MetalPresenter(win, width, height; nearest=arcade)
+    presenter = MetalPresenter(win, width, height; nearest=arcade,
+                               vsync=vsync)
 
     # Camera state (single-threaded: no locks needed).
     state = FlyCamState(cam)

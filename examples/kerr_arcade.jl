@@ -36,11 +36,18 @@ fly_native(cam, spacetime, bg;
            width = 256, height = 144,        # internal; x10 -> 2560x1440
            winwidth = 1280, winheight = 720,
            arcade = true,
-           # Black plus a handful of plasma steps. The mapping is on
-           # LUMINANCE, so the whole frame collapses to exactly this many
-           # tones and the empty sky lands on entry 1, which is true black.
-           palette = 8,
+           # Black plus five magma steps. The mapping is on LUMINANCE, so the
+           # whole frame collapses to exactly this many tones and empty sky
+           # lands on entry 1, which is true black. Magma rather than plasma:
+           # plasma tops out in an electric yellow that takes over the frame.
+           # `lo`/`hi` trim the muddiest low end and the blown-out top, which
+           # is where these ramps are hardest to look at.
+           palette = arcade_palette(6; ramp = :magma, lo = 0.12, hi = 0.92),
            dither = 1.0,                     # 4x4 Bayer, one palette step
+           # CAMetalLayer syncs to the display by default, so an 11 ms frame
+           # still presents on a refresh boundary — that is the ~60 fps, not
+           # the renderer. Off runs at whatever the GPU can actually do.
+           vsync = false,
            # No starmap nebulosity: it is a broad low-level glow, which under a
            # luminance palette lifts the whole sky off black. Stars only.
            star_texture_weight = 0.0,
