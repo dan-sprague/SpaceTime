@@ -21,10 +21,18 @@ using FileIO
 bg = load(joinpath(dirname(@__DIR__), "assets", "starmap_g4k.jpg"))
 
 spacetime = Schwarzschild(1.0)
+# White balance decides which radius renders neutral. At 10000 K that was
+# r = 6M, leaving 93% of the disc's area cooler than white — the beige. At
+# 5000 K neutral sits near 15M, so the hot inner disc reads white-to-blue and
+# only the outer edge stays warm. Star colour is unaffected: it has its own
+# white point (see `STAR_WB_TEMPERATURE`).
 disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
-                     blackbody=Blackbody(wb_temperature=10000.0),
+                     blackbody=Blackbody(wb_temperature=5000.0),
                      density_falloff=0.8)
-volume = DiscVolume(disc; M=spacetime.M)
+# `haze` adds the diffuse envelope that greys the shadow. Erosion is off:
+# it carves real fine structure into the gas, but it only ever removes gas, so
+# it needs `opacity_scale` raised to compensate — the two move together.
+volume = DiscVolume(disc; M=spacetime.M, haze=0.03, haze_height=4.0)
 
 cam = SpaceTime.Camera(SVector(30.0, 1.1, 1.6), SVector(0.0, 0.0, 0.0),
                        SVector(0.0, 0.0, 1.0), Lens(24.0))

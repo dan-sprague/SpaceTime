@@ -94,6 +94,16 @@ Build a volumetric disc for `disc`'s annulus around a black hole of mass `M`.
   default; the shipped look is 192×256×48 at 4 octaves.
 - `scale_height`: H(s) = scale_height · s (flared slab); the grid spans
   ±3 scale heights at the outer edge.
+- `haze` / `haze_height`: a diffuse envelope around the disc — a second
+  Gaussian on the same column, `haze_height`× taller than the disc's own scale
+  height and `haze` as bright at the midplane. Zero (the default) leaves the
+  shipped look untouched. This is what makes the shadow read as *grey* rather
+  than black: the fill is emission from gas between the camera and the hole,
+  and no lens-side bloom can reproduce it, because it has to lens and to sit
+  behind the disc's own geometry. It is nearly free — `z_max` is `3·H(s_out)`
+  at *every* radius, so inside the outer edge the grid already carries many
+  scale heights of near-empty cells and the rays already march through them.
+  Values around 0.02–0.05 read as haze rather than as a fatter disc.
 - `turbulence`: relative amplitude of the fractal density modulation.
 - `noise_gain` / `noise_lacunarity`: the fBm spectrum. **Leave these alone.**
   Grid resolution, octave count and gain were all measured and none of them
@@ -153,6 +163,15 @@ end
 # the turbulence it is stitching.
 const WRAP_BLEND = deg2rad(18.0)
 
+"""
+Fraction of the half-height over which the diffuse `haze` envelope runs at full
+strength before closing to zero at the grid edge. The grid stops at `z_max`
+and sampling returns zero beyond it, so any density still standing there is a
+planar step — which, viewed edge-on, prints a hard straight line across the
+gas. See the `haze` argument of [`DiscVolume`](@ref).
+"""
+const HAZE_WINDOW = 0.6
+
 function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
                     nphi::Int=256, nz::Int=48,
                     target_height::Union{Real,Nothing}=nothing,
@@ -160,6 +179,7 @@ function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
                     turbulence::Real=0.8, spiral_twist::Real=4.0,
                     noise_octaves::Int=4, noise_gain::Real=0.5,
                     noise_lacunarity::Real=2.1,
+                    haze::Real=0.0, haze_height::Real=4.0,
                     erosion::Real=0.0, erosion_scale::Real=4.0,
                     erosion_octaves::Int=3, erosion_mode::Symbol=:billow,
                     emission_scale::Real=0.8, opacity_scale::Real=1.2,
@@ -189,6 +209,30 @@ function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
                 H = scale_height * s
                 ρ0 = _disc_radial_profile(s, disc, M)
                 slab = exp(-z^2 / (2H^2))
+                # Diffuse envelope: a second, much broader Gaussian on the same
+                # column. The grid already spans ±z_max = 3·H(s_out) at *every*
+                # radius, so inside s_out it reaches many scale heights of cells
+                # that currently hold ~0 — filling them costs no extra march
+                # distance, only the shading of samples the ray already takes.
+                if haze > 0.0
+                    Hh = haze_height * H
+                    # Window it to zero at the grid edge. `z_max` is 3σ of the
+                    # *disc's* Gaussian, but the haze's σ is `haze_height`×
+                    # larger, so at the outer edge the haze is still at 75% of
+                    # its midplane value where the grid stops and sampling
+                    # falls to zero. That step is a plane, and edge-on it
+                    # projects to a hard straight line across the gas. This
+                    # window has value and slope zero at ±z_max, so the
+                    # envelope closes smoothly without enlarging the grid —
+                    # which would cost march distance and lose the free lunch.
+                    # Closing over the outer band only, rather than across the
+                    # whole column, keeps the envelope at full strength where
+                    # it is actually seen.
+                    t = clamp((abs(z / z_max) - HAZE_WINDOW) /
+                              (1.0 - HAZE_WINDOW), 0.0, 1.0)
+                    w = 1.0 - t * t * (3.0 - 2.0 * t)
+                    slab += haze * exp(-z^2 / (2Hh^2)) * w
+                end
                 # Sheared noise coordinates: radial detail fine, azimuthal
                 # stretched into arcs, spiral twist trails with radius.
                 u = ϕ + spiral_twist * log(s / s_in)

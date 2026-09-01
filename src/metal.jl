@@ -532,6 +532,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                            spacetime_params, disc_params, fan, sky_params,
                            width, height, nmax, dt, jitter_u, jitter_v,
                            weight, row0, rows, substride, subx, suby,
+                           ring_rmin,
                            ::Val{VOL}, ::Val{NB},
                            ::Val{LAYER}) where {VOL, NB, LAYER}
     idx = thread_position_in_grid().x
@@ -718,7 +719,14 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     gate = 0.0f0
     if LAYER
         gate = sky_params[7]
-        if r > gate
+        # `ring_rmin > 0` marks the **ring pass**: a finer-resolution dispatch
+        # that owns only the strongly-wound rays. The photon ring is disc light
+        # that has looped the hole, so it lives in this layer and is the
+        # highest-frequency thing in the frame — upsampling it from a coarse
+        # rung is what makes it stair-step. Periapsis is the honest selector:
+        # rays dipping near the photon sphere are exactly the ones whose disc
+        # crossings pile into the ring, and the fan already carries it.
+        if r > gate || ring_rmin > 0.0f0
             cψ = clamp(p_t * sky_params[1] + px * sky_params[2] +
                        py * sky_params[3] + pz * sky_params[4],
                        -1.0f0, 1.0f0)
@@ -728,7 +736,12 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
             frac_f = tf - Float32(k0)
             esc = fan[1, k0 + 1] + frac_f * (fan[1, k0 + 2] - fan[1, k0 + 1])
             rmin = fan[4, k0 + 1] + frac_f * (fan[4, k0 + 2] - fan[4, k0 + 1])
-            if esc > 0.999f0 && rmin > gate
+            # Ring pass keeps only the annulus; the bulk pass keeps everything
+            # the gate cannot prove empty. Each writes transparency elsewhere,
+            # so the composite can blend the two without holes.
+            cull = ring_rmin > 0.0f0 ? rmin >= ring_rmin :
+                                       (esc > 0.999f0 && rmin > gate)
+            if cull
                 out[1, i, j] = 0.0f0
                 out[2, i, j] = 0.0f0
                 out[3, i, j] = 0.0f0
@@ -1214,7 +1227,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         nmax::Int, dt::Float32, ju::Float32, jv::Float32,
                         weight::Float32, row0::Int, rows::Int; nb::Int=0,
                         fan=nothing, sky_params=nothing, layer::Bool=false,
-                        substride::Int=1, subx::Int=0, suby::Int=0)
+                        substride::Int=1, subx::Int=0, suby::Int=0,
+                        ring_rmin::Real=0.0)
     von = ctx.vol_on[]
     fan_b = fan === nothing ? _dummy_fan() : fan
     skyp_b = sky_params === nothing ? _dummy_skyp() : sky_params
@@ -1227,7 +1241,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
             ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
             fan_b, skyp_b,
             width, height, nmax, dt, ju, jv, weight, row0, rows,
-            substride, subx, suby, Val(von), Val(nb), Val(layer))
+            substride, subx, suby, Float32(ring_rmin),
+            Val(von), Val(nb), Val(layer))
     end
     kernel = kernels[key]
     n = width * rows
@@ -1238,7 +1253,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
            ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
            fan_b, skyp_b,
            width, height, nmax, dt, ju, jv, weight, row0, rows,
-           substride, subx, suby, Val(von), Val(nb), Val(layer);
+           substride, subx, suby, Float32(ring_rmin),
+           Val(von), Val(nb), Val(layer);
            threads=threads, groups=groups)
     return nothing
 end
@@ -1710,10 +1726,42 @@ function sky_fan_kernel!(fan, cam_params, sky_params, nmax, dt, band)
 end
 
 """
+Fraction of `ring_rmin` over which the ring layer is at full weight before it
+feathers back into the bulk layer. The two layers are traced at different
+resolutions, so they never agree exactly; switching between them abruptly
+would replace a stair-stepped ring with a seam ring.
+"""
+const RING_FEATHER = 0.8f0
+
+"""Bilinear tap of a premultiplied `(4, lw, lh)` layer at display pixel `i, j`."""
+@inline function _layer_bilinear(layer, i, j, width, height, lw, lh)
+    fx = (Float32(i) - 0.5f0) * Float32(lw) / Float32(width) + 0.5f0
+    fy = (Float32(j) - 0.5f0) * Float32(lh) / Float32(height) + 0.5f0
+    x0 = clamp(unsafe_trunc(Int32, floor(fx)), Int32(1), Int32(lw - 1))
+    y0 = clamp(unsafe_trunc(Int32, floor(fy)), Int32(1), Int32(lh - 1))
+    tx = clamp(fx - Float32(x0), 0.0f0, 1.0f0)
+    ty = clamp(fy - Float32(y0), 0.0f0, 1.0f0)
+    x1 = x0 + Int32(1); y1 = y0 + Int32(1)
+    w00 = (1.0f0 - tx) * (1.0f0 - ty); w10 = tx * (1.0f0 - ty)
+    w01 = (1.0f0 - tx) * ty;           w11 = tx * ty
+    @inbounds begin
+        a = layer[1, x0, y0] * w00 + layer[1, x1, y0] * w10 +
+            layer[1, x0, y1] * w01 + layer[1, x1, y1] * w11
+        b = layer[2, x0, y0] * w00 + layer[2, x1, y0] * w10 +
+            layer[2, x0, y1] * w01 + layer[2, x1, y1] * w11
+        c = layer[3, x0, y0] * w00 + layer[3, x1, y0] * w10 +
+            layer[3, x0, y1] * w01 + layer[3, x1, y1] * w11
+        d = layer[4, x0, y0] * w00 + layer[4, x1, y0] * w10 +
+            layer[4, x0, y1] * w01 + layer[4, x1, y1] * w11
+    end
+    return (a, b, c, d)
+end
+
+"""
     sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
                           spacetime_params, sky_params, star_params, star_lut,
-                          width, height, lw, lh, ju, jv, accumulate,
-                          row0, rows)
+                          ring, width, height, lw, lh, rw, rh, ring_rmin,
+                          ju, jv, accumulate, row0, rows)
 
 Per display pixel: build the pixel ray exactly like the trace kernel, find
 its local angle ψ to the radial axis (`ê_r` in `sky_params[1:4]`), look up
@@ -1725,8 +1773,9 @@ fall back to the nearest entry — a sub-pixel zone at the photon ring.
 """
 function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
                                spacetime_params, sky_params, star_params,
-                               star_lut,
-                               width, height, lw, lh, ju, jv, accumulate,
+                               star_lut, ring,
+                               width, height, lw, lh, rw, rh, ring_rmin,
+                               ju, jv, accumulate,
                                row0, rows)
     idx = thread_position_in_grid().x
     idx > width * rows && return
@@ -1787,7 +1836,10 @@ function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
     # inside the critical band, coarse elsewhere).
     cψ = clamp(p_t * sky_params[1] + px * sky_params[2] +
                py * sky_params[3] + pz * sky_params[4], -1.0f0, 1.0f0)
-    esc, cθ, sθ = _fan_dir(fan, fine, sky_params[9], sky_params[10], acos(cψ))
+    ψ = acos(cψ)
+    Nfan = Float32(size(fan, 2))
+    tψ = ψ * (Nfan - 1.0f0) / Float32(pi)
+    esc, cθ, sθ = _fan_dir(fan, fine, sky_params[9], sky_params[10], ψ)
 
     sky_r = 0.0f0
     sky_g = 0.0f0
@@ -1846,23 +1898,27 @@ function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
     end
 
     # Composite the (lower-resolution) premultiplied disc layer over the sky.
-    fx = (Float32(i) - 0.5f0) * Float32(lw) / Float32(width) + 0.5f0
-    fy = (Float32(j) - 0.5f0) * Float32(lh) / Float32(height) + 0.5f0
-    x0 = clamp(unsafe_trunc(Int32, floor(fx)), Int32(1), Int32(lw - 1))
-    y0 = clamp(unsafe_trunc(Int32, floor(fy)), Int32(1), Int32(lh - 1))
-    tx = clamp(fx - Float32(x0), 0.0f0, 1.0f0)
-    ty = clamp(fy - Float32(y0), 0.0f0, 1.0f0)
-    x1 = x0 + Int32(1); y1 = y0 + Int32(1)
-    w00 = (1.0f0 - tx) * (1.0f0 - ty); w10 = tx * (1.0f0 - ty)
-    w01 = (1.0f0 - tx) * ty;           w11 = tx * ty
-    lr = layer[1, x0, y0] * w00 + layer[1, x1, y0] * w10 +
-         layer[1, x0, y1] * w01 + layer[1, x1, y1] * w11
-    lg = layer[2, x0, y0] * w00 + layer[2, x1, y0] * w10 +
-         layer[2, x0, y1] * w01 + layer[2, x1, y1] * w11
-    lb = layer[3, x0, y0] * w00 + layer[3, x1, y0] * w10 +
-         layer[3, x0, y1] * w01 + layer[3, x1, y1] * w11
-    la = layer[4, x0, y0] * w00 + layer[4, x1, y0] * w10 +
-         layer[4, x0, y1] * w01 + layer[4, x1, y1] * w11
+    lr, lg, lb, la = _layer_bilinear(layer, i, j, width, height, lw, lh)
+
+    # Foveated ring: where the ray winds near the photon sphere, prefer the
+    # finer ring layer. Blending on periapsis rather than switching matters —
+    # the two layers are sampled at different rates and will not agree, so a
+    # hard boundary would trade a stair-stepped ring for a seam ring.
+    if ring_rmin > 0.0f0
+        rk0 = clamp(unsafe_trunc(Int32, tψ), Int32(0),
+                    unsafe_trunc(Int32, Nfan) - Int32(2))
+        rfr = tψ - Float32(rk0)
+        rmin = fan[4, rk0 + 1] + rfr * (fan[4, rk0 + 2] - fan[4, rk0 + 1])
+        t = clamp((rmin - RING_FEATHER * ring_rmin) /
+                  max((1.0f0 - RING_FEATHER) * ring_rmin, 1.0f-6),
+                  0.0f0, 1.0f0)
+        wr = 1.0f0 - t * t * (3.0f0 - 2.0f0 * t)
+        if wr > 0.0f0
+            rr, rg, rb, ra = _layer_bilinear(ring, i, j, width, height, rw, rh)
+            lr += wr * (rr - lr); lg += wr * (rg - lg)
+            lb += wr * (rb - lb); la += wr * (ra - la)
+        end
+    end
 
     if accumulate > 0.5f0
         # Progressive refinement: sum jittered passes (the presenter divides
@@ -2043,7 +2099,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                              substride::Int=1, subx::Int=0, suby::Int=0,
                              ju::Real=0.5, jv::Real=0.5,
                              accumulate::Bool=false,
-                             row0::Int=0, rows::Int=-1)
+                             row0::Int=0, rows::Int=-1,
+                             ring_out=nothing, ring_rmin::Real=0.0)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -2081,20 +2138,39 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
     # With trace_layer=false the caller keeps `layer_out` pre-filled with
     # α = 1 (fully transparent): the frame is the fan-driven sky alone.
 
+    # Foveated ring pass: a second, finer trace restricted to the wound rays.
+    # It is a thin annulus (~1-5% of pixels) and spatially coherent, so whole
+    # SIMD groups fall outside it and exit on the fan lookup — but those rays
+    # are also the most expensive in the frame, so the saving is in resolution,
+    # not in ray count.
+    use_ring = ring_out !== nothing && ring_rmin > 0 && trace_layer && !banded
+    rw, rh = use_ring ? (size(ring_out, 2), size(ring_out, 3)) : (lw, lh)
+    ring_b = use_ring ? ring_out : layer_out
+    if use_ring
+        _launch_trace!(ctx, ring_out, ctx.cam_params, ctx.spacetime_params,
+                       rw, rh, nmax, Float32(dt), Float32(ju), Float32(jv),
+                       1.0f0, 0, rh;
+                       fan=sky.fan, sky_params=sky.sky_params, layer=true,
+                       ring_rmin=ring_rmin)
+    end
+
     acc = accumulate ? 1.0f0 : 0.0f0
     if _COMPOSITE_KERNEL[] === nothing
         _COMPOSITE_KERNEL[] = @metal launch=false sky_composite_kernel!(
             comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out,
             ctx.cam_params, ctx.spacetime_params, sky.sky_params,
-            ctx.star_params, ctx.star_lut,
-            width, height, lw, lh, Float32(ju), Float32(jv), acc, row0, rows)
+            ctx.star_params, ctx.star_lut, ring_b,
+            width, height, lw, lh, rw, rh,
+            use_ring ? Float32(ring_rmin) : 0.0f0,
+            Float32(ju), Float32(jv), acc, row0, rows)
     end
     kern = _COMPOSITE_KERNEL[]
     n = width * rows
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
     kern(comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out, ctx.cam_params,
          ctx.spacetime_params, sky.sky_params, ctx.star_params, ctx.star_lut,
-         width, height, lw, lh,
+         ring_b, width, height, lw, lh, rw, rh,
+         use_ring ? Float32(ring_rmin) : 0.0f0,
          Float32(ju), Float32(jv), acc, row0, rows;
          threads=threads, groups=cld(n, threads))
     return nothing

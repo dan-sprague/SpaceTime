@@ -472,10 +472,20 @@ starmap: a fixed angular texture magnifies into blobs exactly where lensing
 stretches the sky hardest, at the photon ring. `B` cycles stars → starmap →
 both; `starfield=false` restores the texture, and `star_texture_weight` keeps
 some of it under the stars (the map is good at diffuse Milky Way glow and bad
-at point sources). Needs a `disc` for the blackbody LUT that colours stars.
+at point sources). Star colour has its own white point, independent of the
+disc's, so regrading the disc never re-tints the sky.
 
-Other keys: drag to look; Z/C roll; V volumetric gas; B sky; R relativistic
-shading; L lens (rectilinear/fisheye); **1/2/3/4 grade presets**
+`quality` (**O** cycles it live) sets the photon ring's own render stride:
+`:performance` 4, `:balanced` 2, `:quality` 1. The bulk gas ladder stays deep
+in every preset — it is what holds the frame budget — because the ring is the
+one feature a coarse rung cannot carry. Measured at 1440p with the bulk at
+stride 8: a stride-2 ring reaches 98% of the sharpness of tracing the *whole*
+layer at stride 2, for 24% of the frame cost (21.6 ms against 89.4 ms), and a
+stride-1 ring beats it outright at under half the cost. `ring_rmin` (4M) is
+the periapsis below which a ray counts as wound.
+
+Other keys: drag to look; Z/C roll; V volumetric gas; B sky; O quality;
+R relativistic shading; L lens (rectilinear/fisheye); **1/2/3/4 grade presets**
 (neutral / film / hectic / **porthole** — the escape-video recipe:
 hue-preserving ACES, gamma-0.2 crush, 4-spike streaks, grain); T/G
 exposure; P filmic curve on/off; X reset
@@ -493,6 +503,7 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     title::String="Spacetime Simulator",
                     starfield::Bool=true, star_texture_weight::Real=0.0,
                     star_psf_pixels::Real=1.0,
+                    quality::Symbol=:balanced, ring_rmin::Real=4.0,
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
     ctx = MetalPreviewContext(background, width, height;
@@ -504,9 +515,9 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # photon ring, where the interesting structure is. The procedural field is
     # evaluated along the asymptotic direction at the pixel's own footprint, so
     # stars stay point-like at every resolution and under any magnification.
-    # Star colour needs the disc's blackbody LUT, so this needs a disc.
+    # Star colour comes from the context's own LUT, so this works with no disc.
     star_tw = Float64(star_texture_weight)
-    star_on = starfield && disc !== nothing
+    star_on = starfield
     if star_on
         set_starfield!(ctx; strength=1.0, texture_weight=star_tw,
                        height=height, fov_factor=cam.fov_factor,
@@ -582,8 +593,29 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # Moving rungs: gas layer resolution ladder, walked by a hysteresis
     # controller (dwell + separate up/down thresholds — flip-flopping
     # between rungs every few frames is worse than either rung).
+    # The ladder has to reach far enough down to hold the frame budget with the
+    # camera *inside* the gas, where the layer marches every step through dense
+    # volume: quarter-res left the controller pinned at the bottom rung with
+    # frames still over budget. Everything downstream is paced per frame — the
+    # input poll included — so a rung that cannot hold the budget is felt as
+    # latency, not just as a lower frame rate.
     rungs = [MtlArray{Float32,3}(undef, 4, cld(width, s), cld(height, s))
-             for s in (2, 3, 4)]
+             for s in (2, 3, 4, 6, 8)]
+    # Graphics quality: the bulk ladder is left deep in every preset — it is
+    # what holds the frame budget — and the setting instead picks the stride of
+    # the *ring* pass, a second finer trace over the wound rays that build the
+    # photon ring. That is the one feature the bulk rungs cannot carry: it is
+    # the highest-frequency thing in the frame, so downscaling it stair-steps
+    # it while the smooth gas around it downscales for free.
+    QUALITY = (:performance, :balanced, :quality)
+    RING_STRIDE = Dict(:performance => 4, :balanced => 2, :quality => 1)
+    quality in QUALITY ||
+        throw(ArgumentError("quality must be one of $QUALITY, got $quality"))
+    qi = findfirst(==(quality), QUALITY)
+    ring_bufs = Dict{Int,MtlArray{Float32,3}}()
+    ring_buf(s) = get!(ring_bufs, s) do
+        MtlArray{Float32,3}(undef, 4, cld(width, s), cld(height, s))
+    end
     rung = 2
     last_rung_change = time()
     last_move_time = time()
@@ -674,6 +706,10 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
         pressed_once(GLFW.KEY_V) && ctx.has_volume &&
             set_volume_enabled!(ctx, !ctx.vol_on[])
         pressed_once(GLFW.KEY_R) && (relativistic = !relativistic)
+        # O cycles graphics quality (the photon-ring pass); it changes what is
+        # rendered, so the still has to be thrown away and retraced.
+        pressed_once(GLFW.KEY_O) && (qi = qi % length(QUALITY) + 1;
+                                     grade_rev += 1)
         pressed_once(GLFW.KEY_L) && (fisheye = fisheye > 0.0 ? 0.0 : 100.0)
         # B cycles the sky: procedural stars → the starmap → both. Direct A/B
         # is the only honest way to judge a starfield.
@@ -815,10 +851,13 @@ function fly_native(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     set_march_stride!(ctx, want)
                     cur_stride = want
                 end
+                rs = RING_STRIDE[QUALITY[qi]]
                 render_layered_gpu!(ctx.out_gpu, rungs[rung],
                                     ctx, sky, cam_now, spacetime;
                                     fisheye_deg=fisheye,
-                                    relativistic=relativistic)
+                                    relativistic=relativistic,
+                                    ring_out=ring_buf(rs),
+                                    ring_rmin=ring_rmin)
             else
                 render_layered_gpu!(ctx.out_gpu, L, ctx, sky, cam_now,
                                     spacetime; fisheye_deg=fisheye,
