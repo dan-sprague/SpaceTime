@@ -24,7 +24,14 @@ module SpaceTime
 
 using SpecialFunctions: besselj1
 using ImageFiltering
-using Images
+# Images is deliberately NOT loaded. Only `imfilter` and `centered` are used
+# and both come from ImageFiltering, which is a direct dependency; `Images`
+# only added a meta-package on top. It also dragged in ImageMorphology ->
+# LoopVectorization -> VectorizationBase -> HostCPUFeatures, whose `vscale()`
+# is an unconditional ccall to the LLVM scalable-vector intrinsic. It is never
+# *called* on Apple silicon (guarded by a runtime SVE check) but juliac
+# compiles every statically-reachable method, so AOT builds died on
+# "LLVM ERROR: Cannot select: i64 = vscale".
 using FileIO
 using DifferentialEquations, GLMakie, StaticArrays
 using LinearAlgebra
