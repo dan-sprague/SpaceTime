@@ -7,6 +7,10 @@ bundled starmap. `fly_native` runs the window loop on the calling thread and
 returns when it closes, so no thread pinning is needed. Set `SPACETIME_SMOKE=1`
 to auto-close after ~8 s (build smoke tests), and `RES=1080|1440|2160` to pick
 the render resolution.
+
+Pass `arcade` as an argument (or set `SPACETIME_MODE=arcade`) for the Kerr
+arcade mode — low internal resolution, nearest upscale, six magma tones —
+with `ARES=144|180|288|360` picking the internal height.
 """
 function julia_main()::Cint
     try
@@ -38,13 +42,38 @@ function julia_main()::Cint
         cam = Camera(SVector(30.0, 1.1, 1.6), SVector(0.0, 0.0, 0.0),
                      SVector(0.0, 0.0, 1.0), Lens(24.0))
 
+        smoke = get(ENV, "SPACETIME_SMOKE", "0") == "1" ? 8.0 : Inf
+
+        # Arcade mode: `SpaceTimeApp arcade`, or SPACETIME_MODE=arcade.
+        # A spinning hole rendered at a low internal resolution, nearest-
+        # upscaled and collapsed onto a handful of magma tones. It cannot use
+        # the deflection fan (that needs spherical symmetry), so every pixel is
+        # traced directly — which is only affordable at this resolution, which
+        # is the look. ARES picks the internal resolution; keep it an integer
+        # divisor of the display or the upscale gives uneven pixels.
+        if "arcade" in ARGS || get(ENV, "SPACETIME_MODE", "") == "arcade"
+            ares = get(Dict("144" => (256, 144), "180" => (320, 180),
+                            "288" => (512, 288), "360" => (640, 360)),
+                       get(ENV, "ARES", "144"), (256, 144))
+            fly_native(cam, Kerr(1.0, 0.9), bg; disc=disc,
+                       width=ares[1], height=ares[2],
+                       winwidth=1280, winheight=720,
+                       arcade=true, vsync=false,
+                       palette=arcade_palette(6; ramp=:magma,
+                                              lo=0.12, hi=0.92),
+                       dither=1.0,
+                       star_texture_weight=0.0, star_psf_pixels=0.9,
+                       star_density=110,
+                       title="Spacetime — Kerr arcade",
+                       max_seconds=smoke)
+            return 0
+        end
+
         res = get(Dict("1080" => (1920, 1080), "1440" => (2560, 1440),
                        "2160" => (3840, 2160)),
                   get(ENV, "RES", "1440"), (2560, 1440))
         fly_native(cam, spacetime, bg; disc=disc, volume=volume,
-                   width=res[1], height=res[2],
-                   max_seconds=get(ENV, "SPACETIME_SMOKE", "0") == "1" ?
-                               8.0 : Inf)
+                   width=res[1], height=res[2], max_seconds=smoke)
         return 0
     catch err
         Base.showerror(stderr, err, catch_backtrace())
