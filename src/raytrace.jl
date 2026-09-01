@@ -84,17 +84,44 @@ function init_photon(origin::SVector{3,Float64}, direction::SVector{3,Float64},
 end
 
 """
-    init_photon(cam::AbstractCamera, spacetime::AbstractSpacetime, u, v; rng=Random.default_rng())
+    camera_tetrad(cam::AbstractCamera, spacetime) -> (u, Ef, Er, Eu)
+
+The camera's own orthonormal tetrad, Lorentz-boosted by `cam.velocity`. Build
+it once per render and hand it to [`init_photon`](@ref) for every ray — it does
+not depend on the pixel.
+"""
+camera_tetrad(cam::AbstractCamera, spacetime::AbstractSpacetime) =
+    ks_camera_tetrad(cam.pos, cam.fwd, cam.right, cam.up_local, spacetime.M;
+                     beta=camera_beta(cam))
+
+"""
+    init_photon(cam::AbstractCamera, spacetime::AbstractSpacetime, u, v;
+                rng=Random.default_rng(), tetrad=nothing)
 
 Convenience wrapper that samples a ray from `cam` at normalised sensor
 coordinates `(u, v)` and converts it to a photon state vector.
+
+Rays are decomposed in the **camera's** basis against the camera's tetrad, the
+same way the Metal kernel does it. That matters as soon as the camera moves: a
+boost has a fixed direction relative to the camera, so a per-ray basis aligned
+with each ray would rotate the boost along with the ray and smear the
+aberration into nonsense. It costs nothing for a camera at rest, where the
+tetrad is direction-independent anyway.
+
+`tetrad` accepts a precomputed [`camera_tetrad`](@ref); pass it in a render loop
+so the Gram–Schmidt is not redone for every pixel.
 """
 function init_photon(cam::AbstractCamera, spacetime::AbstractSpacetime, u, v;
                      rng::Random.AbstractRNG=Random.default_rng(),
-                     lens::Union{Nothing, NTuple{2, Float64}}=nothing)
+                     lens::Union{Nothing, NTuple{2, Float64}}=nothing,
+                     tetrad::Union{Nothing,NTuple{4,SVector{4,Float64}}}=nothing)
     origin, direction = lens === nothing ? get_ray(cam, u, v, rng) :
                         get_ray(cam, u, v, rng, lens)
-    init_photon(origin, direction, spacetime)
+    tet = tetrad === nothing ? camera_tetrad(cam, spacetime) : tetrad
+    μ6, p_t = ks_init_photon(origin, direction, spacetime.M, tet,
+                             cam.fwd, cam.right, cam.up_local)
+    return SVector{8,Float64}(0.0, μ6[1], μ6[2], μ6[3],
+                              p_t, μ6[4], μ6[5], μ6[6])
 end
 
 """
@@ -145,6 +172,14 @@ back).
 _render_nchunks() = 4 * max(1, Threads.nthreads(:default))
 
 """
+    _stratum_centres(n)
+
+Centres of `n` equal strata across `[0, 1]`: `(k - 0.5)/n` for `k = 1:n`. One
+sample lands at 0.5, the middle of the pixel.
+"""
+_stratum_centres(n::Int) = ((k - 0.5) / n for k in 1:n)
+
+"""
     _foreach_column_chunk(body, width, nchunks)
 
 Partition columns `1:width` into `nchunks` contiguous chunks and run
@@ -171,8 +206,9 @@ function _trace_color(integrator, meta, cam::AbstractCamera,
                       rng::Random.AbstractRNG=Random.default_rng(),
                       dust::Union{InterstellarDust,Nothing}=nothing,
                       lens::Union{Nothing, NTuple{2, Float64}}=nothing,
-                      relativistic::Bool=false)
-    μ0 = init_photon(cam, spacetime, u, v; rng, lens)
+                      relativistic::Bool=false,
+                      tetrad::Union{Nothing,NTuple{4,SVector{4,Float64}}}=nothing)
+    μ0 = init_photon(cam, spacetime, u, v; rng, lens, tetrad)
 
     meta.acc_color = RGBf(0, 0, 0)
     meta.alpha = 1.0
@@ -294,7 +330,9 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
     # Independently seeded per-chunk RNGs. `copy(rng)` would give every chunk
     # the same stream, tiling one noise pattern across all chunks.
     thread_rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nchunks]
-    μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0; rng=rng)
+    # The camera's tetrad does not depend on the pixel: build it once.
+    cam_tet = camera_tetrad(cam, spacetime)
+    μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0; rng=rng, tetrad=cam_tet)
     base_prob = ODEProblem(spacetime, μ0_dummy, tspan, (spacetime, thread_metas[1], disc))
     thread_integrators = [init(base_prob, solver, callback=cb_for(r_max),
                                dense=false, save_everystep=false,
@@ -303,8 +341,12 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
 
     n_sub = samples^2
     inv_samples2 = 1.0 / n_sub
-    fixed_offsets = [(du, dv) for du in range(0.5/samples, 1.0, samples)
-                     for dv in range(0.5/samples, 1.0, samples)]
+    # Stratum centres. `range(0.5/n, 1.0, n)` put the last sample on the pixel
+    # edge rather than in the middle of its stratum, and threw outright for
+    # n = 1 ("endpoints differ"), so `samples=1` — the obvious quick check —
+    # could not run at all.
+    fixed_offsets = [(du, dv) for du in _stratum_centres(samples)
+                     for dv in _stratum_centres(samples)]
     use_lens = cam isa ThinLensCamera
 
     progress_counter = Threads.Atomic{Int}(0)
@@ -337,7 +379,8 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                                                 background, disc, u, v;
                                                 rng=local_rng, dust=dust,
                                                 lens=use_lens ? lens_offs[k] : nothing,
-                                                relativistic=relativistic)
+                                                relativistic=relativistic,
+                                                tetrad=cam_tet)
                 end
                 image[i, j] = pixel_color * inv_samples2
             end
@@ -381,8 +424,8 @@ function render_no_doppler(cam::AbstractCamera, spacetime::AbstractSpacetime;
 
     inv_samples2 = 1.0 / samples^2
     subpixel_offsets = jittered ? jittered_grid(samples; rng=rng) :
-                       [(du, dv) for du in range(0.5/samples, 1.0, samples),
-                        dv in range(0.5/samples, 1.0, samples)]
+                       [(du, dv) for du in _stratum_centres(samples),
+                        dv in _stratum_centres(samples)]
 
     _foreach_column_chunk(width, nchunks) do ci, cols
         integrator = thread_integrators[ci]
@@ -426,8 +469,8 @@ function render_motion(camera_at::Function, t0::Real, t1::Real,
     image = zeros(RGBf, width, height)
     inv_total = 1.0 / (samples^2 * time_samples)
     subpixel_offsets = jittered ? jittered_grid(samples; rng=rng) :
-                       [(du, dv) for du in range(0.5/samples, 1.0, samples),
-                        dv in range(0.5/samples, 1.0, samples)]
+                       [(du, dv) for du in _stratum_centres(samples),
+                        dv in _stratum_centres(samples)]
 
     # Each time sample gets its own set of integrators and metas.
     nchunks = _render_nchunks()
@@ -443,7 +486,8 @@ function render_motion(camera_at::Function, t0::Real, t1::Real,
 
         thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf, 0.0) for _ in 1:nchunks]
         thread_rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nchunks]
-        μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0; rng=rng)
+        cam_tet = camera_tetrad(cam, spacetime)
+        μ0_dummy = init_photon(cam, spacetime, 0.0, 0.0; rng=rng, tetrad=cam_tet)
         cb = isnothing(volume) ? make_cb_set(rm, disc) :
             CallbackSet(ContinuousCallback(make_boundary_condition(rm), horizon_affect!),
                         make_volume_cb(volume, disc))
@@ -463,7 +507,8 @@ function render_motion(camera_at::Function, t0::Real, t1::Real,
                         u, v = sensor_coordinate(i, j, width, height; du=du, dv=dv)
                         image[i, j] += _trace_color(integrator, meta, cam, spacetime,
                                                     background, disc, u, v; rng=local_rng,
-                                                    relativistic=relativistic)
+                                                    relativistic=relativistic,
+                                                    tetrad=cam_tet)
                     end
                 end
             end

@@ -140,6 +140,51 @@ end
     @test minimum(g) > 1 / sqrt(1 - 2 / 2.1)   # the old scalar underestimated
 end
 
+@testset "Camera velocity" begin
+    st = Schwarzschild(1.0)
+    pos = SVector(20.0, 0.0, 0.0)
+    v = SVector(-0.6, 0.0, 0.0)                    # 0.6c straight at the hole
+    c = Camera(pos, SVector(0.0, 0.0, 0.0), SVector(0.0, 0.0, 1.0), 0.5;
+               velocity=v)
+
+    # Velocity is stored in world coordinates and projected onto the camera
+    # axes on demand. Forward is -x here, so the whole boost is along forward.
+    @test c.velocity == v
+    @test SpaceTime.camera_beta(c) ≈ SVector(0.6, 0.0, 0.0) atol = 1e-12
+
+    # A rotation of the mount must not change how the ship is moving — it just
+    # re-resolves the same world velocity onto the new axes. This is the whole
+    # reason velocity is world-frame: callers used to project it themselves and
+    # hand the components to the renderer separately, where a stale projection
+    # or a forgotten argument silently rendered a moving ship at rest.
+    y = yaw(c, 25.0)
+    @test y.velocity == v
+    β = SpaceTime.camera_beta(y)
+    @test norm(β) ≈ 0.6 atol = 1e-12               # speed is invariant
+    @test β[1] ≈ 0.6 * cosd(25.0) atol = 1e-12     # and it rotates correctly
+    @test abs(β[2]) ≈ 0.6 * sind(25.0) atol = 1e-12
+    @test truck(c, 1.0).velocity == v              # translations too
+    @test ThinLensCamera(pos, SVector(0.0,0.0,0.0), SVector(0.0,0.0,1.0);
+                         velocity=v).velocity == v
+
+    # Default is at rest, and then the tetrad must be the unboosted one.
+    still = Camera(pos, SVector(0.0,0.0,0.0), SVector(0.0,0.0,1.0), 0.5)
+    @test still.velocity == SVector(0.0, 0.0, 0.0)
+    @test all(map((a, b) -> a == b, SpaceTime.camera_tetrad(still, st),
+                  SpaceTime.ks_camera_tetrad(still.pos, still.fwd, still.right,
+                                             still.up_local, 1.0)))
+
+    # The CPU renderer can now render a moving observer at all, and it beams:
+    # flying into the field blueshifts and brightens what is ahead.
+    bg = fill(RGBf(0.05, 0.05, 0.08), 64, 32)
+    mean(a) = sum(x -> (Float64(x.r) + Float64(x.g) + Float64(x.b)) / 3, a) / length(a)
+    at_rest = render(still, st, bg; disc=nothing, width=28, height=16,
+                     samples=1, rng=Xoshiro(1), relativistic=true)
+    moving = render(c, st, bg; disc=nothing, width=28, height=16,
+                    samples=1, rng=Xoshiro(1), relativistic=true)
+    @test mean(moving) > 1.5 * mean(at_rest)
+end
+
 @testset "Shadow radius" begin
     bh1 = Schwarzschild(1.0)
     # Far away, the shadow's angular radius approaches the critical impact

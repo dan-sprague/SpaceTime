@@ -31,6 +31,13 @@ struct MetalPreviewContext{B<:MtlArray{Float32,3}, O<:MtlArray{Float32,3},
     # Procedural starfield (see `starfield_mtl`); [1] = 0 disables it, and the
     # cost when off is one buffer read and a branch, so it needs no Val.
     star_params::MtlVector{Float32}
+    # Star colour has its OWN blackbody LUT, deliberately not the disc's.
+    # Sharing one made star colour a function of the disc's white balance:
+    # `wb_temperature` decides which temperature renders neutral, so grading
+    # the disc re-tinted the whole sky (a 10000 K white point put every star
+    # below it, and the field came out uniformly gold). Stars should look like
+    # stars whatever the disc is doing.
+    star_lut::L
     width::Int
     height::Int
     dt::Float32
@@ -41,6 +48,27 @@ struct MetalPreviewContext{B<:MtlArray{Float32,3}, O<:MtlArray{Float32,3},
     # Compiled kernel per volume mode (Val-specialised, so the no-volume
     # variant keeps the lean kernel's register budget), built lazily.
     kernel::Base.RefValue{Any}
+end
+
+"""
+White-balance temperature for star colour, held apart from the disc's.
+
+10000 K, which is roughly the A0 dwarf convention (Vega, the historical zero of
+the colour-index system, sits near 9600 K) and is the point the shipped star
+look was tuned at. Stars hotter than this render blue-white, cooler ones
+orange. Changing the *disc's* `wb_temperature` must not move this — see
+[`MetalPreviewContext`](@ref)'s `star_lut`.
+"""
+const STAR_WB_TEMPERATURE = 10000.0
+
+"""Star colour table: a white-balanced blackbody LUT, independent of any disc."""
+function _star_lut_cpu(wb_temperature::Real; table_size::Int=1024)
+    bb = Blackbody(; wb_temperature=wb_temperature, table_size=table_size)
+    lut = Array{Float32,2}(undef, 3, bb.table_size)
+    for k in 1:bb.table_size, c in 1:3
+        lut[c, k] = Float32(bb.table[k][c])
+    end
+    return lut
 end
 
 """
@@ -104,9 +132,12 @@ function MetalPreviewContext(background, width::Int, height::Int;
     end
     star_params = MtlVector{Float32}(undef, 16)
     copyto!(star_params, zeros(Float32, 16))     # off until set_starfield!
+    # The star LUT is independent of `disc`, so a context with no disc can
+    # still render stars. `set_starfield!` rebakes it if the white point moves.
+    star_lut = MtlArray(_star_lut_cpu(STAR_WB_TEMPERATURE))
     return MetalPreviewContext(bg_gpu, out_gpu, cam_params, spacetime_params,
                                disc_params, bb_lut, vol_gpu, vol_params,
-                               star_params,
+                               star_params, star_lut,
                                width, height, Float32(dt),
                                nmax, Float32(r_escape_factor),
                                !isnothing(volume),
@@ -168,6 +199,14 @@ starts to alias into flicker under camera motion; the drizzle literature puts
 the sweet spot near 0.8 pixels. Pass the **render** height, not the preview
 height, or stars will be sized for the wrong frame.
 
+`wb_temperature` is the star field's **own** white point (default
+[`STAR_WB_TEMPERATURE`](@ref)), baked into a LUT the disc never touches. This
+is deliberate: white balance decides which temperature renders neutral, so
+while stars shared the disc's LUT, regrading the disc re-tinted the whole sky —
+and a 10000 K disc white point put every star below it, turning the field
+uniformly gold. Stars should look like stars whatever the disc is doing.
+`temp_min`/`temp_max` should straddle this value, or the same tinting returns.
+
 `flux` is the faintest star's linear brightness; the distribution runs up from
 there as ξ^(−2/3) over roughly a 460× range. The default is calibrated against
 `starmap_g4k.jpg` at the hero framing, where the brightest star in a clear-sky
@@ -179,11 +218,12 @@ function set_starfield!(ctx::MetalPreviewContext; strength::Real=1.0,
                         texture_weight::Real=0.0,
                         height::Union{Int,Nothing}=nothing,
                         fov_factor::Real=0.55, density::Real=384,
-                        fill::Real=0.4, flux::Real=0.008,
+                        fill::Real=0.5, flux::Real=0.011,
                         psf_pixels::Real=0.5,
                         galactic::NTuple{3,Real}=(0.0, 0.0, 1.0),
                         concentration::Real=3.0, temp_min::Real=3000,
-                        temp_max::Real=16000, seed::Integer=12345)
+                        temp_max::Real=16000, seed::Integer=12345,
+                        wb_temperature::Real=STAR_WB_TEMPERATURE)
     H = something(height, ctx.height)
     gx, gy, gz = galactic
     gn = sqrt(gx^2 + gy^2 + gz^2)
@@ -192,15 +232,15 @@ function set_starfield!(ctx::MetalPreviewContext; strength::Real=1.0,
     # `H` rows. Sizing the PSF from this rather than from a fixed angle is what
     # keeps stars ~1 px at every resolution.
     σ = psf_pixels * 2 * fov_factor / H
-    # Star colour reuses the disc's blackbody LUT; its bounds live in
-    # disc_params[4:6]. A context built without a disc has none, so fall back
-    # to a plain table rather than indexing an empty one.
-    lut = Metal.@allowscalar (ctx.disc_params[4], ctx.disc_params[5],
-                              ctx.disc_params[6])
-    if lut[3] < 1
-        throw(ArgumentError("""the starfield needs a blackbody LUT for star \
-            colour; build the context with `disc=` or `blackbody=`."""))
+    # Star colour comes from the context's OWN LUT, never the disc's, so
+    # regrading the disc leaves the sky alone. Rebake only if the caller moves
+    # the star white point off the default.
+    nlut = size(ctx.star_lut, 2)
+    if wb_temperature != STAR_WB_TEMPERATURE
+        copyto!(ctx.star_lut, _star_lut_cpu(wb_temperature; table_size=nlut))
     end
+    bb_ref = Blackbody(; wb_temperature=wb_temperature, table_size=nlut)
+    lut = (bb_ref.table_min, bb_ref.table_max, Float64(nlut))
     copyto!(ctx.star_params,
             Float32[strength, density, fill, σ, flux,
                     gx / gn, gy / gn, gz / gn, concentration,
@@ -354,7 +394,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    starfield_mtl(dx, dy, dz, sp, bb_lut) -> (r, g, b)
+    starfield_mtl(dx, dy, dz, sp, star_lut) -> (r, g, b)
 
 Procedural point stars in the escape direction `(dx, dy, dz)`, evaluated at
 output resolution instead of read from a texture.
@@ -389,7 +429,7 @@ Celestia's finding that FOV-relative sizing must take over below ~0.03°/pixel
 is what makes the footprint, rather than a fixed angular size, the right
 choice: a 4K frame here sits at 0.026°/pixel, already inside that regime.
 """
-@inline function starfield_mtl(dx, dy, dz, sp, bb_lut)
+@inline function starfield_mtl(dx, dy, dz, sp, star_lut)
     N = sp[2]
     fill = sp[3]
     σ = sp[4]
@@ -455,16 +495,16 @@ choice: a 4K frame here sits at 0.026°/pixel, already inside that regime.
                    max(lut_tmax - lut_tmin, 1.0f-6)
             li = clamp(unsafe_trunc(Int32, frac * (lut_size - 1.0f0) + 0.5f0) +
                        Int32(1), Int32(1), unsafe_trunc(Int32, lut_size))
-            acc_r += w * bb_lut[1, li]
-            acc_g += w * bb_lut[2, li]
-            acc_b += w * bb_lut[3, li]
+            acc_r += w * star_lut[1, li]
+            acc_g += w * star_lut[2, li]
+            acc_b += w * star_lut[3, li]
         end
     end
     return (acc_r, acc_g, acc_b)
 end
 
 """
-    trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
+    trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params, cam_params,
                       spacetime_params, disc_params, width, height, nmax, dt,
                       jitter_u, jitter_v, weight, row0, rows, ::Val{VOL})
 
@@ -487,8 +527,8 @@ before the first pass and the weights of all passes should sum to 1. `row0`
 and `rows` select a horizontal tile so large frames can be split across
 several short dispatches.
 """
-function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, star_params,
-                           cam_params,
+function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
+                           star_params, cam_params,
                            spacetime_params, disc_params, fan, sky_params,
                            width, height, nmax, dt, jitter_u, jitter_v,
                            weight, row0, rows, substride, subx, suby,
@@ -1001,7 +1041,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, star_params,
             tw = star_params[16]
             r_col *= tw; g_col *= tw; b_col *= tw
             sr, sg, sb = starfield_mtl(vx / vl, vy / vl, vz / vl,
-                                       star_params, bb_lut)
+                                       star_params, star_lut)
             r_col += star_params[1] * sr
             g_col += star_params[1] * sg
             b_col += star_params[1] * sb
@@ -1059,10 +1099,9 @@ fields wider than 180° render cleanly — a rectilinear pinhole caps below
 180° at any focal length). See [`CAM_PARAMS_N`](@ref) for the layout.
 """
 function _ks_cam_params(cam::Camera, M::Float64; fisheye_deg::Real=0.0,
-                        focus_dist::Real=1.0,
-                        beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
+                        focus_dist::Real=1.0)
     u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
-                                      cam.up_local, M; beta=beta)
+                                      cam.up_local, M; beta=camera_beta(cam))
     p = Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
                 Ef..., Er..., Eu..., u4...,
                 fisheye_deg > 0 ? 1.0 : 0.0, deg2rad(max(fisheye_deg, 0.0)),
@@ -1088,24 +1127,22 @@ allocates nothing per frame.
 """
 function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
                             spacetime::Schwarzschild; fisheye_deg::Real=0.0,
-                            relativistic::Bool=false,
-                            beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
+                            relativistic::Bool=false)
     img = Matrix{RGBf}(undef, ctx.width, ctx.height)
     host = Array{Float32,3}(undef, 3, ctx.width, ctx.height)
     return render_preview_mtl!(img, host, ctx, cam, spacetime;
                                fisheye_deg=fisheye_deg,
-                               relativistic=relativistic, beta=beta)
+                               relativistic=relativistic)
 end
 
 function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              ctx::MetalPreviewContext, cam::Camera,
                              spacetime::Schwarzschild; fisheye_deg::Real=0.0,
                              relativistic::Bool=false,
-                             beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
                              band_rows::Int=0,
                              on_band::Union{Nothing,Function}=nothing)
     _trace_preview_gpu!(ctx, cam, spacetime; fisheye_deg=fisheye_deg,
-                        relativistic=relativistic, beta=beta,
+                        relativistic=relativistic,
                         band_rows=band_rows, on_band=on_band)
     copyto!(host, ctx.out_gpu)
     @inbounds for j in 1:ctx.height, i in 1:ctx.width
@@ -1122,7 +1159,6 @@ to the host. The native shell presents `out_gpu` straight to a CAMetalLayer;
 function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
                              spacetime::Schwarzschild; fisheye_deg::Real=0.0,
                              relativistic::Bool=false,
-                             beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
                              band_rows::Int=0,
                              on_band::Union{Nothing,Function}=nothing)
     M = Float32(spacetime.M)
@@ -1140,7 +1176,7 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
 
     # Update reusable GPU parameter buffers with a single host-to-device copy.
     copyto!(ctx.cam_params, _ks_cam_params(cam, spacetime.M;
-                                           fisheye_deg=fisheye_deg, beta=beta))
+                                           fisheye_deg=fisheye_deg))
     copyto!(ctx.spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
 
@@ -1186,7 +1222,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
     key = (von, nb, layer)
     if !haskey(kernels, key)
         kernels[key] = @metal launch=false trace_kernel_mtl!(
-            out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
+            out, ctx.bg_gpu, ctx.bb_lut, ctx.star_lut, ctx.vol_gpu,
+            ctx.vol_params,
             ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
             fan_b, skyp_b,
             width, height, nmax, dt, ju, jv, weight, row0, rows,
@@ -1196,7 +1233,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
     n = width * rows
     threads = min(kernel.pipeline.maxTotalThreadsPerThreadgroup, n)
     groups = cld(n, threads)
-    kernel(out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
+    kernel(out, ctx.bg_gpu, ctx.bb_lut, ctx.star_lut, ctx.vol_gpu,
+           ctx.vol_params,
            ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
            fan_b, skyp_b,
            width, height, nmax, dt, ju, jv, weight, row0, rows,
@@ -1207,7 +1245,7 @@ end
 
 """
     render_depth_mtl(ctx, cam, spacetime; width, height, samples=2, dt=0.02,
-                     nbuckets=10, fisheye_deg=0.0, relativistic=false, beta=0)
+                     nbuckets=10, fisheye_deg=0.0, relativistic=false)
 
 Pinhole draft render with emission separated into `nbuckets` path-length
 buckets (log-spaced over 1.5M–120M; the last bucket holds the escaped
@@ -1221,8 +1259,7 @@ function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
                           samples::Int=2, dt::Real=0.02,
                           nbuckets::Int=10, fisheye_deg::Real=0.0,
                           rng::Random.AbstractRNG=Random.default_rng(),
-                          relativistic::Bool=false,
-                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
+                          relativistic::Bool=false)
     nbuckets >= 3 || throw(ArgumentError("nbuckets must be ≥ 3"))
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
@@ -1235,7 +1272,7 @@ function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
     cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
     spacetime_params = MtlVector{Float32}(undef, 4)
     copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
-                                       fisheye_deg=fisheye_deg, beta=beta))
+                                       fisheye_deg=fisheye_deg))
     copyto!(spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
     out = MtlArray{Float32,3}(undef, 3 * nbuckets, width, height)
@@ -1283,11 +1320,15 @@ context's background/LUT/parameter buffers, so call it with the same `ctx` as
 the live preview. Thin-lens cameras fall back to pinhole optics (no DoF).
 
 Motion blur: pass `camera_at`, a function of the shutter fraction `s ∈ [0, 1)`
-returning `(cam::Camera, beta::SVector{3,Float64})`. Each of the `samples²`
-supersampling passes then renders from its own stratified shutter time — the
-passes double as the temporal samples, exactly as they double as the aperture
-samples for DoF, so the blur costs nothing extra. The positional `cam`/`beta`
-still set the escape radius and are the nominal (shutter-centre) pose.
+returning a `Camera`. Each of the `samples²` supersampling passes then renders
+from its own stratified shutter time — the passes double as the temporal
+samples, exactly as they double as the aperture samples for DoF, so the blur
+costs nothing extra. The positional `cam` still sets the escape radius and is
+the nominal (shutter-centre) pose.
+
+`camera_at` has the same signature here as in [`render_motion`](@ref), so one
+motion path drives either renderer. It used to return `(Camera, beta)` on the
+GPU and a bare `Camera` on the CPU; velocity now lives on the camera itself.
 """
 function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           spacetime::Schwarzschild;
@@ -1298,7 +1339,6 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           fisheye_deg::Real=0.0,
                           aperture_world::Real=0.0, focus_dist::Real=1.0,
                           relativistic::Bool=false,
-                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
                           camera_at::Union{Function,Nothing}=nothing,
                           per_pixel_shutter::Bool=false)
     dt32 = Float32(dt)
@@ -1315,7 +1355,7 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     cam_params = MtlVector{Float32}(undef, CAM_PARAMS_N)
     spacetime_params = MtlVector{Float32}(undef, 4)
     base_params = _ks_cam_params(cam, spacetime.M; fisheye_deg=fisheye_deg,
-                                 focus_dist=focus_dist, beta=beta)
+                                 focus_dist=focus_dist)
     copyto!(cam_params, base_params)
     copyto!(spacetime_params,
             Float32[M, r_band, r_escape, relativistic ? 1.0 : 0.0])
@@ -1351,23 +1391,21 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
         if camera_at !== nothing
             m = time_perm[pass] - 1
             if per_pixel_shutter
-                cam_a, beta_a = camera_at(m / samples^2)
-                cam_b, beta_b = camera_at((m + 1) / samples^2)
-                base_params = _ks_cam_params(cam_a, spacetime.M;
+                base_params = _ks_cam_params(camera_at(m / samples^2), spacetime.M;
                                              fisheye_deg=fisheye_deg,
-                                             focus_dist=focus_dist, beta=beta_a)
-                endp = _ks_cam_params(cam_b, spacetime.M;
+                                             focus_dist=focus_dist)
+                endp = _ks_cam_params(camera_at((m + 1) / samples^2), spacetime.M;
                                       fisheye_deg=fisheye_deg,
-                                      focus_dist=focus_dist, beta=beta_b)
+                                      focus_dist=focus_dist)
                 # Seed kept clear of the lens hashes (which use `pass` and
                 # `pass + 7919`), so time and aperture decorrelate per pixel.
                 base_params[29] = Float32(104729 + pass)
                 base_params[30:(29 + CAM_POSE_N)] .= @view endp[1:CAM_POSE_N]
             else
-                cam_s, beta_s = camera_at((m + 0.5) / samples^2)
-                base_params = _ks_cam_params(cam_s, spacetime.M;
+                base_params = _ks_cam_params(camera_at((m + 0.5) / samples^2),
+                                             spacetime.M;
                                              fisheye_deg=fisheye_deg,
-                                             focus_dist=focus_dist, beta=beta_s)
+                                             focus_dist=focus_dist)
             end
         end
         if use_dof
@@ -1673,7 +1711,7 @@ end
 
 """
     sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
-                          spacetime_params, sky_params, star_params, bb_lut,
+                          spacetime_params, sky_params, star_params, star_lut,
                           width, height, lw, lh, ju, jv, accumulate,
                           row0, rows)
 
@@ -1687,7 +1725,7 @@ fall back to the nearest entry — a sub-pixel zone at the photon ring.
 """
 function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
                                spacetime_params, sky_params, star_params,
-                               bb_lut,
+                               star_lut,
                                width, height, lw, lh, ju, jv, accumulate,
                                row0, rows)
     idx = thread_position_in_grid().x
@@ -1795,7 +1833,7 @@ function sky_composite_kernel!(out, bg, fan, fine, layer, cam_params,
             tw = star_params[16]
             sky_r *= tw; sky_g *= tw; sky_b *= tw
             sr, sg, sb = starfield_mtl(dx / dl, dy / dl, dz / dl,
-                                       star_params, bb_lut)
+                                       star_params, star_lut)
             sky_r += star_params[1] * sr
             sky_g += star_params[1] * sg
             sky_b += star_params[1] * sb
@@ -2048,14 +2086,14 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
         _COMPOSITE_KERNEL[] = @metal launch=false sky_composite_kernel!(
             comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out,
             ctx.cam_params, ctx.spacetime_params, sky.sky_params,
-            ctx.star_params, ctx.bb_lut,
+            ctx.star_params, ctx.star_lut,
             width, height, lw, lh, Float32(ju), Float32(jv), acc, row0, rows)
     end
     kern = _COMPOSITE_KERNEL[]
     n = width * rows
     threads = min(kern.pipeline.maxTotalThreadsPerThreadgroup, n)
     kern(comp_out, ctx.bg_gpu, sky.fan, sky.fine, layer_out, ctx.cam_params,
-         ctx.spacetime_params, sky.sky_params, ctx.star_params, ctx.bb_lut,
+         ctx.spacetime_params, sky.sky_params, ctx.star_params, ctx.star_lut,
          width, height, lw, lh,
          Float32(ju), Float32(jv), acc, row0, rows;
          threads=threads, groups=cld(n, threads))

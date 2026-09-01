@@ -59,11 +59,9 @@ for f in 1:NFRAMES
         continue
     end
     pos, tgt, up, fe = dive_path_at(t)
-    cam = SpaceTime.Camera(pos, tgt, up, 0.55)
-    v = dive_beta(t; T_M=T_M)
-    βl = SVector(dot(v, cam.fwd), dot(v, cam.right), dot(v, cam.up_local))
+    cam = SpaceTime.Camera(pos, tgt, up, 0.55; velocity=dive_beta(t; T_M=T_M))
     img = render_draft_mtl(ctx, cam, st; width=W, height=H, samples=SAMPLES,
-                           dt=0.02, fisheye_deg=fe, relativistic=true, beta=βl)
+                           dt=0.02, fisheye_deg=fe, relativistic=true)
     SAVE_TIFF && save_master(joinpath(frames, "linear", @sprintf("f%04d.tiff", f)), rotr90(img))
     post = apply_look!(img, LOOK; rng=Xoshiro(7000 + f))
     if fade < 1.0

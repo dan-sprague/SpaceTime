@@ -280,7 +280,7 @@ end
 # scaled by target distance) transverse to the view, plus roll about the view
 # axis. Position and the ship velocity stay on the smooth path, so the
 # relativistic aberration doesn't wobble with the mount.
-function cam_for(t, jx)
+function cam_for(t, jx, v=SVector(0.0, 0.0, 0.0))
     pos, tgt, up, _ = path_at(t)
     fwd = normalize(tgt - pos)
     right = normalize(cross(fwd, up))
@@ -288,7 +288,9 @@ function cam_for(t, jx)
     d = norm(tgt - pos)
     tgt = tgt + d * (jx[1] * right + jx[2] * upl)
     up_j = normalize(cos(jx[3]) * upl + sin(jx[3]) * right)
-    return SpaceTime.Camera(pos, tgt, up_j, FOV33)
+    # Velocity is world-frame and rides on the camera, so mount jitter rotates
+    # the camera without touching the ship's motion.
+    return SpaceTime.Camera(pos, tgt, up_j, FOV33; velocity=v)
 end
 
 const SHUTTER = frame_span(0.5, NFRAMES)   # 180-degree shutter, in path-time
@@ -305,11 +307,9 @@ for f in 1:NFRAMES
     pose_at(s) = begin
         ts = clamp(t + (s - 0.5) * SHUTTER, 0.0, 1.0)
         jx = jxs[f] + (s - 0.5) * 0.5 * (jxs[f + 1] - jxs[f])
-        c = cam_for(ts, jx)
-        v = REL ? escape_beta(ts) : SVector(0.0, 0.0, 0.0)
-        (c, SVector(dot(v, c.fwd), dot(v, c.right), dot(v, c.up_local)))
+        cam_for(ts, jx, REL ? escape_beta(ts) : SVector(0.0, 0.0, 0.0))
     end
-    cam, βl = pose_at(0.5)
+    cam = pose_at(0.5)
 
     # Deep thin-lens DoF on the rectilinear tail, focused just inside the
     # camera radius like the hero (27M at r=30M). aperture = focus/f_number.
@@ -319,7 +319,7 @@ for f in 1:NFRAMES
     img = render_draft_mtl(ctx, cam, st; width=W, height=H,
                            samples=(fe_frame[f] > 0.0 ? SAMPLES : TAIL_SAMPLES),
                            dt=0.02, fisheye_deg=fe_frame[f], relativistic=REL,
-                           beta=βl, aperture_world=ap, focus_dist=fo,
+                           aperture_world=ap, focus_dist=fo,
                            camera_at=(MOTION ? pose_at : nothing),
                            rng=Xoshiro(9_000 + f))
     put!(ch, (f, img))

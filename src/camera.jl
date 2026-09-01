@@ -1,11 +1,37 @@
 abstract type AbstractCamera end
 
+const _ZERO_V = SVector(0.0, 0.0, 0.0)
+
 """
-    Camera(pos, target, up, fov_factor=1.0)
+    camera_beta(cam::AbstractCamera) -> SVector{3,Float64}
+
+The camera's 3-velocity resolved onto its own `(forward, right, up)` axes,
+which is the basis [`ks_camera_tetrad`](@ref) boosts in.
+
+Cameras store `velocity` in **world** coordinates, because that is what it
+physically is: how the ship is moving, independent of where it happens to be
+pointing. Mount jitter rotates the camera many times a second and must not
+change the ship's velocity. Projecting here, once, is also what stops the two
+from disagreeing — velocity used to be a separate argument handed to the
+renderer alongside the camera, and a caller that forgot it rendered a ship
+moving at 0.189c as though it were parked.
+"""
+camera_beta(cam::AbstractCamera) =
+    SVector(dot(cam.velocity, cam.fwd),
+            dot(cam.velocity, cam.right),
+            dot(cam.velocity, cam.up_local))
+
+"""
+    Camera(pos, target, up, fov_factor=1.0; velocity=zero)
 
 A simple pinhole camera. All rays originate from `pos` and pass through an
 imaginary sensor plane defined by `fov_factor = tan(half_fov)`. This is the
 fastest camera model and matches the original `Camera` behaviour.
+
+`velocity` is the camera's 3-velocity in units of c, in **world** coordinates.
+Non-zero, the observer tetrad is Lorentz-boosted by it, so aberration, motion
+Doppler and beaming appear exactly as an on-board observer would see them. See
+[`camera_beta`](@ref).
 """
 struct Camera <: AbstractCamera
     pos::SVector{3, Float64}
@@ -13,12 +39,13 @@ struct Camera <: AbstractCamera
     right::SVector{3, Float64}
     up_local::SVector{3, Float64}
     fov_factor::Float64
+    velocity::SVector{3, Float64}
 
-    function Camera(pos, target, up, fov_factor=1.0)
+    function Camera(pos, target, up, fov_factor=1.0; velocity=_ZERO_V)
         fwd = normalize(target - pos)
         right = normalize(cross(fwd, up))
         up_local = cross(right, fwd)
-        new(pos, fwd, right, up_local, fov_factor)
+        new(pos, fwd, right, up_local, fov_factor, SVector{3,Float64}(velocity))
     end
 end
 
@@ -27,12 +54,14 @@ const PinholeCamera = Camera
 
 """
     ThinLensCamera(pos, target, up; focal_length=50.0, sensor_width=36.0,
-                   f_number=2.8, focus_distance=100.0)
+                   f_number=2.8, focus_distance=100.0, velocity=zero)
 
 A thin-lens camera with a circular aperture. `focal_length` and `sensor_width`
 are in millimetres; `focus_distance` is in world units. The aperture diameter
 is `focal_length / f_number`. Rays are sampled over the lens aperture and
 converge at the focal plane, producing depth-of-field blur.
+
+`velocity` is the world-frame 3-velocity in units of c; see [`Camera`](@ref).
 """
 struct ThinLensCamera <: AbstractCamera
     pos::SVector{3, Float64}
@@ -44,19 +73,21 @@ struct ThinLensCamera <: AbstractCamera
     fov_factor::Float64         # (sensor_width / 2) / focal_length
     aperture::Float64           # mm
     focus_distance::Float64     # world units
+    velocity::SVector{3, Float64}
 
     function ThinLensCamera(pos, target, up;
                               focal_length=50.0,
                               sensor_width=36.0,
                               f_number=2.8,
-                              focus_distance=100.0)
+                              focus_distance=100.0,
+                              velocity=_ZERO_V)
         fwd = normalize(target - pos)
         right = normalize(cross(fwd, up))
         up_local = cross(right, fwd)
         fov_factor = (sensor_width / 2.0) / focal_length
         aperture = focal_length / f_number
         new(pos, fwd, right, up_local, focal_length, sensor_width, fov_factor,
-            aperture, focus_distance)
+            aperture, focus_distance, SVector{3,Float64}(velocity))
     end
 end
 
@@ -137,12 +168,14 @@ struct FisheyeCamera <: AbstractCamera
     right::SVector{3, Float64}
     up_local::SVector{3, Float64}
     theta_edge::Float64
+    velocity::SVector{3, Float64}
 
-    function FisheyeCamera(pos, target, up; theta_edge=deg2rad(100.0))
+    function FisheyeCamera(pos, target, up; theta_edge=deg2rad(100.0),
+                           velocity=_ZERO_V)
         fwd = normalize(target - pos)
         right = normalize(cross(fwd, up))
         up_local = cross(right, fwd)
-        new(pos, fwd, right, up_local, theta_edge)
+        new(pos, fwd, right, up_local, theta_edge, SVector{3,Float64}(velocity))
     end
 end
 
@@ -206,9 +239,10 @@ function _rebuild(cam::AbstractCamera, pos, fwd)
                        focal_length=cam.focal_length,
                        sensor_width=cam.sensor_width,
                        f_number=cam.focal_length / cam.aperture,
-                       focus_distance=cam.focus_distance)
+                       focus_distance=cam.focus_distance,
+                       velocity=cam.velocity)
     else
-        Camera(pos, target, cam.up_local, cam.fov_factor)
+        Camera(pos, target, cam.up_local, cam.fov_factor; velocity=cam.velocity)
     end
 end
 
@@ -238,9 +272,10 @@ function roll(cam::AbstractCamera, deg)
                        focal_length=cam.focal_length,
                        sensor_width=cam.sensor_width,
                        f_number=cam.focal_length / cam.aperture,
-                       focus_distance=cam.focus_distance)
+                       focus_distance=cam.focus_distance,
+                       velocity=cam.velocity)
     else
-        Camera(cam.pos, cam.pos + cam.fwd, new_up, cam.fov_factor)
+        Camera(cam.pos, cam.pos + cam.fwd, new_up, cam.fov_factor; velocity=cam.velocity)
     end
 end
 
@@ -301,9 +336,10 @@ function offset_camera(cam::AbstractCamera, bh_pos; mode=:rotate, angle=nothing,
                                   focal_length=cam.focal_length,
                                   sensor_width=cam.sensor_width,
                                   f_number=cam.focal_length / cam.aperture,
-                                  focus_distance=cam.focus_distance)
+                                  focus_distance=cam.focus_distance,
+                                  velocity=cam.velocity)
         else
-            return Camera(new_pos, new_target, cam.up_local, cam.fov_factor)
+            return Camera(new_pos, new_target, cam.up_local, cam.fov_factor; velocity=cam.velocity)
         end
     else
         error("Unknown mode: $mode. Use :rotate or :translate.")

@@ -103,20 +103,22 @@ t0 = time()
 for f in 1:NFRAMES
     t = frame_t(f, NFRAMES)
     pos, tgt, up, fe = path_at(t)
-    cam = SpaceTime.Camera(pos, tgt, up, 0.55)
+    # The ship's velocity rides on the camera, in world coordinates. It used to
+    # be projected onto the camera basis here and passed to the renderer
+    # alongside the camera, where the two could disagree.
+    cam = SpaceTime.Camera(pos, tgt, up, 0.55;
+                           velocity = REL ? escape_beta(t) : SVector(0.0, 0.0, 0.0))
     sim !== nothing && step_sim!(sim, ctx; dt=2.5 / 30)   # gas at 2.5x time-lapse
     ONLY > 0 && f != ONLY && continue   # sim still steps: frame ONLY is exact
-    v = REL ? escape_beta(t) : SVector(0.0, 0.0, 0.0)
-    βl = SVector(dot(v, cam.fwd), dot(v, cam.right), dot(v, cam.up_local))
     img = render_draft_mtl(ctx, cam, st; width=W, height=H, samples=SAMPLES,
-                           dt=0.02, fisheye_deg=fe, relativistic=REL, beta=βl)
+                           dt=0.02, fisheye_deg=fe, relativistic=REL)
     # Linear HDR frame, untouched by any grading — the master for post.
     SAVE_TIFF && save_master(joinpath(frames, "linear", @sprintf("f%04d.tiff", f)), rotr90(img))
     post = apply_look!(img, LOOK; rng=Xoshiro(7000 + f))
     rot = map(clamp01nan, rotr90(post))
     if HUD
         r_h = norm(pos)
-        sp_h = norm(v)
+        sp_h = norm(cam.velocity)
         γ_h = 1.0 / sqrt(1.0 - min(sp_h^2, 0.999))
         f > 1 && (global τ_ship += dtc * sqrt(max(1.0 - 2.0 / r_h, 0.0)) / γ_h)
         draw_hud!(rot, (@sprintf("R %5.2f M  %s", r_h, hud_region(r_h)),
