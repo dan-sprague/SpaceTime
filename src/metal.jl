@@ -28,6 +28,9 @@ struct MetalPreviewContext{B<:MtlArray{Float32,3}, O<:MtlArray{Float32,3},
     bb_lut::L
     vol_gpu::V                   # (nr, nphi, nz) volumetric disc density
     vol_params::MtlVector{Float32}
+    # Procedural starfield (see `starfield_mtl`); [1] = 0 disables it, and the
+    # cost when off is one buffer read and a branch, so it needs no Val.
+    star_params::MtlVector{Float32}
     width::Int
     height::Int
     dt::Float32
@@ -99,8 +102,11 @@ function MetalPreviewContext(background, width::Int, height::Int;
                                     volume.emission_scale,
                                     volume.opacity_scale, 2.0f0])  # march stride
     end
+    star_params = MtlVector{Float32}(undef, 16)
+    copyto!(star_params, zeros(Float32, 16))     # off until set_starfield!
     return MetalPreviewContext(bg_gpu, out_gpu, cam_params, spacetime_params,
                                disc_params, bb_lut, vol_gpu, vol_params,
+                               star_params,
                                width, height, Float32(dt),
                                nmax, Float32(r_escape_factor),
                                !isnothing(volume),
@@ -137,6 +143,69 @@ function set_disc_enabled!(ctx::MetalPreviewContext, disc::AccretionDisc,
             Float32[enabled ? disc.inner_radius : 0.0, disc.outer_radius,
                     disc.density_falloff, bb.table_min, bb.table_max,
                     bb.table_size])
+    return nothing
+end
+
+"""
+    set_starfield!(ctx; strength=1.0, texture_weight=0.0, height=nothing,
+                   fov_factor=0.55, density=768, fill=0.18, flux=0.004,
+                   psf_pixels=1.0, galactic=(0,0,1), concentration=3.0,
+                   temp_min=3000, temp_max=9000, seed=12345)
+
+Enable the procedural starfield (see [`starfield_mtl`](@ref)). `strength = 0`
+turns it off, which is the default.
+
+`texture_weight` scales the sky texture the stars are drawn over: 1.0 keeps it
+at full strength and adds stars on top, 0.0 replaces it entirely. The useful
+middle is a low weight — the 4k equirectangular map is *good* at the diffuse
+Milky Way glow and nebulosity, which are genuinely low-frequency and lose
+nothing to magnification, and *bad* at point sources, which is what this
+replaces.
+
+`psf_pixels` sets the Gaussian width as a multiple of the pixel's angular
+footprint, computed from `height` and `fov_factor`. Below about 1 the field
+starts to alias into flicker under camera motion; the drizzle literature puts
+the sweet spot near 0.8 pixels. Pass the **render** height, not the preview
+height, or stars will be sized for the wrong frame.
+
+`flux` is the faintest star's linear brightness; the distribution runs up from
+there as ξ^(−2/3) over roughly a 460× range. The default is calibrated against
+`starmap_g4k.jpg` at the hero framing, where the brightest star in a clear-sky
+crop reaches ≈2.3 linear — match that and the two skies carry comparable
+weight, so `texture_weight` becomes a pure look dial rather than an exposure
+correction.
+"""
+function set_starfield!(ctx::MetalPreviewContext; strength::Real=1.0,
+                        texture_weight::Real=0.0,
+                        height::Union{Int,Nothing}=nothing,
+                        fov_factor::Real=0.55, density::Real=1024,
+                        fill::Real=0.5, flux::Real=0.022,
+                        psf_pixels::Real=1.0,
+                        galactic::NTuple{3,Real}=(0.0, 0.0, 1.0),
+                        concentration::Real=3.0, temp_min::Real=3000,
+                        temp_max::Real=9000, seed::Integer=12345)
+    H = something(height, ctx.height)
+    gx, gy, gz = galactic
+    gn = sqrt(gx^2 + gy^2 + gz^2)
+    gn > 0 || throw(ArgumentError("galactic normal must be non-zero"))
+    # The pixel's angular footprint: the vertical field is 2·fov_factor across
+    # `H` rows. Sizing the PSF from this rather than from a fixed angle is what
+    # keeps stars ~1 px at every resolution.
+    σ = psf_pixels * 2 * fov_factor / H
+    # Star colour reuses the disc's blackbody LUT; its bounds live in
+    # disc_params[4:6]. A context built without a disc has none, so fall back
+    # to a plain table rather than indexing an empty one.
+    lut = Metal.@allowscalar (ctx.disc_params[4], ctx.disc_params[5],
+                              ctx.disc_params[6])
+    if lut[3] < 1
+        throw(ArgumentError("""the starfield needs a blackbody LUT for star \
+            colour; build the context with `disc=` or `blackbody=`."""))
+    end
+    copyto!(ctx.star_params,
+            Float32[strength, density, fill, σ, flux,
+                    gx / gn, gy / gn, gz / gn, concentration,
+                    temp_min, temp_max - temp_min,
+                    lut[1], lut[2], lut[3], seed, texture_weight])
     return nothing
 end
 
@@ -285,6 +354,111 @@ end
 # ---------------------------------------------------------------------------
 
 """
+    starfield_mtl(dx, dy, dz, sp, bb_lut) -> (r, g, b)
+
+Procedural point stars in the escape direction `(dx, dy, dz)`, evaluated at
+output resolution instead of read from a texture.
+
+**Why this exists.** `assets/starmap_g4k.jpg` is 4096×2048 equirectangular, so
+0.088° per texel. A 4K frame through a 33 mm lens has pixels of about 0.026°,
+which magnifies the sky texture more than three times: stars stop being points
+and become soft blobs, and no amount of render resolution recovers them
+because the source has run out. A procedural field has no such limit.
+
+**Placement.** Stars live on a uniform grid in `(u, v) = (φ/2π, (cos θ + 1)/2)`.
+That parametrisation is *equal-area* — `d(cos θ) dφ` is the solid-angle element
+— so a uniform grid gives uniform sky density with no pole pile-up, and the
+3×3 neighbourhood search needs no latitude correction. Each cell's contents
+come from a hash of its index, so the sky is deterministic, seamless and free.
+
+**Brightness.** Star counts grow as 10^(0.6m) with limiting magnitude and flux
+falls as 10^(−0.4m), which composes to a flux drawn as `ξ^(−2/3)` for uniform
+ξ — no logarithms needed. Colour is the blackbody LUT the disc already uses,
+at a sampled stellar temperature.
+
+**The point-source problem.** A star is a delta function; point-sampling one
+either hits or misses, which flickers under motion. Celestia hit this exactly
+and needed pixel-level PSF integration. Here the PSF is a Gaussian of width
+`sp[4]`, which the host sets to the pixel's angular footprint, and the
+renderer's existing jittered supersampling integrates it by Monte Carlo.
+
+The width is deliberately set in the **source sky**, not in screen pixels, so
+gravitational magnification stretches and brightens star images near the
+critical curve on its own — which is both correct and the thing worth seeing.
+Celestia's finding that FOV-relative sizing must take over below ~0.03°/pixel
+is what makes the footprint, rather than a fixed angular size, the right
+choice: a 4K frame here sits at 0.026°/pixel, already inside that regime.
+"""
+@inline function starfield_mtl(dx, dy, dz, sp, bb_lut)
+    N = sp[2]
+    fill = sp[3]
+    σ = sp[4]
+    flux0 = sp[5]
+    gnx = sp[6]; gny = sp[7]; gnz = sp[8]
+    gconc = sp[9]
+    tmin = sp[10]; tspan = sp[11]
+    lut_tmin = sp[12]; lut_tmax = sp[13]; lut_size = sp[14]
+    seed = unsafe_trunc(Int32, sp[15])
+
+    two_pi = 2.0f0 * Float32(pi)
+    u = atan(dy, dx) / two_pi + 0.5f0
+    v = (dz + 1.0f0) * 0.5f0
+    Ni = unsafe_trunc(Int32, N)
+    i0 = unsafe_trunc(Int32, floor(u * N))
+    j0 = unsafe_trunc(Int32, floor(v * N))
+
+    inv2σ2 = 1.0f0 / (2.0f0 * σ * σ)
+    cut = 25.0f0 * σ * σ            # 5σ; beyond it the Gaussian is negligible
+    acc_r = 0.0f0; acc_g = 0.0f0; acc_b = 0.0f0
+
+    for dj in Int32(-1):Int32(1)
+        jj = j0 + dj
+        (jj < Int32(0) || jj >= Ni) && continue
+        for di in Int32(-1):Int32(1)
+            ii = mod(i0 + di, Ni)
+
+            su = _sim_hash(ii, jj, seed + Int32(1))
+            sv = _sim_hash(ii, jj, seed + Int32(2))
+            # Star direction from its own cell coordinates.
+            φs = ((Float32(ii) + su) / N - 0.5f0) * two_pi
+            sz = 2.0f0 * (Float32(jj) + sv) / N - 1.0f0
+            sr = sqrt(max(1.0f0 - sz * sz, 0.0f0))
+            sx = sr * cos(φs)
+            sy = sr * sin(φs)
+
+            # Chord² ≈ angle² at these scales (σ is ~1e-4 rad).
+            ex = dx - sx; ey = dy - sy; ez = dz - sz
+            d2 = ex * ex + ey * ey + ez * ez
+            d2 > cut && continue
+
+            # Occupancy, thinned away from the galactic plane so the field has
+            # a Milky Way concentration rather than being uniform noise.
+            occ = fill
+            if gconc > 0.0f0
+                sb = abs(sx * gnx + sy * gny + sz * gnz)
+                occ *= exp(-sb * gconc)
+            end
+            _sim_hash(ii, jj, seed) < occ || continue
+
+            ξ = max(_sim_hash(ii, jj, seed + Int32(3)), 1.0f-4)
+            flux = flux0 * exp(-0.6666667f0 * log(ξ))     # ξ^(−2/3)
+            w = flux * exp(-d2 * inv2σ2)
+
+            ht = _sim_hash(ii, jj, seed + Int32(4))
+            T = tmin + tspan * ht * ht                    # biased cool
+            frac = (clamp(T, lut_tmin, lut_tmax) - lut_tmin) /
+                   max(lut_tmax - lut_tmin, 1.0f-6)
+            li = clamp(unsafe_trunc(Int32, frac * (lut_size - 1.0f0) + 0.5f0) +
+                       Int32(1), Int32(1), unsafe_trunc(Int32, lut_size))
+            acc_r += w * bb_lut[1, li]
+            acc_g += w * bb_lut[2, li]
+            acc_b += w * bb_lut[3, li]
+        end
+    end
+    return (acc_r, acc_g, acc_b)
+end
+
+"""
     trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
                       spacetime_params, disc_params, width, height, nmax, dt,
                       jitter_u, jitter_v, weight, row0, rows, ::Val{VOL})
@@ -307,7 +481,8 @@ before the first pass and the weights of all passes should sum to 1. `row0`
 and `rows` select a horizontal tile so large frames can be split across
 several short dispatches.
 """
-function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
+function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, star_params,
+                           cam_params,
                            spacetime_params, disc_params, fan, sky_params,
                            width, height, nmax, dt, jitter_u, jitter_v,
                            weight, row0, rows, substride, subx, suby,
@@ -770,6 +945,18 @@ function trace_kernel_mtl!(out, bg, bb_lut, vol, vol_params, cam_params,
         θbg = acos(clamp(vz / vl, -1.0f0, 1.0f0))
         φbg = atan(vy, vx)
         r_col, g_col, b_col = sample_background_mtl(bg, θbg, φbg, W, H)
+        # Procedural point stars, evaluated in the SOURCE sky so lensing
+        # magnifies them as it does everything else. `star_params[16]` dims the
+        # texture, so the two can be crossfaded rather than only swapped.
+        if star_params[1] > 0.0f0
+            tw = star_params[16]
+            r_col *= tw; g_col *= tw; b_col *= tw
+            sr, sg, sb = starfield_mtl(vx / vl, vy / vl, vz / vl,
+                                       star_params, bb_lut)
+            r_col += star_params[1] * sr
+            g_col += star_params[1] * sg
+            b_col += star_params[1] * sb
+        end
         if scam != 1.0f0
             # Relativistic sky: a ~5800 K star observed at T = g·5800 K.
             # Per-channel Planck ratios at 610/550/465 nm; brightness boost
@@ -930,7 +1117,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
     if !haskey(kernels, key)
         kernels[key] = @metal launch=false trace_kernel_mtl!(
             out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
-            cam_params, spacetime_params, ctx.disc_params, fan_b, skyp_b,
+            ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
+            fan_b, skyp_b,
             width, height, nmax, dt, ju, jv, weight, row0, rows,
             substride, subx, suby, Val(von), Val(nb), Val(layer))
     end
@@ -939,7 +1127,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
     threads = min(kernel.pipeline.maxTotalThreadsPerThreadgroup, n)
     groups = cld(n, threads)
     kernel(out, ctx.bg_gpu, ctx.bb_lut, ctx.vol_gpu, ctx.vol_params,
-           cam_params, spacetime_params, ctx.disc_params, fan_b, skyp_b,
+           ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
+           fan_b, skyp_b,
            width, height, nmax, dt, ju, jv, weight, row0, rows,
            substride, subx, suby, Val(von), Val(nb), Val(layer);
            threads=threads, groups=groups)
