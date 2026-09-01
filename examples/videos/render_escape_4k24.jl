@@ -311,9 +311,12 @@ for f in 1:NFRAMES
     end
     cam = pose_at(0.5)
 
-    # Deep thin-lens DoF on the rectilinear tail, focused just inside the
-    # camera radius like the hero (27M at r=30M). aperture = focus/f_number.
-    fo = 0.9 * norm(cam.pos)
+    # Thin-lens DoF on the rectilinear tail, focused ON the hole. This tracked
+    # the hero's old fixed 27M at r=30M — 10% inside the camera radius — and
+    # that defocus is what softened the photon ring there too. The hero now
+    # focuses at norm(pos); this follows it, since the tail exists to land on
+    # the hero composition. aperture = focus/f_number.
+    fo = norm(cam.pos)
     ap = fe_frame[f] > 0.0 ? 0.0 : fo / F_NUMBER
 
     img = render_draft_mtl(ctx, cam, st; width=W, height=H,

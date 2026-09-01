@@ -48,8 +48,18 @@ function camera_at(t)
     pos = SVector(base_pos[1] * cos(ϕ) - base_pos[2] * sin(ϕ),
                   base_pos[1] * sin(ϕ) + base_pos[2] * cos(ϕ),
                   base_pos[3])
+    # Focus ON the hole, not in front of it. This used to be a fixed 27.0
+    # against a camera radius of 30.05, putting the shadow edge three units
+    # behind the focal plane — and at f/5.6 that defocus is what was softening
+    # the photon ring, the thinnest feature in the frame.
+    #
+    # Measured as the steepest shadow-edge gradient per frame height: 239 for
+    # the CPU hero and 334 for the GPU hero, both at focus 27, against 569 for
+    # the documentary frame, which is the same camera position and roll but
+    # focused at norm(pos). Nothing else accounted for it — motion blur, grade,
+    # starfield and renderer were each measured and each made no difference.
     ThinLensCamera(pos, target, tilted_up;
-                   focal_length=33.0, f_number=5.6, focus_distance=27.0)
+                   focal_length=33.0, f_number=5.6, focus_distance=norm(pos))
 end
 
 println("Rendering $(W)×$(H), samples=$S, time_samples=$TS on ",
