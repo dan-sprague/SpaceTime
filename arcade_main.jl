@@ -4,42 +4,25 @@
 #   julia --project=. "$JC" --output-exe build/SpaceTimeArcade \
 #         --relative-rpath --verbose arcade_main.jl
 #
-# No --trim: this dependency tree (FileIO/ImageIO decoding a JPEG at runtime,
-# GLFW, ObjectiveC's @objc, Metal's kernel compilation) is not statically
+# No --trim: this dependency tree (GLFW, ObjectiveC's @objc, Metal's kernel compilation) is not statically
 # analysable, and trim=safe would reject it. Without trim juliac still gives a
 # single executable, just a large one.
-#
-# The starmap is found next to the binary, next to the source checkout, or
-# wherever SPACETIME_ASSETS points.
 
 using SpaceTime
 using StaticArrays
-using FileIO
+using Colors
 
-function _find_starmap()
-    cands = String[]
-    haskey(ENV, "SPACETIME_ASSETS") &&
-        push!(cands, joinpath(ENV["SPACETIME_ASSETS"], "starmap_g4k.jpg"))
-    try
-        push!(cands, joinpath(dirname(Sys.BINDIR), "assets", "starmap_g4k.jpg"))
-        push!(cands, joinpath(Sys.BINDIR, "assets", "starmap_g4k.jpg"))
-    catch
-    end
-    push!(cands, joinpath(pwd(), "assets", "starmap_g4k.jpg"))
-    push!(cands, joinpath(pwd(), "..", "assets", "starmap_g4k.jpg"))
-    i = findfirst(isfile, cands)
-    i === nothing ? nothing : cands[i]
-end
+# No image file is loaded, deliberately. Arcade mode runs with
+# `star_texture_weight = 0`, so the equirectangular starmap contributes
+# nothing — the sky is the procedural point-star field. Loading a JPEG would
+# mean FileIO picking a decoder at *runtime*, which an AOT binary cannot do:
+# it tries to precompile JpegTurbo_jll by spawning a `julia` that is not there,
+# and dies with ENOENT. A few black texels stand in for the texture that gets
+# multiplied by zero, and the binary needs no assets at all.
+const BLANK_SKY = fill(RGB{Float32}(0, 0, 0), 8, 4)
 
 function (@main)(args::Vector{String})::Cint
     try
-        path = _find_starmap()
-        if path === nothing
-            println(stderr, "starmap_g4k.jpg not found; set SPACETIME_ASSETS")
-            return 1
-        end
-        bg = FileIO.load(path)
-
         # Internal render height; keep it an integer divisor of the display or
         # the nearest upscale gives uneven pixels. 144 x10 and 180 x8 both land
         # exactly on 2560x1440.
@@ -54,7 +37,7 @@ function (@main)(args::Vector{String})::Cint
         cam = Camera(SVector(15.0, 0.0, 2.0), SVector(0.0, 0.0, 0.0),
                      SVector(0.0, 0.0, 1.0), Lens(24.0))
 
-        fly_native(cam, Kerr(1.0, spin_a), bg;
+        fly_native(cam, Kerr(1.0, spin_a), BLANK_SKY;
                    disc = disc,
                    width = ares[1], height = ares[2],
                    winwidth = 1280, winheight = 720,
