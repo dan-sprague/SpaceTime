@@ -50,6 +50,7 @@ include("accretion_disc.jl")
 include("disc_volume.jl")
 
 # Cameras and CPU ray tracing
+include("track.jl")   # racing tracks as timelike worldlines; needs gr.jl only
 include("camera.jl")
 include("dust.jl")
 include("callbacks.jl")
@@ -101,6 +102,11 @@ export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
 # --- Interactive apps and flight dynamics
 export PreviewSettings, render_preview, viewfinder, postprocessor
 export ShipState, step_ship!, ship_velocity
+
+# Racing tracks: timelike worldlines with bounded thrust (src/track.jl)
+export Track, Burn, integrate_track, solve_track
+export metric, orthonormal_frame, christoffel, normalize_timelike
+export periapsis_state, encounter_track, frame_components, ks_radius
 export fly_native, arcade_palette, plasma_palette, set_palette!
 
 # --- Look and Sampling: resolution-independent grade, device-independent effort

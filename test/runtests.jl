@@ -644,3 +644,84 @@ end
     q = SVector(0.0, 6.0, 2.0, 1.5)
     @test metric_inverse(Kerr(1.0, 0.0), q) ≈ metric_inverse(Schwarzschild(1.0), q)
 end
+
+@testset "Track construction" begin
+    # --- primitives ---
+    for bh in (Schwarzschild(1.0), Kerr(1.0, 0.9))
+        q = SVector(0.0, 12.0, 3.0, 2.0)
+        @test maximum(abs.(SpaceTime.metric(bh, q) *
+                           SpaceTime.metric_inverse(bh, q) - Diagonal(ones(4)))) < 1e-13
+    end
+    q = SVector(0.0, 12.0, 3.0, 2.0)
+    @test SpaceTime.metric(Schwarzschild(1.0), q) ≈ SpaceTime.metric(Kerr(1.0, 0.0), q)
+    @test maximum(abs.(SpaceTime.christoffel(Schwarzschild(0.0), q))) == 0.0
+
+    # Kerr-Schild r is not |pos|: on the equator |pos| = sqrt(r^2 + a^2).
+    bh = Kerr(1.0, 0.9)
+    pos, _ = SpaceTime.periapsis_state(bh, 10.0, 0.3)
+    @test SpaceTime.ks_radius(bh, pos) ≈ 10.0 atol=1e-10
+    @test norm(pos) ≈ sqrt(100.0 + 0.81) atol=1e-10
+
+    # --- worldline invariants ---
+    tr = SpaceTime.encounter_track(bh, 8.0, 0.55; τ_in=60, τ_out=60,
+                                   dτ=0.02, inclination=0.6)
+    @test !tr.captured
+    @test length(tr) > 1000
+    Es = Float64[]; Ls = Float64[]
+    for k in 1:50:length(tr)
+        qk = SVector(tr.t[k], tr.pos[k]...)
+        u  = SpaceTime.normalize_timelike(bh, qk, tr.vel[k])
+        g  = SpaceTime.metric(bh, qk); p = g * u
+        @test dot(u, g * u) ≈ -1.0 atol=1e-12          # stays timelike
+        push!(Es, -p[1]); push!(Ls, qk[2]*p[3] - qk[3]*p[2])
+    end
+    @test (maximum(Es) - minimum(Es)) / abs(Es[1]) < 1e-9    # coasting: E conserved
+    @test (maximum(Ls) - minimum(Ls)) / abs(Ls[1]) < 1e-8    # ... and L_z
+
+    # periapsis really is a turning point of the KS radius
+    rs = [SpaceTime.ks_radius(bh, p) for p in tr.pos]
+    @test minimum(rs) ≈ 8.0 atol=1e-6
+
+    # --- Fermi-Walker transport against the closed form ---
+    # A gyroscope on a circular equatorial orbit falls behind the orbital
+    # motion by  DPhi = 2pi[1 - sqrt(1 - 3M/r +/- 2a sqrt(M/r^3))]  per orbit
+    # (geodetic precession, plus Lense-Thirring from the spin term). This is a
+    # sharp test of the transport AND of the numerical Christoffels.
+    circ(b, r, pro) = begin
+        f(v) = maximum(SpaceTime.ks_radius.(Ref(b),
+                 SpaceTime.encounter_track(b, r, v; τ_in=0.0, τ_out=6.0,
+                                           dτ=0.01, prograde=pro).pos)) - r
+        lo, hi = 0.02, 0.95
+        for _ in 1:60; m = 0.5*(lo+hi); f(m) > 1e-9 ? (hi = m) : (lo = m); end
+        0.5*(lo+hi)
+    end
+    function precession(b, r, pro)
+        v  = circ(b, r, pro)
+        tk = SpaceTime.encounter_track(b, r, v; τ_in=0.0, τ_out=2π*r/v*1.4,
+                                       dτ=0.004, prograde=pro)
+        φ  = [atan(p[2], p[1]) for p in tk.pos]
+        Φ  = cumsum(vcat(0.0, [mod(φ[k]-φ[k-1]+π, 2π)-π for k in 2:length(φ)]))
+        A  = map(1:length(tk)) do i
+            qi = SVector(tk.t[i], tk.pos[i]...)
+            R  = SVector(0.0, tk.pos[i]...)
+            R  = R + dot(R, SpaceTime.metric(b, qi) * tk.u4[i]) * tk.u4[i]
+            c  = SpaceTime.frame_components(b, qi,
+                    (tk.ef4[i], tk.er4[i], tk.eu4[i]), R)
+            atan(c[2], c[1])
+        end
+        Au = cumsum(vcat(0.0, [mod(A[k]-A[k-1]+π, 2π)-π for k in 2:length(A)]))
+        k  = findfirst(i -> abs(Φ[i]) >= 2π, eachindex(Φ))
+        f  = (2π - abs(Φ[k-1])) / (abs(Φ[k]) - abs(Φ[k-1]))
+        return 2π - abs(Au[k-1] + f*(Au[k] - Au[k-1]))
+    end
+    for (a, pro, r) in ((0.0, true, 10.0), (0.5, true, 10.0), (0.9, true, 10.0),
+                        (0.998, true, 10.0), (0.9, false, 10.0), (0.9, true, 6.0))
+        b  = Kerr(1.0, a)
+        th = 2π * (1 - sqrt(1 - 3/r + (pro ? 1 : -1) * 2a * sqrt(1/r^3)))
+        @test precession(b, r, pro) ≈ th rtol=1e-6
+    end
+    # Frame dragging is not a rounding effect: prograde and retrograde
+    # precession at a = 0.9 differ by >50%.
+    @test precession(Kerr(1.0,0.9), 10.0, false) >
+          1.5 * precession(Kerr(1.0,0.9), 10.0, true)
+end

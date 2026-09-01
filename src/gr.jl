@@ -152,6 +152,43 @@ function metric_inverse(bh::Kerr, q::SVector{4,T}) where T
     return η - f * (lU * lU')
 end
 
+"""
+    metric(spacetime, q) -> SMatrix{4,4}
+
+Covariant metric `g_μν` at `q = (t, x, y, z)` in Cartesian Kerr–Schild
+coordinates: `g = η + f l⊗l` with the **covariant** null vector
+`l_μ = (1, l⃗)` — note `l_t = +1` where the contravariant `l^t = −1`, since
+`l_μ = η_μν l^ν`. Exact inverse of [`metric_inverse`](@ref); `g·g⁻¹ = I` to
+round-off, which is what the track integrator's index-lowering relies on.
+"""
+function metric(bh::Schwarzschild, q::SVector{4,T}) where T
+    x, y, z = q[2], q[3], q[4]
+    r = sqrt(x^2 + y^2 + z^2)
+    f = 2 * bh.M / r
+    lD = SVector{4,T}(1.0, x / r, y / r, z / r)
+    η = @SMatrix [-one(T) zero(T) zero(T) zero(T);
+                  zero(T)  one(T) zero(T) zero(T);
+                  zero(T) zero(T)  one(T) zero(T);
+                  zero(T) zero(T) zero(T)  one(T)]
+    return η + f * (lD * lD')
+end
+
+function metric(bh::Kerr, q::SVector{4,T}) where T
+    x, y, z = q[2], q[3], q[4]
+    a = bh.a
+    w = x^2 + y^2 + z^2 - a^2
+    r2 = 0.5 * (w + sqrt(w^2 + 4 * a^2 * z^2))
+    r = sqrt(max(r2, eps(Float64)))
+    f = 2 * bh.M * r^3 / (r2^2 + a^2 * z^2)
+    R2A = r2 + a^2
+    lD = SVector{4,T}(1.0, (r * x + a * y) / R2A, (r * y - a * x) / R2A, z / r)
+    η = @SMatrix [-one(T) zero(T) zero(T) zero(T);
+                  zero(T)  one(T) zero(T) zero(T);
+                  zero(T) zero(T)  one(T) zero(T);
+                  zero(T) zero(T) zero(T)  one(T)]
+    return η + f * (lD * lD')
+end
+
 """ 
     hamiltonian(μ, bh)
 Calculates the Hamiltonian for a photon in the given spacetime. The input `μ` is an 8-component state vector containing position and momentum information, and `bh` is the black hole spacetime. The function returns the value of the Hamiltonian, which should be zero for a photon following a geodesic.
