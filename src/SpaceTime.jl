@@ -107,6 +107,7 @@ export ShipState, step_ship!, ship_velocity
 export Track, Burn, integrate_track, solve_track
 export metric, orthonormal_frame, christoffel, normalize_timelike
 export periapsis_state, encounter_track, frame_components, ks_radius
+export track_sample, tidal_scalar
 export fly_native, arcade_palette, plasma_palette, set_palette!
 
 # --- Look and Sampling: resolution-independent grade, device-independent effort

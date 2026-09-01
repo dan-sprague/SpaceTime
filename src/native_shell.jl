@@ -678,6 +678,13 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
                     quantize::Real=0, dither::Real=1.0,
                     palette::Union{Nothing,Integer,AbstractMatrix}=nothing,
                     vsync::Bool=true,
+                    # Ride a generated worldline instead of flying manually.
+                    # The camera's position, heading, roll and velocity all come
+                    # from the same timelike solution, so what you see is what a
+                    # ship on that trajectory would see -- including aberration,
+                    # since `velocity` boosts the observer tetrad. Mouse-look
+                    # still works, as an offset from the track's own frame.
+                    track=nothing, track_speed::Real=1.0, track_loop::Bool=true,
                     max_seconds::Float64=Inf)   # finite for smoke tests
     M = spacetime.M
     # Arcade mode. The deflection fan needs spherical symmetry, so Kerr cannot
@@ -1100,6 +1107,24 @@ function fly_native(cam::AbstractCamera, spacetime::AbstractSpacetime, backgroun
         sig = (state.pos, state.yaw, state.pitch, state.roll, fisheye,
                relativistic, ctx.vol_on[], grade_rev, sky_mode)
         cam_now = build_cam()
+        if track !== nothing
+            # Proper time along the worldline, paced by wall clock. Note this
+            # is the SHIP's clock: near periapsis it runs slow against the
+            # coordinate time a distant observer would use, and that dilation
+            # is visible in how the starfield sweeps.
+            span = track.τ[end] - track.τ[1]
+            τr = (time() - t_start) * track_speed
+            τn = track_loop ? track.τ[1] + mod(τr, span) : track.τ[1] + τr
+            tp, tf, tu, tv, _ = track_sample(track, τn)
+            # Mouse-look as a rotation off the track's own frame rather than a
+            # replacement for it, so the roll the worldline carries survives.
+            rt = normalize(cross(tf, tu)); uu = cross(rt, tf)
+            cy, sy = cos(state.yaw), sin(state.yaw)
+            cp, sp = cos(state.pitch), sin(state.pitch)
+            look = normalize(cp * (cy * tf + sy * rt) + sp * uu)
+            cam_now = Camera(tp, tp + look, uu, Lens(Float64(focal)).fov_factor;
+                             velocity = tv)
+        end
         if sig != last_sig
             if haskey(ENV, "SPACETIME_DEBUG") && last_sig !== nothing
                 for (ci, (a, b)) in enumerate(zip(sig, last_sig))

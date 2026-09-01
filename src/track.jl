@@ -457,7 +457,7 @@ end
 State at the closest approach of an encounter. `r_p` is the periapsis **Kerr-Schild** radius — the same `r` that
 [`horizon_radius`](@ref) and [`photon_orbit_min`](@ref) are quoted in, not the
 Cartesian distance from the origin,
-`speed` the coordinate speed there (units of c), `inclination` the tilt of the
+`speed` the speed there **as measured by a static observer** (units of c, always valid in `[0,1)`), `inclination` the tilt of the
 orbital plane from the equator in radians, and `prograde` whether the pass runs
 with the hole's spin or against it.
 
@@ -493,8 +493,27 @@ function periapsis_state(bh::AbstractSpacetime, r_p::Real, speed::Real;
     t̂ = cross(n̂, grad_ks_r(bh, pos))
     nt = norm(t̂)
     nt > 1e-12 || throw(ArgumentError("degenerate orbital plane at inclination $inclination"))
-    t̂ = t̂ / nt
-    return pos, (prograde ? speed : -speed) * t̂
+    t̂ = (prograde ? 1.0 : -1.0) * t̂ / nt
+
+    # `speed` is what a STATIC observer at the periapsis measures, not a
+    # coordinate speed. The coordinate speed limit shrinks near the hole, so a
+    # designer asking for 0.7c at r = 2.5M would be refused for a reason that
+    # has nothing to do with the trajectory being unphysical. The static
+    # observer's own 4-velocity is along ∂_t, which has no spatial part, so
+    # boosting it along t̂ leaves dr/dτ = 0 exactly — the turning point survives.
+    q = SVector(0.0, pos[1], pos[2], pos[3])
+    g = metric(bh, q)
+    g[1, 1] < 0 || throw(ArgumentError(
+        "no static observer at r_p = $r_p (inside the ergosphere, g_tt = $(g[1,1]) ≥ 0). " *
+        "A turning point there requires co-rotating with the hole, which this " *
+        "constructor does not express — frame dragging leaves no choice about it."))
+    et = SVector(1.0, 0.0, 0.0, 0.0) / sqrt(-g[1, 1])
+    T = SVector(0.0, t̂[1], t̂[2], t̂[3])
+    T = T + dot(T, g * et) * et
+    T = T / sqrt(dot(T, g * T))
+    γ = 1.0 / sqrt(1.0 - speed^2)
+    u = γ * (et + speed * T)
+    return pos, SVector(u[2], u[3], u[4]) / u[1]
 end
 
 """
@@ -525,3 +544,43 @@ function encounter_track(bh::AbstractSpacetime, r_p::Real, speed::Real;
                  cat3(:u4), cat3(:ef4), cat3(:er4), cat3(:eu4),
                  cat3(:speed), back.captured || fwd.captured)
 end
+
+"""
+    track_sample(track, τ) -> (pos, fwd, up, vel, roll)
+
+Interpolate the track at proper time `τ`, clamped to its endpoints. Linear
+between samples: the worldline is smooth and integrated at `dτ ≈ 0.02`, so at
+any playback rate a viewer could follow, the interpolation error is far below a
+pixel.
+
+`vel` is the coordinate 3-velocity, which is what a `Camera` wants for
+`velocity` — the renderer boosts the observer tetrad by it, so aberration,
+Doppler and beaming come out of the same worldline that produced the position.
+"""
+function track_sample(tr::Track, τ::Real)
+    n = length(tr)
+    τ <= tr.τ[1]  && return (tr.pos[1], tr.fwd[1], tr.up[1], tr.vel[1], tr.roll[1])
+    τ >= tr.τ[n]  && return (tr.pos[n], tr.fwd[n], tr.up[n], tr.vel[n], tr.roll[n])
+    i = searchsortedfirst(tr.τ, τ)
+    i = clamp(i, 2, n)
+    w = (τ - tr.τ[i-1]) / (tr.τ[i] - tr.τ[i-1])
+    lerp(a, b) = a + w * (b - a)
+    nz(v) = (m = norm(v); m > 1e-12 ? v / m : v)
+    return (lerp(tr.pos[i-1], tr.pos[i]),
+            nz(lerp(tr.fwd[i-1], tr.fwd[i])),
+            nz(lerp(tr.up[i-1],  tr.up[i])),
+            lerp(tr.vel[i-1], tr.vel[i]),
+            lerp(tr.roll[i-1], tr.roll[i]))
+end
+
+"""
+    tidal_scalar(spacetime, pos) -> ~M/r³
+
+Cheap stand-in for the tidal stress a ship feels in free fall. Proper
+acceleration is zero on a geodesic — an accelerometer riding the slingshot
+reads nothing — so this, not acceleration, is the quantity that can hurt you.
+The real thing is the Riemann tensor contracted with the ship's frame; this is
+its leading radial scaling, which is what a HUD needle actually needs.
+"""
+tidal_scalar(bh::AbstractSpacetime, pos::SVector{3,Float64}) =
+    bh.M / max(ks_radius(bh, pos), 1e-6)^3
