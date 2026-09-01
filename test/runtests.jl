@@ -136,42 +136,122 @@ end
 end
 
 @testset "Resolution-independent post" begin
-    # Bloom radius and streak width are given in pixels, so the same numbers
-    # produce a tighter look on a larger frame unless `ref_height` rescales
-    # them. Measure the glow around a lone bright pixel as a fraction of frame
-    # height and require the two resolutions to agree.
-    function glow_fraction(w, h; kwargs...)
+    # The invariant this whole file exists for: the same `Look` at two output
+    # resolutions must give the same picture, differing only in sharpness. Every
+    # length in a `Look` is a fraction of frame height, so there is no reference
+    # resolution to get wrong.
+    #
+    # Measure the glow around a lone bright pixel as a fraction of frame height.
+    function glow_fraction(w, h, look)
         img = fill(RGBf(0, 0, 0), w, h)
         img[w ÷ 2, h ÷ 2] = RGBf(50, 50, 50)
-        p = postprocess(img; gain=1.0, exposure=0.0, gamma=1.0,
-                        bloom_strength=1.0, threshold=0.5, bloom_radius=10.0,
-                        bloom_power=1.5, streak_strength=0.0, tonemap=:none,
-                        kwargs...)
+        p = postprocess(img, look)
         cx, cy = w ÷ 2, h ÷ 2
         prof = [Float64(p[cx + k, cy].r) for k in 1:min(cx, cy) - 2]
         r = findfirst(<(0.05 * prof[1]), prof)
         return (r === nothing ? length(prof) : r) / h
     end
 
-    small = glow_fraction(320, 180)
-    big_unscaled = glow_fraction(960, 540)
-    big_scaled = glow_fraction(960, 540; ref_height=180)
+    look = Look(gain=1.0, exposure=0.0, gamma=1.0, bloom_strength=1.0,
+                threshold=0.5, bloom_radius=10.0 / 180, bloom_power=1.5,
+                streak_strength=0.0, tonemap=:none)
+    @test glow_fraction(960, 540, look) ≈ glow_fraction(320, 180, look) rtol = 0.15
 
-    # Unscaled, tripling the frame shrinks the glow to about a third of it.
-    @test big_unscaled < 0.5 * small
-    # Scaled, the glow covers the same fraction of the frame at both sizes.
-    @test big_scaled ≈ small rtol = 0.15
+    # ...and the test has teeth: a radius fixed in absolute pixels fails it,
+    # which is the bug the fractional units replaced.
+    function glow_fraction_px(w, h, radius_px)
+        img = fill(RGBf(0, 0, 0), w, h)
+        img[w ÷ 2, h ÷ 2] = RGBf(50, 50, 50)
+        p = postprocess(img; gain=1.0, exposure=0.0, gamma=1.0,
+                        bloom_strength=1.0, threshold=0.5,
+                        bloom_radius=radius_px, bloom_power=1.5,
+                        streak_strength=0.0, tonemap=:none)
+        cx, cy = w ÷ 2, h ÷ 2
+        prof = [Float64(p[cx + k, cy].r) for k in 1:min(cx, cy) - 2]
+        r = findfirst(<(0.05 * prof[1]), prof)
+        return (r === nothing ? length(prof) : r) / h
+    end
+    @test glow_fraction_px(960, 540, 10.0) < 0.5 * glow_fraction_px(320, 180, 10.0)
 
     # Lens-plane effects take the same treatment: a speck of dust covers a
     # fixed fraction of the frame regardless of the sensor behind it.
     darkness(img) = 1.0 - sum(Float64(c.r) for c in img) / length(img)
-    dust = LensDust(count=12, size_min=3.0, size_max=3.0,
+    dust = LensDust(count=12, size_min=3.0 / 180, size_max=3.0 / 180,
                     opacity_min=0.8, opacity_max=0.8)
     a = fill(RGBf(1, 1, 1), 320, 180)
     b = fill(RGBf(1, 1, 1), 960, 540)
     apply_lens_dust!(a; lens_dust=dust, rng=Xoshiro(1))
-    apply_lens_dust!(b; lens_dust=dust, ref_height=180, rng=Xoshiro(1))
+    apply_lens_dust!(b; lens_dust=dust, rng=Xoshiro(1))
     @test darkness(b) ≈ darkness(a) rtol = 0.25
+end
+
+@testset "Resolution-independent grain" begin
+    # Grain is the one effect that was never scaled at all: one deviate per
+    # pixel means the grain covers six times less of a 2160-line frame than of
+    # a 360-line one, and effectively vanishes at 4K. That is why low-res
+    # renders read as more filmic.
+    #
+    # Box-downsampling by F averages F² deviates. Independent ones lose a
+    # factor F of RMS; ones correlated across an F-pixel grain cell survive.
+    function down(img, f)
+        w, h = size(img)
+        o = zeros(RGBf, w ÷ f, h ÷ f)
+        for j in 1:size(o, 2), i in 1:size(o, 1)
+            s = 0.0
+            for dj in 0:f-1, di in 0:f-1
+                s += Float64(img[(i-1)*f + di + 1, (j-1)*f + dj + 1].g)
+            end
+            o[i, j] = RGBf(s / f^2, s / f^2, s / f^2)
+        end
+        o
+    end
+    # Relative RMS of the grain after downsampling to a common grid.
+    function grain(w, h, gs, f)
+        clean = fill(RGBf(0.18, 0.18, 0.18), w, h)
+        sensor_expose!(clean; iso=400.0, add_noise=false)
+        noisy = fill(RGBf(0.18, 0.18, 0.18), w, h)
+        sensor_expose!(noisy; iso=400.0, grain_size=gs, rng=Xoshiro(11))
+        c = f == 1 ? clean : down(clean, f)
+        n = f == 1 ? noisy : down(noisy, f)
+        μ = sum(x -> Float64(x.g), c) / length(c)
+        sqrt(sum((Float64(n[i].g) - Float64(c[i].g))^2
+                 for i in eachindex(n)) / length(n)) / μ
+    end
+
+    F = 4
+    # Frame-relative grain keeps its strength across a 4x resolution change.
+    @test grain(1280 * F, 720 * F, 1 / 360, F) ≈ grain(1280, 720, 1 / 360, 1) rtol = 0.1
+    # Per-pixel grain loses a factor of F, which is the defect.
+    @test grain(1280 * F, 720 * F, 0.0, F) < 0.45 * grain(1280, 720, 0.0, 1)
+end
+
+@testset "Look and Sampling" begin
+    # The 6x disagreement between the video grade and the hero grade is real and
+    # aesthetic, not a resolution artefact. Both are resolution independent;
+    # they simply disagree about how wide the halo should be. Pinning it here
+    # means changing it has to be deliberate.
+    @test LOOK_FILM.bloom_radius / LOOK_HERO.bloom_radius ≈ 6.0
+    @test LOOK_FILM.streak_width / LOOK_HERO.streak_width ≈ 6.0
+
+    l = with_look(LOOK_FILM; exposure=1.5)
+    @test l.exposure == 1.5
+    @test l.gamma == LOOK_FILM.gamma          # everything else carries over
+    @test l.bloom_radius == LOOK_FILM.bloom_radius
+
+    s = with_sampling(MOTION; samples=6)
+    @test s.samples == 6 && s.shutter == MOTION.shutter
+    # A still is not "the CPU preset" and a moving frame is not "the GPU
+    # preset": they differ only in effort and shutter.
+    @test STILL.shutter == 0.0 && MOTION.shutter > 0.0
+    @test STILL.samples > MOTION.samples
+
+    # apply_look! runs the chain and leaves a sane image.
+    img = fill(RGBf(0.2, 0.2, 0.2), 64, 36)
+    img[32, 18] = RGBf(40, 40, 40)
+    out = apply_look!(img, with_look(LOOK_FILM; f_number=0.0); rng=Xoshiro(3))
+    @test size(out) == (64, 36)
+    @test all(c -> isfinite(c.r) && isfinite(c.g) && isfinite(c.b), out)
+    @test all(c -> c.r >= 0 && c.g >= 0 && c.b >= 0, out)
 end
 
 @testset "Ship dynamics" begin
@@ -239,4 +319,47 @@ end
     tb = SpaceTime.ks_camera_tetrad(burn.x, fwd, right, upl, M; beta=βb)
     @test norm(tb[1] - ub) < 1.0e-8 * γb
     @test γb > 1.1                            # the burn actually moved us
+end
+
+@testset "Gas erosion" begin
+    disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
+                         blackbody=Blackbody(wb_temperature=10000.0),
+                         density_falloff=0.8)
+    small = (nr=48, nphi=64, nz=16)
+    ref = DiscVolume(disc; M=1.0, rng=Xoshiro(7), small...)
+
+    # erosion=0 is the shipped look, exactly: the carve must be off by default
+    # and must short-circuit before it touches the Worley field.
+    @test DiscVolume(disc; M=1.0, rng=Xoshiro(7), small...).density == ref.density
+    @test DiscVolume(disc; M=1.0, rng=Xoshiro(7), erosion=0.0,
+                     erosion_mode=:vein, small...).density == ref.density
+
+    @test_throws ArgumentError DiscVolume(disc; M=1.0, erosion_mode=:nope, small...)
+
+    # Erosion only ever removes gas, and it removes a real fraction of it —
+    # the failure mode this guards is a remap whose threshold never reaches the
+    # base distribution, which leaves a contrast gain and no holes at all.
+    gas(v) = filter(>(0.0), vec(v.density))
+    for mode in (:billow, :vein)
+        e = DiscVolume(disc; M=1.0, rng=Xoshiro(7), erosion=0.9,
+                       erosion_mode=mode, small...)
+        @test count(<(0.01), gas(e)) / length(gas(e)) >
+              count(<(0.01), gas(ref)) / length(gas(ref)) + 0.05
+        @test all(isfinite, e.density)
+        @test maximum(e.density) ≈ 1.0            # peak normalisation survives
+    end
+
+    # The remap's denominator is kept away from zero however hard it is driven.
+    @test all(isfinite, DiscVolume(disc; M=1.0, rng=Xoshiro(7), erosion=1.0,
+                                   small...).density)
+
+    # Both Worley modes are range-matched, so `erosion` means the same thing in
+    # each; an unmatched detail field is what made the first attempt inert.
+    lat = SpaceTime._noise_lattice(Xoshiro(7))
+    wv = [SpaceTime._worley_fbm(lat, 4x, 4y, 4z, 3; ridge=true)
+          for x in 0:0.37:12, y in 0:0.41:12, z in 0:0.43:12]
+    wb = [SpaceTime._worley_fbm(lat, 4x, 4y, 4z, 3; ridge=false)
+          for x in 0:0.37:12, y in 0:0.41:12, z in 0:0.43:12]
+    @test all(0 .<= wv .<= 1) && all(0 .<= wb .<= 1)
+    @test abs(sum(wv) / length(wv) - sum(wb) / length(wb)) < 0.15
 end

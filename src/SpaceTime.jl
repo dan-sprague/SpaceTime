@@ -52,6 +52,7 @@ include("postprocess.jl")
 include("sensor.jl")
 include("sensor_effects.jl")
 include("rawio.jl")
+include("look.jl")       # resolution-independent Look / Sampling; see its header
 
 # GPU renderer (Metal, Kerr–Schild) and interactive apps
 include("utils.jl")
@@ -94,6 +95,10 @@ export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
 export PreviewSettings, render_preview, viewfinder, flythrough, postprocessor
 export ShipState, step_ship!, ship_velocity
 export fly_native
+
+# --- Look and Sampling: resolution-independent grade, device-independent effort
+export Look, with_look, LOOK_FILM, LOOK_HERO, apply_look!
+export Sampling, with_sampling, STILL, MOTION
 
 # --- Image pipeline
 export postprocess, airy_kernel, apply_diffraction!, generate_psf, fft_convolve, aces_tonemap,
