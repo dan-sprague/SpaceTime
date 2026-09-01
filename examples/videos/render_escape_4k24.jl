@@ -236,10 +236,15 @@ workers = map(1:NPOST) do _
         # Projection morph happens on the linear frame, before bloom/streaks,
         # so the glow follows the final geometry.
         morph_a[f] > 0.0 && (img = lens_morph(img, morph_a[f], fe_frame[f]))
+        # Aperture diffraction, on the linear frame: the lens's own resolution
+        # limit, which at f/11 is ~1.6 px at 4k. Applied only on the
+        # rectilinear tail, where the thin lens is what we are modelling.
+        fe_frame[f] > 0.0 || apply_diffraction!(img; f_number=F_NUMBER)
         post = postprocess(img; gain=1.0, exposure=0.8, gamma=0.2, bloom_strength=1.0,
                            threshold=0.5, bloom_radius=10.0, bloom_power=1.5,
                            streak_strength=2.0, streak_length=0.1, streak_width=1.0,
-                           n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75)
+                           n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75,
+                           ref_height=360)
         sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0,
                        saturation=1.0e6, rng=Xoshiro(70_000 + f))
         apply_vignette!(post; strength=0.3)

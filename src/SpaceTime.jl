@@ -71,7 +71,7 @@ export visualize_solution, trace_fan, compare_hamiltonian_drift, shadow_radius
 
 # --- Accretion disc and emission
 export Blackbody, AccretionDisc, get_disc_color_doppler
-export DiscVolume, sample_disc_volume
+export DiscVolume, sample_disc_volume, volume_resolution
 export DiscFlare, DiscFlares, apply_flares!
 export DiscFluidSim, step_sim!
 
@@ -87,7 +87,8 @@ export render, render_no_doppler, render_motion
 
 # --- GPU renderer (Metal)
 export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
-       render_draft_mtl, set_volume_enabled!, set_disc_enabled!
+       render_draft_mtl, set_volume_enabled!, set_disc_enabled!,
+       set_march_stride!, set_starfield!
 
 # --- Interactive apps and flight dynamics
 export PreviewSettings, render_preview, viewfinder, flythrough, postprocessor
@@ -95,7 +96,7 @@ export ShipState, step_ship!, ship_velocity
 export fly_native
 
 # --- Image pipeline
-export postprocess, airy_convolve, generate_psf, fft_convolve, aces_tonemap,
+export postprocess, airy_kernel, apply_diffraction!, generate_psf, fft_convolve, aces_tonemap,
        auto_balance!
 export apply_vignette!, apply_lens_distortion!
 export SensorSettings, apply_iso_gain!, add_sensor_noise!, clip!, sensor_expose!

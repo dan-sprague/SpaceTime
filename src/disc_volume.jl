@@ -95,6 +95,29 @@ Build a volumetric disc for `disc`'s annulus around a black hole of mass `M`.
 - `scale_height`: H(s) = scale_height · s (flared slab); the grid spans
   ±3 scale heights at the outer edge.
 - `turbulence`: relative amplitude of the fractal density modulation.
+- `noise_gain` / `noise_lacunarity`: the fBm spectrum. **Leave these alone.**
+  Grid resolution, octave count and gain were all measured and none of them
+  makes the gas look more detailed — raising the gain makes it measurably
+  *worse*, because the octaves are near-independent and the normalised sum has
+  variance Σaᵢ²/(Σaᵢ)², so spreading weight across octaves flattens the field
+  (0.38σ² at gain 0.5, 0.29σ² at 0.7). See [`_fbm`](@ref).
+- `erosion`: strength in [0, 0.95] of the Worley carve, and **the dial that
+  actually adds gas detail**. Zero (the default, and the shipped look)
+  reproduces the plain fBm exactly. The reason spectral tuning fails is that
+  emission is alpha-composited along each ray, and a line integral is a √N
+  averaging operator that suppresses octave *k* by about lacunarity^(−k/2);
+  surviving it would need amplitude *rising* with frequency. Erosion sidesteps
+  the whole argument by not being a modulation: the detail field is subtracted
+  from the base as a threshold, producing near-binary edges, and a ray either
+  passes through a hole or it does not. See [`_shape_coverage`](@ref).
+  Because erosion only removes gas, the disc gets dimmer as it rises — expect
+  to raise `opacity_scale`/`emission_scale` alongside it.
+- `erosion_scale` / `erosion_octaves`: frequency multiplier and depth of the
+  carving field, relative to the base shape noise. The default 4× puts the
+  coarsest carve just below the finest shape octave.
+- `erosion_mode`: `:vein` carves with Worley F2−F1, whose zero set is a thin
+  web, leaving bright filaments split by dark lanes; `:billow` carves with
+  1−F1, punching round lobes. See [`_worley`](@ref).
 - `spiral_twist`: azimuthal shear applied to the noise coordinates, smearing
   blobs into trailing spiral filaments.
 - `emission_scale` / `opacity_scale`: brightness and optical-depth knobs used
@@ -120,12 +143,21 @@ function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
                     target_height::Union{Real,Nothing}=nothing,
                     scale_height::Real=0.08,
                     turbulence::Real=0.8, spiral_twist::Real=4.0,
-                    noise_octaves::Int=4,
+                    noise_octaves::Int=4, noise_gain::Real=0.5,
+                    noise_lacunarity::Real=2.1,
+                    erosion::Real=0.0, erosion_scale::Real=4.0,
+                    erosion_octaves::Int=3, erosion_mode::Symbol=:billow,
                     emission_scale::Real=0.8, opacity_scale::Real=1.2,
                     rng::Random.AbstractRNG=Random.default_rng())
     if target_height !== nothing
         nr, nphi, nz, noise_octaves = volume_resolution(target_height)
     end
+    erosion_mode in (:vein, :billow) ||
+        throw(ArgumentError("erosion_mode must be :vein or :billow, got $erosion_mode"))
+    eridge = erosion_mode === :vein
+    # Keep the remap's denominator away from zero: at erosion 1 a detail value
+    # of 1 would divide by 0 and erase the cell regardless of its density.
+    ero = clamp(Float64(erosion), 0.0, 0.95)
     s_in = disc.inner_radius
     s_out = disc.outer_radius
     z_max = 3.0 * scale_height * s_out
@@ -145,8 +177,10 @@ function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
                 # Sheared noise coordinates: radial detail fine, azimuthal
                 # stretched into arcs, spiral twist trails with radius.
                 u = ϕ + spiral_twist * log(s / s_in)
-                n = _fbm(lattice, 10.0 * log(s), 6.0 * u, 2.0 * z / H,
-                         noise_octaves)
+                n = _shape_coverage(lattice, log(s), u, 2.0 * z / H,
+                                    noise_octaves, noise_gain,
+                                    noise_lacunarity, ero, erosion_scale,
+                                    erosion_octaves, eridge)
                 # `u` is not periodic in ϕ (the noise argument jumps 6·2π
                 # lattice units across the 0↔2π wrap), which printed a
                 # filament seam along the ϕ=0 half-plane. Crossfade the last
@@ -155,8 +189,11 @@ function DiscVolume(disc::AccretionDisc; M::Real=1.0, nr::Int=192,
                 if ϕ > 2π - WRAP_BLEND
                     w = (ϕ - (2π - WRAP_BLEND)) / WRAP_BLEND
                     w = w * w * (3.0 - 2.0 * w)
-                    n2 = _fbm(lattice, 10.0 * log(s), 6.0 * (u - 2π),
-                              2.0 * z / H, noise_octaves)
+                    n2 = _shape_coverage(lattice, log(s), u - 2π,
+                                         2.0 * z / H, noise_octaves,
+                                         noise_gain, noise_lacunarity, ero,
+                                         erosion_scale, erosion_octaves,
+                                         eridge)
                     n = (1.0 - w) * n + w * n2
                 end
                 # Log-normal modulation: fBm has a small linear variance
@@ -210,7 +247,32 @@ function _value_noise(lattice, x, y, z)
     return c0 + fz * (c1 - c0)
 end
 
-function _fbm(lattice, x, y, z, octaves)
+"""
+    _fbm(lattice, x, y, z, octaves; gain=0.5, lacunarity=2.1)
+
+Fractional Brownian motion: octaves of value noise, each `lacunarity`× finer
+and `gain`× weaker than the last, normalised by the sum of amplitudes.
+
+`gain` sets how much of the texture lives at small scales, and it is the dial
+that controls how detailed the gas looks. Amplitude falls as f^(−H) with
+H = −ln(gain)/ln(lacunarity), so the default 0.5 at lacunarity 2.1 gives
+**H ≈ 0.93** — very close to the smooth extreme, with the coarsest octave
+alone carrying 53% of the signal and the fourth only 7%. That is why adding
+octaves or grid cells does nothing visible: a fifth octave is 3% of the
+result (see [`volume_resolution`](@ref)).
+
+Kolmogorov turbulence is H = 1/3, which at this lacunarity would be a gain of
+2.1^(−1/3) ≈ 0.78. Values around 0.65–0.7 (H ≈ 0.58–0.48) put real energy in
+the fine octaves while staying smoother than fully developed turbulence.
+
+Raising `gain` *lowers* the variance of the result, which is not obvious: the
+octaves are near-independent and the sum is normalised, so spreading weight
+across more comparable terms averages them. Variance goes as
+Σaᵢ²/(Σaᵢ)² — 0.38σ² at gain 0.5, 0.29σ² at 0.7 — and since density is
+`exp(6·turbulence·(n−0.5))`, finer gas also comes out flatter. Raise
+`turbulence` alongside `gain` to hold the wisp-to-gap contrast.
+"""
+function _fbm(lattice, x, y, z, octaves; gain::Real=0.5, lacunarity::Real=2.1)
     amp = 0.5
     freq = 1.0
     total = 0.0
@@ -218,10 +280,138 @@ function _fbm(lattice, x, y, z, octaves)
     for _ in 1:octaves
         total += amp * _value_noise(lattice, x * freq, y * freq, z * freq)
         norm += amp
-        amp *= 0.5
-        freq *= 2.1
+        amp *= gain
+        freq *= lacunarity
     end
     return total / norm
+end
+
+"""Gain that lifts Worley F2−F1 onto the same range as 1−F1; see [`_worley`](@ref)."""
+const VEIN_SCALE = 2.5
+
+"""
+    _worley(lattice, x, y, z; ridge=true)
+
+Cellular (Worley) noise: distance to scattered feature points, one per unit
+lattice cell, searched over the 3×3×3 neighbourhood. Returns a value in [0, 1].
+
+This exists because [`_value_noise`](@ref) is smooth trilinear interpolation
+and **cannot produce a sharp feature at any amplitude** — every level set is a
+gentle gradient, and a gentle gradient is exactly what a line integral erases.
+Worley has creases: `ridge=true` returns F2−F1, which is zero along the
+equidistant surfaces between neighbouring points and rises into the cell
+interiors, so its zero set is a thin web with a kink in the gradient across it.
+That crease is the sharpest structure available from a procedural field, and it
+is what survives being averaged along a ray. `ridge=false` returns 1−F1, the
+classic billow: round lobes centred on the feature points.
+
+Feature-point coordinates are drawn from the same hashed lattice as the value
+noise at three decorrelated offsets, so the whole volume stays reproducible
+from one `rng`.
+"""
+function _worley(lattice, x, y, z; ridge::Bool=true)
+    ix, iy, iz = floor(Int, x), floor(Int, y), floor(Int, z)
+    f1 = Inf; f2 = Inf
+    for dk in -1:1, dj in -1:1, di in -1:1
+        cx, cy, cz = ix + di, iy + dj, iz + dk
+        px = cx + _lat(lattice, cx, cy, cz)
+        py = cy + _lat(lattice, cx + 17, cy + 31, cz + 7)
+        pz = cz + _lat(lattice, cx + 43, cy + 11, cz + 29)
+        d = (px - x)^2 + (py - y)^2 + (pz - z)^2
+        if d < f1
+            f2 = f1; f1 = d
+        elseif d < f2
+            f2 = d
+        end
+    end
+    f1 = sqrt(f1); f2 = sqrt(f2)
+    # Range-match the two modes. Raw F2−F1 has mean ≈0.08 against 1−F1's ≈0.48,
+    # and the erosion remap is a *threshold* against the base shape noise
+    # (mean 0.50, sd 0.11): a detail field that never climbs into that range
+    # carves nothing and degrades into an affine contrast gain. VEIN_SCALE
+    # lifts F2−F1 onto the same footing so `erosion` means the same thing in
+    # both modes.
+    return ridge ? clamp(VEIN_SCALE * (f2 - f1), 0.0, 1.0) :
+                   clamp(1.0 - f1, 0.0, 1.0)
+end
+
+"""
+    _worley_fbm(lattice, x, y, z, octaves; gain=0.5, lacunarity=2.0, ridge=true)
+
+Octaves of [`_worley`](@ref), normalised to [0, 1]. Used as the *detail* field
+that erodes the base shape — see the `erosion` argument of [`DiscVolume`](@ref).
+The gain falloff matters far less here than in `_fbm`, because erosion is a
+threshold operation: what reaches the image is where the field crosses the base
+density, not how much amplitude it carries.
+"""
+function _worley_fbm(lattice, x, y, z, octaves; gain::Real=0.5,
+                     lacunarity::Real=2.0, ridge::Bool=true)
+    amp = 0.5
+    freq = 1.0
+    total = 0.0
+    norm = 0.0
+    for _ in 1:octaves
+        total += amp * _worley(lattice, x * freq, y * freq, z * freq; ridge=ridge)
+        norm += amp
+        amp *= gain
+        freq *= lacunarity
+    end
+    return total / norm
+end
+
+"""
+    _shape_coverage(lattice, ls, u, zh, octaves, gain, lac,
+                    erosion, escale, eoct, eridge) -> Float64
+
+Filament coverage in [0, 1] at one grid cell: the base fBm shape, optionally
+carved by a Worley detail field.
+
+The carve is the standard cloud remap — the detail noise becomes the new
+*minimum* of the range:
+
+    coverage = remap(base, erosion·detail, 1, 0, 1)
+             = (base − erosion·detail) / (1 − erosion·detail)
+
+Where the base is high (a filament core) the remap barely moves it; where the
+base is marginal the detail cuts straight through to zero. The result is a
+near-binary edge instead of a smooth gradient, and a ray either passes through
+a hole or it does not.
+
+`_fbm` returns a normalised weighted average of lattice values in [0, 1], so
+the base is already a coverage field and `erosion = 0` reproduces it exactly.
+
+**The two fields have to be range-matched or this does nothing.** The remap is
+a threshold, so it only bites where `erosion·detail` reaches into the base's
+distribution — and the base fBm is a narrow Gaussian, mean 0.50, sd 0.11, with
+a 1st percentile of 0.247, not a coverage field with mass near zero. Carving it
+with raw F2−F1 (mean 0.08) drives `erosion·detail` to ≈0.11, which clears the
+base on **0.17%** of cells; the remap then degenerates into an affine rescale
+of the base, i.e. a broadband contrast gain with no change in structure — which
+is exactly what it measured as. [`VEIN_SCALE`](@ref) and a default of `:billow`
+(mean 0.48) keep the detail on the same footing as the base, so `erosion` near
+0.9 actually reaches the base's bulk and cuts holes.
+"""
+@inline function _shape_coverage(lattice, ls, u, zh, octaves, gain, lac,
+                                 erosion, escale, eoct, eridge)
+    n = _fbm(lattice, 10.0 * ls, 6.0 * u, zh, octaves;
+             gain=gain, lacunarity=lac)
+    erosion <= 0.0 && return n
+    w = _worley_fbm(lattice, escale * 10.0 * ls, escale * 6.0 * u,
+                    escale * zh, eoct; ridge=eridge)
+    ew = erosion * w
+    return clamp((n - ew) / (1.0 - ew), 0.0, 1.0)
+end
+
+"""
+    octave_weights(octaves; gain=0.5, lacunarity=2.1) -> Vector{Float64}
+
+Fraction of the fBm signal each octave contributes. Useful for choosing
+`noise_octaves`: past the point where an octave is worth a couple of percent,
+adding depth (and the grid resolution to carry it) buys nothing.
+"""
+function octave_weights(octaves::Int; gain::Real=0.5, lacunarity::Real=2.1)
+    a = [0.5 * gain^(k - 1) for k in 1:octaves]
+    return a ./ sum(a)
 end
 
 # ---------------------------------------------------------------------------

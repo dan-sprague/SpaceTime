@@ -101,10 +101,15 @@ for f in 1:NFRAMES
                            dt=0.02, rng=Xoshiro(1000 + f))
     # Linear HDR frame, untouched by any grading — the master for post.
     SAVE_TIFF && save_master(_tiff(f), rotr90(img))
+    # Aperture diffraction on the linear frame, then bloom/streaks with the
+    # pixel-unit kernels rescaled from the 360p tuning height, so proxy and 4k
+    # share one look.
+    apply_diffraction!(img; f_number=5.6)
     post = postprocess(img; gain=1.0, exposure=0.8, gamma=0.2, bloom_strength=1.0,
                        threshold=0.5, bloom_radius=10.0, bloom_power=1.5,
                        streak_strength=2.0, streak_length=0.1, streak_width=1.0,
-                       n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75)
+                       n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75,
+                       ref_height=360)
     apply_lens_dust!(post; lens_dust=LensDust(count=25, size_min=1.5 * SC, size_max=6.0 * SC,
                      opacity_min=0.05, opacity_max=0.22), rng=Xoshiro(99))
     if haskey(events, f)

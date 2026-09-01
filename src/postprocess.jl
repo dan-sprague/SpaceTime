@@ -6,6 +6,75 @@
 # Approximates diffraction: blue diffracts tighter, red wider.
 const AIRY_SPECTRUM = SVector(1.0, 0.85, 0.7)
 
+# Per-channel wavelengths in mm, matching the 610/550/465 nm convention the
+# renderers use for relativistic sky tint and disc colour.
+const CHANNEL_LAMBDA_MM = SVector(610.0e-6, 550.0e-6, 465.0e-6)
+
+# 35 mm full-frame sensor width, the reference for `Lens`'s focal lengths.
+const SENSOR_WIDTH_MM = 36.0
+
+"""
+    airy_kernel(f_number, pixel_pitch_mm, λ_mm; radius_px=nothing)
+
+Airy point-spread function for a circular aperture, sampled on a pixel grid:
+`I(r) = (2 J₁(v) / v)²` with `v = π r / (λ N)`, whose first zero sits at
+`r = 1.22 λ N` (so the Airy *diameter* is the familiar `2.44 λ N`). Returns a
+normalised, centred, odd-sized matrix.
+
+`radius_px` defaults to three times the first-zero radius, which captures the
+core and the first two rings.
+"""
+function airy_kernel(f_number::Real, pixel_pitch_mm::Real, λ_mm::Real;
+                     radius_px::Union{Nothing,Int}=nothing)
+    r_zero = 1.22 * λ_mm * f_number / pixel_pitch_mm      # first zero, pixels
+    R = radius_px === nothing ? max(ceil(Int, 3 * r_zero), 1) : radius_px
+    k = zeros(Float64, 2R + 1, 2R + 1)
+    scale = π * pixel_pitch_mm / (λ_mm * f_number)        # v per pixel of r
+    for j in -R:R, i in -R:R
+        r = sqrt(Float64(i)^2 + Float64(j)^2)
+        v = scale * r
+        # (2J₁(v)/v)² → 1 as v → 0; besselj1(v)/v is removable there.
+        k[i+R+1, j+R+1] = v < 1.0e-8 ? 1.0 : (2 * besselj1(v) / v)^2
+    end
+    s = sum(k)
+    s > 0 && (k ./= s)
+    return k
+end
+
+"""
+    apply_diffraction!(image; f_number, sensor_width_mm=36.0)
+
+Convolve `image` with the lens's Airy PSF, in place. This is the physical
+resolution limit of the aperture: at f/11 on full-frame, the Airy diameter is
+`2.44 λ N ≈ 14.8 µm`, which at 3840 px across a 36 mm sensor is about 1.6
+pixels — so a real f/11 lens *cannot* render single-pixel detail, and an image
+that contains it is optically impossible.
+
+Apply this to the **linear** image, before `postprocess`: it is a property of
+the glass, upstream of bloom and tonemapping. Each channel is blurred at its
+own wavelength (610/550/465 nm), so the softening is chromatic like real
+diffraction. A no-op when the PSF is narrower than a third of a pixel.
+"""
+function apply_diffraction!(image::Matrix{RGBf}; f_number::Real,
+                            sensor_width_mm::Real=SENSOR_WIDTH_MM)
+    w, _ = size(image)
+    pitch = sensor_width_mm / w
+    # Widest channel sets whether the PSF is resolvable at all.
+    if 1.22 * CHANNEL_LAMBDA_MM[1] * f_number / pitch < 0.33
+        return image
+    end
+    chans = (Float64.(getfield.(image, :r)), Float64.(getfield.(image, :g)),
+             Float64.(getfield.(image, :b)))
+    out = map(enumerate(chans)) do (c, ch)
+        imfilter(ch, centered(airy_kernel(f_number, pitch, CHANNEL_LAMBDA_MM[c])),
+                 "replicate")
+    end
+    @inbounds for idx in eachindex(image)
+        image[idx] = RGBf(out[1][idx], out[2][idx], out[3][idx])
+    end
+    return image
+end
+
 """
     fft_convolve(image_ch::Matrix{Float64}, kernel::Matrix{Float64})
 
@@ -155,8 +224,21 @@ function postprocess(image::Matrix{RGBf};
                      angles=nothing,
                      tonemap=:aces,
                      tonemap_hue_preserve=0.75,
-                     contrast=0.0)
+                     contrast=0.0,
+                     ref_height=nothing)
     w, h = size(image)
+
+    # `bloom_radius` and `streak_width` are in pixels, so the same numbers
+    # give a 6x tighter bloom at 2160p than at 360p — the look drifts with
+    # output resolution. (`streak_length` is already fractional: the streak
+    # kernel scales it by max(w, h).) Passing `ref_height` — the height the
+    # values were tuned at — rescales them so the look is resolution
+    # independent. Left off, behaviour is unchanged.
+    if ref_height !== nothing
+        s = h / ref_height
+        bloom_radius *= s
+        streak_width *= s
+    end
 
     # 1. Gain + exposure
     ev = gain * 2.0^exposure
