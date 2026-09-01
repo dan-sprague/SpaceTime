@@ -62,12 +62,17 @@ fly_native(cam, spacetime, bg;
            width = 384, height = 216,
            winwidth = 1920, winheight = 1080,
            arcade = true,
-           # Full colour. Swap in
-           #   palette = arcade_palette(6; ramp = :magma, lo = 0.12, hi = 0.92),
-           #   dither  = 1.0,
-           # for the six-tone arcade look.
-           star_density = 384,
+           # Black plus five magma steps. The mapping is on LUMINANCE, so the
+           # whole frame collapses to exactly this many tones and empty sky
+           # lands on entry 1, which is true black. `lo`/`hi` trim the muddiest
+           # low end and the blown-out top. Comment both out for full colour.
+           palette = arcade_palette(6; ramp = :magma, lo = 0.12, hi = 0.92),
+           dither = 1.0,             # 4x4 Bayer, one palette step
+           # A 3x3 star cell scan only holds while a cell covers 5 sigma, and
+           # sigma scales as 1/height — at 216 rows across a 10mm field the cap
+           # is 75 whatever is asked for, so ask for 75 and skip the warning.
+           star_density = 75,
            vsync = false,
            star_texture_weight = 0.0,
-           star_psf_pixels = 1.4,
+           star_psf_pixels = 1.0,
            title = "Spacetime — track ride")
