@@ -79,6 +79,12 @@ const T_M = parse(Float64, get(ENV, "T_M", "140.0"))
 const HUD = get(ENV, "HUD", "0") == "1"
 const GAS = get(ENV, "GAS", "static")
 const F_NUMBER = parse(Float64, get(ENV, "F_NUMBER", "11.0"))
+
+# The shared video grade. Every length in `LOOK_FILM` is a fraction of frame
+# height, so the 4K deliverable and a 360p check render are the same look at
+# different sharpness — no reference height to keep in sync. Aperture and
+# distortion are set per frame below, since both change across the lens morph.
+const LOOK = with_look(LOOK_FILM; f_number=0.0, distortion_k1=0.0)
 const FLARES = parse(Int, get(ENV, "FLARES", "8"))
 const MOTION = get(ENV, "MOTION", "1") == "1"
 const JITTER = get(ENV, "JITTER", "1") == "1"
@@ -239,16 +245,13 @@ workers = map(1:NPOST) do _
         # Aperture diffraction, on the linear frame: the lens's own resolution
         # limit, which at f/11 is ~1.6 px at 4k. Applied only on the
         # rectilinear tail, where the thin lens is what we are modelling.
-        fe_frame[f] > 0.0 || apply_diffraction!(img; f_number=F_NUMBER)
-        post = postprocess(img; gain=1.0, exposure=0.8, gamma=0.2, bloom_strength=1.0,
-                           threshold=0.5, bloom_radius=10.0, bloom_power=1.5,
-                           streak_strength=2.0, streak_length=0.1, streak_width=1.0,
-                           n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75,
-                           ref_height=360)
-        sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0,
-                       saturation=1.0e6, rng=Xoshiro(70_000 + f))
-        apply_vignette!(post; strength=0.3)
-        k1_frame[f] != 0.0 && apply_lens_distortion!(post; k1=k1_frame[f])
+        # Diffraction runs only on the rectilinear tail, where the thin lens is
+        # what we are modelling; barrel distortion follows the projection morph.
+        # Both ride on the shared look rather than being spliced in by hand.
+        look_f = with_look(LOOK;
+            f_number = fe_frame[f] > 0.0 ? 0.0 : F_NUMBER,
+            distortion_k1 = k1_frame[f])
+        post = apply_look!(img, look_f; rng=Xoshiro(70_000 + f))
         rot = map(clamp01nan, rotr90(post))
         HUD && draw_hud!(rot, hud_lines[f])
         save(joinpath(pngdir, @sprintf("f%04d.png", f)), rot)

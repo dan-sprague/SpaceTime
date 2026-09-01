@@ -47,6 +47,13 @@ const GAS = get(ENV, "GAS", "live")
 const BETA_SMOOTH = parse(Float64, get(ENV, "BETA_SMOOTH", "0.015"))
 const ONLY = parse(Int, get(ENV, "ONLY", "0"))   # 0 = full sequence
 
+# The shared video grade, resolution independent: every length in `LOOK_FILM`
+# is a fraction of frame height, so RES=proxy and RES=final differ only in
+# sharpness. This shot has always run without an aperture-diffraction kernel
+# and without barrel distortion, so both stay off here rather than being
+# quietly switched on by the shared look.
+const LOOK = with_look(LOOK_FILM; f_number=0.0, distortion_k1=0.0)
+
 tag = REL ? "_rel" : ""
 frames = joinpath(ROOT, "renders", "escape$(tag)", RES)
 mkpath(joinpath(frames, "png"))
@@ -105,13 +112,7 @@ for f in 1:NFRAMES
                            dt=0.02, fisheye_deg=fe, relativistic=REL, beta=βl)
     # Linear HDR frame, untouched by any grading — the master for post.
     SAVE_TIFF && save_master(joinpath(frames, "linear", @sprintf("f%04d.tiff", f)), rotr90(img))
-    post = postprocess(img; gain=1.0, exposure=0.8, gamma=0.2, bloom_strength=1.0,
-                       threshold=0.5, bloom_radius=10.0, bloom_power=1.5,
-                       streak_strength=2.0, streak_length=0.1, streak_width=1.0,
-                       n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75,
-                       ref_height=360)
-    sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0, saturation=1.0e6)
-    apply_vignette!(post; strength=0.3)
+    post = apply_look!(img, LOOK; rng=Xoshiro(7000 + f))
     rot = map(clamp01nan, rotr90(post))
     if HUD
         r_h = norm(pos)

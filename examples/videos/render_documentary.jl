@@ -39,8 +39,15 @@ const W, H = RES == "4k" ? (3840, 2160) :
 const SAMPLES = parse(Int, get(ENV, "SAMPLES", "4"))
 const NFRAMES = parse(Int, get(ENV, "NFRAMES", "900"))
 const FLARES = parse(Int, get(ENV, "FLARES", "8"))
-# Pixel-unit effects (dust size, streak length) were tuned at 360p; scale with res.
-const SC = H / 360.0
+
+# The grade, once. `LOOK_FILM` is the shared video look — hot exposure, wide
+# bloom, four-point streaks, coarse filmic grain — with every length expressed
+# as a fraction of frame height, so RES=proxy and RES=4k differ only in
+# sharpness. Nothing here is tuned to an output resolution and there is no
+# reference height to keep in sync.
+const LOOK = with_look(LOOK_FILM;
+    dust = LensDust(count=25, size_min=1.5 / 360, size_max=6.0 / 360,
+                    opacity_min=0.05, opacity_max=0.22))
 
 frames = joinpath(ROOT, "renders", "documentary", RES)
 mkpath(joinpath(frames, "png"))
@@ -101,25 +108,19 @@ for f in 1:NFRAMES
                            dt=0.02, rng=Xoshiro(1000 + f))
     # Linear HDR frame, untouched by any grading — the master for post.
     SAVE_TIFF && save_master(_tiff(f), rotr90(img))
-    # Aperture diffraction on the linear frame, then bloom/streaks with the
-    # pixel-unit kernels rescaled from the 360p tuning height, so proxy and 4k
-    # share one look.
-    apply_diffraction!(img; f_number=5.6)
-    post = postprocess(img; gain=1.0, exposure=0.8, gamma=0.2, bloom_strength=1.0,
-                       threshold=0.5, bloom_radius=10.0, bloom_power=1.5,
-                       streak_strength=2.0, streak_length=0.1, streak_width=1.0,
-                       n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75,
-                       ref_height=360)
-    apply_lens_dust!(post; lens_dust=LensDust(count=25, size_min=1.5 * SC, size_max=6.0 * SC,
-                     opacity_min=0.05, opacity_max=0.22), rng=Xoshiro(99))
-    if haskey(events, f)
-        apply_micro_streaks!(post; streaks=MicroStreaks(count=rand(Xoshiro(events[f]), 1:2),
-                             length_min=8.0 * SC, length_max=45.0 * SC),
-                             rng=Xoshiro(events[f]))
-    end
-    sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0, saturation=1.0e6)
-    apply_vignette!(post; strength=0.3)
-    apply_lens_distortion!(post; k1=-0.02)
+    # One call runs the whole chain in physical order: diffraction, grade and
+    # glare, dust, streaks, then vignette and distortion in the lens and the
+    # sensor last. Micro-streak events fire only on chosen frames, so the
+    # streak RNG is passed only then.
+    ev = get(events, f, nothing)
+    look_f = ev === nothing ? LOOK :
+        with_look(LOOK; streaks=MicroStreaks(count=rand(Xoshiro(ev), 1:2),
+                                             length_min=8.0 / 360,
+                                             length_max=45.0 / 360))
+    post = apply_look!(img, look_f;
+                       rng=Xoshiro(7000 + f),        # grain: redrawn each frame
+                       dust_rng=Xoshiro(99),         # dust: fixed to the glass
+                       streak_rng=ev === nothing ? nothing : Xoshiro(ev))
     save(_pngf(f), map(clamp01nan, rotr90(post)))
     f % 100 == 0 && (println("documentary ", f, "/", NFRAMES, "  ",
         round((time() - t0) / 60, digits=1), " min"); flush(stdout))

@@ -28,6 +28,10 @@ const T_M = parse(Float64, get(ENV, "T_M", "220.0"))
 # Fade fully to black BEFORE the camera crosses r = 2M (frame ~872): the
 # kernel's shadow-kill criterion flips discretely at the horizon and would
 # otherwise show as a one-frame snap. Black holds to the end for the web cut.
+# Shared, resolution-independent video grade; diffraction and barrel
+# distortion stay off, as they have always been for this shot.
+const LOOK = with_look(LOOK_FILM; f_number=0.0, distortion_k1=0.0)
+
 const FADE_START = 820
 const FADE_END = 866
 
@@ -61,13 +65,7 @@ for f in 1:NFRAMES
     img = render_draft_mtl(ctx, cam, st; width=W, height=H, samples=SAMPLES,
                            dt=0.02, fisheye_deg=fe, relativistic=true, beta=βl)
     SAVE_TIFF && save_master(joinpath(frames, "linear", @sprintf("f%04d.tiff", f)), rotr90(img))
-    post = postprocess(img; gain=1.0, exposure=0.8, gamma=0.2, bloom_strength=1.0,
-                       threshold=0.5, bloom_radius=10.0, bloom_power=1.5,
-                       streak_strength=2.0, streak_length=0.1, streak_width=1.0,
-                       n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75,
-                       ref_height=360)
-    sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0, saturation=1.0e6)
-    apply_vignette!(post; strength=0.3)
+    post = apply_look!(img, LOOK; rng=Xoshiro(7000 + f))
     if fade < 1.0
         fd = Float32(fade)
         post = map(c -> typeof(c)(fd * c.r, fd * c.g, fd * c.b), post)

@@ -14,6 +14,7 @@ using SpaceTime
 using StaticArrays
 using LinearAlgebra
 using FileIO
+using Random
 using Images: clamp01nan
 
 lowres = get(ENV, "HERO_LOWRES", "0") == "1"
@@ -26,7 +27,10 @@ disc = AccretionDisc(inner_radius=3.0, outer_radius=20.0,
                      density_falloff=0.8)
 
 # Volumetric turbulent gas disc (comment out to fall back to the thin plane).
-volume = DiscVolume(disc; M=1.0)
+# Seeded: unseeded this falls back to the global RNG, so the filament pattern
+# was different on every run and no hero frame could ever be reproduced or
+# compared against another.
+volume = DiscVolume(disc; M=1.0, rng=Xoshiro(7))
 
 # The "COOL SCENE" composition: just above the disc plane,
 # rolled 20°, looking through the disc at the shadow.
@@ -54,27 +58,11 @@ println("Rendering $(W)×$(H), samples=$S, time_samples=$TS on ",
                           disc=disc, volume=volume, width=W, height=H,
                           samples=S, time_samples=TS)
 
-post = postprocess(img;
-                   gain=1.0,
-                   exposure=0.8,
-                   gamma=0.2,
-                   bloom_strength=1.0,
-                   threshold=0.5,
-                   bloom_radius=10.0,
-                   bloom_power=1.5,
-                   streak_strength=2.0,
-                   streak_length=0.1,
-                   streak_width=1.0,
-                   n_spikes=4,
-                   tonemap=:aces,
-                   tonemap_hue_preserve=0.75,
-                   # The 4K frame is the deliverable, so the look is anchored
-                   # there and HERO_LOWRES drafts scale down to match it.
-                   ref_height=2160)
-
-sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0, saturation=1.0e6)
-apply_vignette!(post; strength=0.3)
-apply_lens_distortion!(post; k1=-0.02)
+# One shared, resolution-independent grade. `LOOK_HERO` is `LOOK_FILM` with
+# glare kernels 6x tighter — the grade this still was tuned to. Both are
+# fractions of frame height, so a HERO_LOWRES draft and the 4K deliverable are
+# now the same picture at different sharpness rather than different looks.
+post = apply_look!(img, LOOK_HERO; rng=Xoshiro(4242))
 
 outfile = joinpath(@__DIR__, "..", lowres ? "hero_shot_lowres.png" : "hero_shot.png")
 save(outfile, map(clamp01nan, rotr90(post)))

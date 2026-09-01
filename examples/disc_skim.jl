@@ -45,26 +45,11 @@ println("Rendering $(W)×$(H), samples=$S on ", Threads.nthreads(), " threads…
 
 # Post: hero-shot defaults — tweak to taste (the saved state above is
 # camera-only; post sliders weren't captured).
-post = postprocess(img;
-                   gain=1.0,
-                   exposure=0.8,
-                   gamma=0.2,
-                   bloom_strength=1.0,
-                   threshold=0.5,
-                   bloom_radius=10.0,
-                   bloom_power=1.5,
-                   streak_strength=2.0,
-                   streak_length=0.1,
-                   streak_width=1.0,
-                   n_spikes=4,
-                   tonemap=:aces,
-                   tonemap_hue_preserve=0.75,
-                   # The 4K frame is the deliverable, so the look is anchored
-                   # there and SKIM_LOWRES drafts scale down to match it.
-                   ref_height=2160)
-
-sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0, saturation=1.0e6)
-apply_vignette!(post; strength=0.3)
+# `LOOK_HERO` is the shared still grade, in fractions of frame height, so a
+# SKIM_LOWRES draft and the 4K deliverable are the same picture at different
+# sharpness. Diffraction and barrel distortion stay off, as they were here.
+post = apply_look!(img, with_look(LOOK_HERO; f_number=0.0, distortion_k1=0.0);
+                   rng=Xoshiro(4242))
 
 outfile = joinpath(@__DIR__, "..",
                    lowres ? "disc_skim_lowres.png" : "disc_skim.png")

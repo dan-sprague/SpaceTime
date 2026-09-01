@@ -224,21 +224,15 @@ function postprocess(image::Matrix{RGBf};
                      angles=nothing,
                      tonemap=:aces,
                      tonemap_hue_preserve=0.75,
-                     contrast=0.0,
-                     ref_height=nothing)
+                     contrast=0.0)
     w, h = size(image)
 
-    # `bloom_radius` and `streak_width` are in pixels, so the same numbers
-    # give a 6x tighter bloom at 2160p than at 360p — the look drifts with
-    # output resolution. (`streak_length` is already fractional: the streak
-    # kernel scales it by max(w, h).) Passing `ref_height` — the height the
-    # values were tuned at — rescales them so the look is resolution
-    # independent. Left off, behaviour is unchanged.
-    if ref_height !== nothing
-        s = h / ref_height
-        bloom_radius *= s
-        streak_width *= s
-    end
+    # `bloom_radius` and `streak_width` are in raw pixels here, so the same
+    # numbers give a 6x tighter bloom at 2160p than at 360p. This form is the
+    # low-level one, used by the interactive apps where the preview is a fixed
+    # size and pixels are what the sliders mean. Anything that renders at more
+    # than one resolution should go through [`Look`](@ref) instead, whose
+    # lengths are fractions of frame height and so cannot drift.
 
     # 1. Gain + exposure
     ev = gain * 2.0^exposure

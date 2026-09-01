@@ -32,6 +32,12 @@ const SAMPLES = parse(Int, get(ENV, "SAMPLES", "4"))
 const NLOOP = parse(Int, get(ENV, "NLOOP", "240"))
 const NX = min(30, NLOOP); const NT = NLOOP + NX   # 8 s loop + 1 s crossfade tail
 
+# Shared, resolution-independent video grade, plus dust on the front element.
+# Diffraction and barrel distortion stay off, as they have always been here.
+const LOOK = with_look(LOOK_FILM; f_number=0.0, distortion_k1=0.0,
+    dust = LensDust(count=25, size_min=1.5 / 360, size_max=6.0 / 360,
+                    opacity_min=0.05, opacity_max=0.22))
+
 frames = joinpath(ROOT, "renders", "loop", RES)
 mkpath(joinpath(frames, "png"))
 mkpath(joinpath(frames, "linear"))   # required intermediate for the crossfade
@@ -88,15 +94,7 @@ for k in 1:NLOOP
                                  α * a.b + (1 - α) * b.b), img, tl)
         save_master(lin(k), img)   # linear masters hold the seamless loop
     end
-    post = postprocess(img; gain=1.0, exposure=0.8, gamma=0.2, bloom_strength=1.0,
-                       threshold=0.5, bloom_radius=10.0, bloom_power=1.5,
-                       streak_strength=2.0, streak_length=0.1, streak_width=1.0,
-                       n_spikes=4, tonemap=:aces, tonemap_hue_preserve=0.75,
-                       ref_height=360)
-    apply_lens_dust!(post; lens_dust=LensDust(count=25, size_min=1.5 * H / 360, size_max=6.0 * H / 360,
-                     opacity_min=0.05, opacity_max=0.22), rng=Xoshiro(99))
-    sensor_expose!(post; iso=400.0, t_exp=1.0, read_noise_e=2.0, saturation=1.0e6)
-    apply_vignette!(post; strength=0.3)
+    post = apply_look!(img, LOOK; rng=Xoshiro(7000 + k), dust_rng=Xoshiro(99))
     save(joinpath(frames, "png", @sprintf("f%04d.png", k)), map(clamp01nan, post))
 end
 for k in NLOOP+1:NT   # tail frames are folded into the head; drop them

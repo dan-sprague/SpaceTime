@@ -222,7 +222,7 @@ function postprocess(image::Matrix{RGBf}, look::Look)
 end
 
 """
-    apply_look!(image, look::Look; rng, streak_rng=nothing)
+    apply_look!(image, look::Look; rng, dust_rng=nothing, streak_rng=nothing)
 
 Run the full image chain for `look` on a linear HDR render, in physical order:
 
@@ -238,16 +238,24 @@ Steps 5 and 6 are in that order for a reason: grain is generated *by the
 sensor*, so it must not be vignetted or distorted along with the image. The
 scripts previously ran the sensor first and then distorted its grain.
 
+The three streams are separate because they change on different clocks. Grain
+is redrawn every frame, so `rng` should vary per frame; dust sits on the glass
+and must not move, so `dust_rng` should be a fixed seed across a sequence. It
+defaults to `rng`, which is right for a single still and wrong for a sequence —
+pass it explicitly when rendering one.
+
 Returns `image`, modified in place.
 """
 function apply_look!(image::Matrix{RGBf}, look::Look;
                      rng::Random.AbstractRNG=Random.default_rng(),
+                     dust_rng::Union{Random.AbstractRNG,Nothing}=nothing,
                      streak_rng::Union{Random.AbstractRNG,Nothing}=nothing)
     look.f_number > 0 && apply_diffraction!(image; f_number=look.f_number,
                                             sensor_width_mm=look.sensor_width_mm)
     out = postprocess(image, look)
     look.dust === nothing ||
-        apply_lens_dust!(out; lens_dust=look.dust, rng=rng)
+        apply_lens_dust!(out; lens_dust=look.dust,
+                         rng=something(dust_rng, rng))
     (look.streaks === nothing || streak_rng === nothing) ||
         apply_micro_streaks!(out; streaks=look.streaks, rng=streak_rng)
     look.vignette > 0 && apply_vignette!(out; strength=look.vignette)
