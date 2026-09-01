@@ -170,13 +170,38 @@ function _trace_color(integrator, meta, cam::AbstractCamera,
                       spacetime::Schwarzschild, background, disc, u, v;
                       rng::Random.AbstractRNG=Random.default_rng(),
                       dust::Union{InterstellarDust,Nothing}=nothing,
-                      lens::Union{Nothing, NTuple{2, Float64}}=nothing)
+                      lens::Union{Nothing, NTuple{2, Float64}}=nothing,
+                      relativistic::Bool=false)
     μ0 = init_photon(cam, spacetime, u, v; rng, lens)
 
     meta.acc_color = RGBf(0, 0, 0)
     meta.alpha = 1.0
     meta.r_min = Inf
     meta.path_length = 0.0
+    # Camera/infinity frequency ratio, per ray. The photon leaves the sensor at
+    # unit frequency in the observer tetrad and `p_t` is conserved, so the shift
+    # this ray carries is exactly 1/|p_t| — the same expression the Metal kernel
+    # uses, with the same clamp.
+    #
+    # This used to be one number for the whole image, `1/√(1 − 2M/r)`. Outside
+    # r = 2.5M that is not an approximation but the exact answer: the tetrad is
+    # a static observer, the shift is purely gravitational, and it does not
+    # depend on which way the ray left. Measured spread across a frame is 0.0%
+    # at 20M, 6M and 3M, agreeing with the old scalar to four figures.
+    #
+    # Inside r = 2.5M the tetrad becomes a radial free-faller and the two part
+    # company, because the infall gives the shift a direction dependence:
+    #
+    #   camera r    per-ray 1/|p_t|      old uniform scalar
+    #     2.4M      3.466 .. 3.779       2.449
+    #     2.1M      8.486 .. 17.589      4.583
+    #
+    # — 70% spread across one frame at 2.1M, against a single number wrong by
+    # nearly 2x. That is the porthole and the horizon crossing, so this is the
+    # regime the fix is for. It will also carry a boosted camera correctly if
+    # the CPU ever gains one; today `init_photon` builds an unboosted tetrad,
+    # so a moving CPU camera still shades as though it were at rest.
+    meta.gcam = relativistic ? 1.0 / clamp(abs(μ0[5]), 0.05, 20.0) : 1.0
     integrator.p = (spacetime, meta, disc)
     reinit!(integrator, μ0)
     solve!(integrator)
@@ -256,9 +281,6 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                 relativistic::Bool=false)
     image = zeros(RGBf, width, height)
     cam_dist = norm(cam.pos)
-    # Static exterior camera: the camera/infinity shift is uniform.
-    gcam = relativistic ?
-           1.0 / sqrt(max(1.0 - 2.0 * spacetime.M / cam_dist, 1e-6)) : 1.0
     r_max = max(5.0 * cam_dist, 100.0)
     tspan = (0.0, max(10.0 * cam_dist, 500.0))
     # A volumetric disc replaces the thin-plane crossing callback.
@@ -267,7 +289,8 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     make_volume_cb(volume, disc))
 
     nchunks = _render_nchunks()
-    thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf, 0.0, gcam) for _ in 1:nchunks]
+    # gcam is set per ray in `_trace_color`; this is only the initial value.
+    thread_metas = [RayData(RGBf(0,0,0), 1.0, Inf, 0.0, 1.0) for _ in 1:nchunks]
     # Independently seeded per-chunk RNGs. `copy(rng)` would give every chunk
     # the same stream, tiling one noise pattern across all chunks.
     thread_rngs = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:nchunks]
@@ -313,7 +336,8 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                     pixel_color += _trace_color(integrator, meta, cam, spacetime,
                                                 background, disc, u, v;
                                                 rng=local_rng, dust=dust,
-                                                lens=use_lens ? lens_offs[k] : nothing)
+                                                lens=use_lens ? lens_offs[k] : nothing,
+                                                relativistic=relativistic)
                 end
                 image[i, j] = pixel_color * inv_samples2
             end
@@ -397,7 +421,8 @@ function render_motion(camera_at::Function, t0::Real, t1::Real,
                        samples::Int=1,
                        time_samples::Int=8,
                        jittered::Bool=true,
-                       rng::Random.AbstractRNG=Random.default_rng())
+                       rng::Random.AbstractRNG=Random.default_rng(),
+                       relativistic::Bool=false)
     image = zeros(RGBf, width, height)
     inv_total = 1.0 / (samples^2 * time_samples)
     subpixel_offsets = jittered ? jittered_grid(samples; rng=rng) :
@@ -437,7 +462,8 @@ function render_motion(camera_at::Function, t0::Real, t1::Real,
                     for (du, dv) in subpixel_offsets
                         u, v = sensor_coordinate(i, j, width, height; du=du, dv=dv)
                         image[i, j] += _trace_color(integrator, meta, cam, spacetime,
-                                                    background, disc, u, v; rng=local_rng)
+                                                    background, disc, u, v; rng=local_rng,
+                                                    relativistic=relativistic)
                     end
                 end
             end

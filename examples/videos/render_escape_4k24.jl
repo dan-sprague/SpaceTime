@@ -154,7 +154,7 @@ fe_frame = Vector{Float64}(undef, NFRAMES)     # fisheye half-angle (0 = rectili
 morph_a = Vector{Float64}(undef, NFRAMES)      # projection morph weight
 k1_frame = Vector{Float64}(undef, NFRAMES)     # hero barrel distortion, ramped in
 for f in 1:NFRAMES
-    t = (f - 1) / (NFRAMES - 1)
+    t = frame_t(f, NFRAMES)
     _, _, _, fe_path = path_at(t)
     if t <= T_LENS0
         fe_frame[f], morph_a[f] = fe_path, 0.0
@@ -210,11 +210,11 @@ end
 # order on the workers: ship proper time is dτ = dt·√(1−2M/r)/γ, earth time
 # is Schwarzschild coordinate time. Seconds assume a 1e5 Msun hole.
 const TUNIT = 4.9255e-6 * 1.0e5
-dtc = T_M / (NFRAMES - 1)
+dtc = frame_span(T_M, NFRAMES)
 hud_lines = Vector{NTuple{5,String}}(undef, NFRAMES)
 let τ = 0.0
     for f in 1:NFRAMES
-        t = (f - 1) / (NFRAMES - 1)
+        t = frame_t(f, NFRAMES)
         pos, _, _, _ = path_at(t)
         r_h = norm(pos)
         sp_h = REL ? norm(escape_beta(t)) : 0.0
@@ -270,7 +270,7 @@ jxs = fill(SVector(0.0, 0.0, 0.0), NFRAMES + 1)
 if JITTER
     let Jp = Jitter(21)
         for f in 1:(NFRAMES + 1)
-            jxs[f] = step!(Jp, 30.0 / (NFRAMES - 1);
+            jxs[f] = step!(Jp, frame_span(30.0, NFRAMES);
                            rms=SVector(2.7e-3, 2.7e-3, deg2rad(0.15)))
         end
     end
@@ -291,9 +291,9 @@ function cam_for(t, jx)
     return SpaceTime.Camera(pos, tgt, up_j, FOV33)
 end
 
-const SHUTTER = 0.5 / (NFRAMES - 1)   # 180-degree shutter, in path-time
+const SHUTTER = frame_span(0.5, NFRAMES)   # 180-degree shutter, in path-time
 for f in 1:NFRAMES
-    t = (f - 1) / (NFRAMES - 1)
+    t = frame_t(f, NFRAMES)
     sim !== nothing && step_sim!(sim, ctx; dt=2.5 / FPS)
     f in render_set || continue
     # Flare gain is a pure function of footage time, so a sampled subset of

@@ -3,6 +3,28 @@ using FileIO
 using FreeTypeAbstraction
 using Images: RGB
 
+"""
+    frame_t(f, nframes)
+
+Normalised position of frame `f` in a sequence of `nframes`, in `[0, 1]`.
+
+The obvious `(f - 1) / (nframes - 1)` is `0/0` for a single frame, and the NaN
+propagates all the way into the renderer, which fails on an `InexactError`
+several call frames from the cause. `NFRAMES=1` is the natural way to check a
+look, so it should render the first frame rather than crash.
+"""
+frame_t(f::Integer, nframes::Integer) =
+    nframes <= 1 ? 0.0 : (f - 1) / (nframes - 1)
+
+"""
+    frame_span(total, nframes)
+
+`total` divided over the gaps between `nframes` frames — the per-frame step for
+a quantity that spans `total` across the whole sequence. Guards the same
+single-frame division as [`frame_t`](@ref).
+"""
+frame_span(total::Real, nframes::Integer) = total / max(nframes - 1, 1)
+
 # --- Telemetry HUD -----------------------------------------------------------
 const _HUD_FACE = Ref{Any}(nothing)
 function _hud_face()

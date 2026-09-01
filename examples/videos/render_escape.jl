@@ -96,12 +96,12 @@ end
 # earth time is Schwarzschild coordinate time. Seconds assume a 1e5 Msun hole
 # (GM/c³ = 0.4926 s per M-time unit — same convention as orbit_cam.jl).
 const TUNIT = 4.9255e-6 * 1.0e5
-dtc = T_M / (NFRAMES - 1)
+dtc = frame_span(T_M, NFRAMES)
 τ_ship = 0.0
 
 t0 = time()
 for f in 1:NFRAMES
-    t = (f - 1) / (NFRAMES - 1)
+    t = frame_t(f, NFRAMES)
     pos, tgt, up, fe = path_at(t)
     cam = SpaceTime.Camera(pos, tgt, up, 0.55)
     sim !== nothing && step_sim!(sim, ctx; dt=2.5 / 30)   # gas at 2.5x time-lapse

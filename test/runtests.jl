@@ -110,6 +110,36 @@ end
     @test all(map((a, b) -> a == b, t0, t1))
 end
 
+@testset "Per-ray frequency shift" begin
+    # The camera/infinity shift the CPU applies to shading is 1/|p_t| per ray,
+    # the same expression the Metal kernel uses. Outside r = 2.5M the tetrad is
+    # a static observer, so it must equal the closed-form gravitational shift
+    # exactly and be identical for every ray in the frame — the scalar the CPU
+    # used to apply was right there.
+    st = Schwarzschild(1.0)
+    shifts(R) = begin
+        c = Camera(SVector(R, 0.0, 0.0), SVector(0.0, 0.0, 0.0),
+                   SVector(0.0, 0.0, 1.0), 0.5)
+        [1.0 / clamp(abs(init_photon(c, st, sensor_coordinate(i, j, 24, 14)...)[5]),
+                     0.05, 20.0) for i in 1:24, j in 1:14]
+    end
+    # Agreement is to ~8 figures — the residual is round-trip error through the
+    # tetrad construction. Set against the 70% spread inside 2.5M below, that is
+    # six orders of magnitude of separation, so the loose bound keeps its teeth.
+    for R in (20.0, 6.0, 3.0)
+        g = shifts(R)
+        @test maximum(g) - minimum(g) < 1.0e-7          # direction independent
+        @test g[1] ≈ 1 / sqrt(1 - 2 / R) rtol = 1.0e-7  # and the static value
+    end
+
+    # Inside r = 2.5M the tetrad becomes a radial free-faller, the infall gives
+    # the shift a direction dependence, and the single scalar stops being
+    # correct. This is the porthole and the horizon crossing.
+    g = shifts(2.1)
+    @test (maximum(g) - minimum(g)) / (sum(g) / length(g)) > 0.5
+    @test minimum(g) > 1 / sqrt(1 - 2 / 2.1)   # the old scalar underestimated
+end
+
 @testset "Shadow radius" begin
     bh1 = Schwarzschild(1.0)
     # Far away, the shadow's angular radius approaches the critical impact
@@ -381,4 +411,38 @@ end
           for x in 0:0.37:12, y in 0:0.41:12, z in 0:0.43:12]
     @test all(0 .<= wv .<= 1) && all(0 .<= wb .<= 1)
     @test abs(sum(wv) / length(wv) - sum(wb) / length(wb)) < 0.15
+end
+
+@testset "Star colour is independent of the disc" begin
+    # Regression guard: star colour used to read the disc's blackbody LUT, so
+    # regrading the disc re-tinted the whole sky, and a 10000 K disc white
+    # point put every star below it and turned the field gold. Stars carry
+    # their own white point now, and must not move when the disc's does.
+    bg = [RGBf(0, 0, 0) for i in 1:8, j in 1:4]
+    ctx(wb) = MetalPreviewContext(bg, 16, 16;
+        disc=AccretionDisc(inner_radius=3.0, outer_radius=20.0,
+                           density_falloff=0.8,
+                           blackbody=Blackbody(wb_temperature=wb)))
+    hot, cool = ctx(10000.0), ctx(4000.0)
+    @test Array(hot.star_lut) == Array(cool.star_lut)      # sky unmoved
+    @test Array(hot.bb_lut) != Array(cool.bb_lut)          # disc did move
+
+    # The starfield no longer needs a disc to borrow a LUT from.
+    plain = MetalPreviewContext(bg, 16, 16)
+    set_starfield!(plain; height=16, fov_factor=0.75)
+    p = Array(plain.star_params)
+    @test p[1] > 0 && p[14] > 1                            # on, with a real LUT
+
+    # The default temperature range must straddle the star white point, or
+    # every star tints one way — the original bug in its other form.
+    @test p[10] < SpaceTime.STAR_WB_TEMPERATURE < p[10] + p[11]
+
+    # Colour actually tracks temperature across that white point.
+    lut = Array(plain.star_lut)
+    idx(T) = clamp(round(Int, (T - p[12]) / (p[13] - p[12]) * (p[14] - 1)) + 1,
+                   1, Int(p[14]))
+    br(T) = (c = lut[:, idx(T)]; c[3] / c[1])
+    @test br(3500.0) < 0.5                                  # cool star is warm
+    @test br(SpaceTime.STAR_WB_TEMPERATURE) ≈ 1.0 atol = 0.02   # white point
+    @test br(15000.0) > 1.2                                 # hot star is blue
 end

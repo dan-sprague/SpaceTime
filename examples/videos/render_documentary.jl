@@ -89,7 +89,7 @@ start_f > 1 && println("resuming at frame ", start_f, "/", NFRAMES)
 t0 = time()
 stopped_early = false
 for f in 1:NFRAMES
-    t = (f - 1) / (NFRAMES - 1)
+    t = frame_t(f, NFRAMES)
     jx = step!(J, 1 / 30)   # advance jitter even when skipping: keeps resumes deterministic
     f < start_f && continue
     if STOP_AFTER > 0 && (time() - t0) > STOP_AFTER * 3600

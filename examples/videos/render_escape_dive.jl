@@ -51,7 +51,7 @@ ctx = MetalPreviewContext(bg, 480, 270; dt=0.1, nmax=1000, disc=disc, volume=vol
 
 t0 = time()
 for f in 1:NFRAMES
-    t = (f - 1) / (NFRAMES - 1)
+    t = frame_t(f, NFRAMES)
     fade = clamp((FADE_END * NFRAMES / 900 - f) /
                  ((FADE_END - FADE_START) * NFRAMES / 900), 0.0, 1.0)
     if fade <= 0.0   # fully black: skip the trace, write the frame directly
