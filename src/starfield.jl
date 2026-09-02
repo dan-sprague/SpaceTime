@@ -66,13 +66,14 @@ function Starfield(; strength::Real=1.0, texture_weight::Real=0.0,
                    concentration::Real=3.0, temp_min::Real=3000,
                    temp_max::Real=16000, seed::Integer=12345,
                    wb_temperature::Real=STAR_WB_TEMPERATURE,
-                   table_size::Int=1024)
+                   table_size::Int=1024, saturation::Real=1.0)
     gn = sqrt(sum(abs2, galactic))
     gn > 0 || throw(ArgumentError("galactic normal must be non-zero"))
     # Identical to the kernel: the pixel's angular footprint is 2*fov_factor
     # across `height` rows.
     σ = psf_pixels * 2 * fov_factor / height
-    lut = _star_lut_cpu(wb_temperature; table_size=table_size)
+    lut = _star_lut_cpu(wb_temperature; table_size=table_size,
+                        saturation=saturation)
     bb = Blackbody(; wb_temperature=wb_temperature, table_size=table_size)
     return Starfield(strength, texture_weight, density, fill, σ, flux,
                      SVector{3,Float64}(galactic ./ gn), concentration,

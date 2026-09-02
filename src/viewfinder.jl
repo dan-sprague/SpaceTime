@@ -82,23 +82,84 @@ contravariant 4-vectors `(t, x, y, z)`. The observer `u` is static for
 (regular through the horizon; static frames don't exist there). `Ef/Er/Eu`
 are the camera's forward/right/up axes, Gram–Schmidt orthonormalised under
 the KS metric with forward first, so the look direction is exact.
+
+With spin (`a ≠ 0`) the metric is the Kerr one in Kerr–Schild form and the
+observer is static (u ∝ ∂_t) where f ≤ 0.72, blending smoothly to the
+KS-congruence faller (u_μ ∝ −dt_μ, regular through the ergosphere and the
+horizon) by f = 0.88 — so the camera may ride anywhere outside r₊.
 """
 function ks_camera_tetrad(pos::SVector{3,Float64}, fwd::SVector{3,Float64},
                           right::SVector{3,Float64}, up::SVector{3,Float64},
                           M::Float64;
-                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0))
-    r = norm(pos)
-    x̂ = pos / r
-    f = 2M / r
-    # Radial-geodesic observer: E² = max(E_freeze², 1−f) gives dr/dτ = 0
-    # exactly for r ≥ 2.5M and the freeze-radius faller inside.
-    E = sqrt(max(_KS_FREEZE_E2, 1.0 - f))
-    v = -sqrt(max(E^2 - (1.0 - f), 0.0))
-    w = (1.0 - E * (E - v)) / (E - v)           # covariant u_i = w x̂_i
-    lu = E + w                                   # l^μ u_μ
-    u = SVector(E + f * lu, ((w - f * lu) * x̂)...)
+                          beta::SVector{3,Float64}=SVector(0.0, 0.0, 0.0),
+                          a::Float64=0.0)
+    local l⃗::SVector{3,Float64}, f::Float64, u::SVector{4,Float64}
+    if a == 0.0
+        r = norm(pos)
+        x̂ = pos / r
+        f = 2M / r
+        # Radial-geodesic observer: E² = max(E_freeze², 1−f) gives dr/dτ = 0
+        # exactly for r ≥ 2.5M and the freeze-radius faller inside.
+        E = sqrt(max(_KS_FREEZE_E2, 1.0 - f))
+        v = -sqrt(max(E^2 - (1.0 - f), 0.0))
+        w = (1.0 - E * (E - v)) / (E - v)       # covariant u_i = w x̂_i
+        lu = E + w                               # l^μ u_μ
+        u = SVector(E + f * lu, ((w - f * lu) * x̂)...)
+        l⃗ = x̂
+    else
+        # Kerr–Schild null direction and scalar, same convention as
+        # `kerr_rhs_mtl`: l_μ = (1, (rx+ay)/(r²+a²), (ry−ax)/(r²+a²), z/r),
+        # f = 2Mr³/(r⁴ + a²z²), with r the KS radius from the implicit
+        # quartic. Observer: static (u ∝ ∂_t) where f ≤ 0.72, blending to
+        # the ZAMO by f = 0.88. The ZAMO — u_μ ∝ −∇t_BL, zero angular
+        # momentum, corotating at ω, no radial fall — is the natural
+        # "hovering" frame inside the ergosphere and exists down to r₊
+        # (where its lapse → 0 and the sky blueshift diverges, which is
+        # physically what hovering at the horizon costs). The KS-slicing
+        # Eulerian observer was rejected here: it falls at the escape speed,
+        # and the Doppler redshift of the whole outside universe beats the
+        # gravitational blueshift — a camera deep in renders near-black. In
+        # KS coordinates t_BL = t_KS − A(r) with A'(r) = 2Mr/Δ, so
+        # u_μ ∝ −(dt_μ − A' ∂r/∂xⁱ dxⁱ), normalised with g⁻¹ = η − f l⊗l.
+        x, y, z = pos
+        a2 = a * a
+        wq = x * x + y * y + z * z - a2
+        rk2 = 0.5 * (wq + sqrt(wq * wq + 4.0 * a2 * z * z))
+        rk = sqrt(max(rk2, 1.0e-12))
+        iRA = 1.0 / (rk2 + a2)
+        l⃗ = SVector((rk * x + a * y) * iRA, (rk * y - a * x) * iRA, z / rk)
+        Σq = rk2 * rk2 + a2 * z * z
+        f = 2.0 * M * rk2 * rk / Σq
+        Δ = max(rk2 - 2.0 * M * rk + a2, 1.0e-6)
+        k = 2.0 * M * rk / Δ                        # A'(r)
+        ∇r = SVector(x * rk2 * rk / Σq, y * rk2 * rk / Σq,
+                     z * rk * (rk2 + a2) / Σq)
+        luc = 1.0 + k * dot(l⃗, ∇r)                  # l^ν (−dt + A' dr)_ν
+        uz_t = 1.0 + f * luc
+        uz = SVector(uz_t, (k * ∇r - (f * luc) * l⃗)...)
+        lu_z = uz[1] + l⃗[1] * uz[2] + l⃗[2] * uz[3] + l⃗[3] * uz[4]
+        nrm2 = -uz[1]^2 + uz[2]^2 + uz[3]^2 + uz[4]^2 + f * lu_z * lu_z
+        u_zamo = uz / sqrt(-nrm2)
+        if f >= 0.88
+            u = u_zamo
+        else
+            u_stat = SVector(1.0 / sqrt(1.0 - f), 0.0, 0.0, 0.0)
+            wb = clamp((f - 0.72) / 0.16, 0.0, 1.0)
+            wb = wb * wb * (3.0 - 2.0 * wb)
+            if wb == 0.0
+                u = u_stat
+            else
+                # Both timelike and future-pointing, so the mix is timelike;
+                # renormalise under g.
+                um = (1.0 - wb) * u_stat + wb * u_zamo
+                lu = um[1] + l⃗[1] * um[2] + l⃗[2] * um[3] + l⃗[3] * um[4]
+                nn = -um[1]^2 + um[2]^2 + um[3]^2 + um[4]^2 + f * lu * lu
+                u = um / sqrt(-nn)
+            end
+        end
+    end
 
-    ldot(A) = A[1] + x̂[1] * A[2] + x̂[2] * A[3] + x̂[3] * A[4]
+    ldot(A) = A[1] + l⃗[1] * A[2] + l⃗[2] * A[3] + l⃗[3] * A[4]
     gdot(A, B) = -A[1] * B[1] + A[2] * B[2] + A[3] * B[3] + A[4] * B[4] +
                  f * ldot(A) * ldot(B)
 

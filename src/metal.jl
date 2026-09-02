@@ -74,12 +74,31 @@ orange. Changing the *disc's* `wb_temperature` must not move this — see
 """
 const STAR_WB_TEMPERATURE = 10000.0
 
-"""Star colour table: a white-balanced blackbody LUT, independent of any disc."""
-function _star_lut_cpu(wb_temperature::Real; table_size::Int=1024)
+"""Star colour table: a white-balanced blackbody LUT, independent of any disc.
+
+`saturation` scales each entry's chroma about its Rec.709 luminance. Raw
+blackbody chroma is far more saturated than any star ever looks — measured
+star chromaticities (Charity's dataset) top out at pale blue-white even for
+O stars, and point sources barely drive colour vision at all, which is why
+production sky renderers mix star colours most of the way toward white.
+1.0 keeps the raw LUT; ~0.35 matches the measured/production look.
+"""
+function _star_lut_cpu(wb_temperature::Real; table_size::Int=1024,
+                       saturation::Real=1.0)
     bb = Blackbody(; wb_temperature=wb_temperature, table_size=table_size)
     lut = Array{Float32,2}(undef, 3, bb.table_size)
     for k in 1:bb.table_size, c in 1:3
         lut[c, k] = Float32(bb.table[k][c])
+    end
+    if saturation != 1.0
+        s = Float32(saturation)
+        for k in 1:bb.table_size
+            L = 0.2126f0 * lut[1, k] + 0.7152f0 * lut[2, k] +
+                0.0722f0 * lut[3, k]
+            for c in 1:3
+                lut[c, k] = L + s * (lut[c, k] - L)
+            end
+        end
     end
     return lut
 end
@@ -230,6 +249,10 @@ there as ξ^(−2/3) over roughly a 460× range. The default is calibrated again
 crop reaches ≈2.3 linear — match that and the two skies carry comparable
 weight, so `texture_weight` becomes a pure look dial rather than an exposure
 correction.
+
+`saturation` scales the colour LUT's chroma about luminance (see
+[`_star_lut_cpu`](@ref)): 1.0 is raw blackbody colour, ~0.35 matches measured
+star chromaticities, where even O stars are only pale blue-white.
 """
 function set_starfield!(ctx::MetalPreviewContext; strength::Real=1.0,
                         texture_weight::Real=0.0,
@@ -240,7 +263,8 @@ function set_starfield!(ctx::MetalPreviewContext; strength::Real=1.0,
                         galactic::NTuple{3,Real}=(0.0, 0.0, 1.0),
                         concentration::Real=3.0, temp_min::Real=3000,
                         temp_max::Real=16000, seed::Integer=12345,
-                        wb_temperature::Real=STAR_WB_TEMPERATURE)
+                        wb_temperature::Real=STAR_WB_TEMPERATURE,
+                        saturation::Real=1.0)
     H = something(height, ctx.height)
     gx, gy, gz = galactic
     gn = sqrt(gx^2 + gy^2 + gz^2)
@@ -251,10 +275,11 @@ function set_starfield!(ctx::MetalPreviewContext; strength::Real=1.0,
     σ = psf_pixels * 2 * fov_factor / H
     # Star colour comes from the context's OWN LUT, never the disc's, so
     # regrading the disc leaves the sky alone. Rebake only if the caller moves
-    # the star white point off the default.
+    # the star white point or the chroma off the default.
     nlut = size(ctx.star_lut, 2)
-    if wb_temperature != STAR_WB_TEMPERATURE
-        copyto!(ctx.star_lut, _star_lut_cpu(wb_temperature; table_size=nlut))
+    if wb_temperature != STAR_WB_TEMPERATURE || saturation != 1.0
+        copyto!(ctx.star_lut, _star_lut_cpu(wb_temperature; table_size=nlut,
+                                            saturation=saturation))
     end
     bb_ref = Blackbody(; wb_temperature=wb_temperature, table_size=nlut)
     lut = (bb_ref.table_min, bb_ref.table_max, Float64(nlut))
@@ -859,24 +884,49 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
 
     # Received photon p = ω(u + n); trace q = n − u, i.e. backward in time
     # (regular through the horizon in both directions). Lower the index:
-    # p_μ = η_μν q^ν + f l_μ (l_ν q^ν) with l_μ = (1, x̂).
+    # p_μ = η_μν q^ν + f l_μ (l_ν q^ν), with the spacetime's own f and
+    # l_μ = (1, l⃗) — radial for Schwarzschild, the spinning KS congruence for
+    # Kerr (same convention as `kerr_rhs_mtl`; the CPU-side tetrad in
+    # `ks_camera_tetrad` is orthonormalised under the matching metric).
     # The origin carries the aperture offset along the tetrad right/up axes
     # (zero for pinhole).
     x = cx + offr * er1 + offu * eu1
     y = cy + offr * er2 + offu * eu2
     z = cz + offr * er3 + offu * eu3
     r = sqrt(x * x + y * y + z * z)
-    f = 2.0f0 * M / r
     qt = cf * ef0 + cr * er0 + cu * eu0 - ut0
     qx = cf * ef1 + cr * er1 + cu * eu1 - ut1
     qy = cf * ef2 + cr * er2 + cu * eu2 - ut2
     qz = cf * ef3 + cr * er3 + cu * eu3 - ut3
-    lq = qt + (x * qx + y * qy + z * qz) / r
-    p_t = -qt + f * lq
-    flr = f * lq / r
-    px = qx + flr * x
-    py = qy + flr * y
-    pz = qz + flr * z
+    p_t = 0.0f0
+    px = 0.0f0
+    py = 0.0f0
+    pz = 0.0f0
+    if KERR
+        a2l = spin_a * spin_a
+        wl = r * r - a2l
+        rk2l = 0.5f0 * (wl + sqrt(wl * wl + 4.0f0 * a2l * z * z))
+        rkl = sqrt(max(rk2l, 1.0f-12))
+        iRAl = 1.0f0 / (rk2l + a2l)
+        lxl = (rkl * x + spin_a * y) * iRAl
+        lyl = (rkl * y - spin_a * x) * iRAl
+        lzl = z / rkl
+        fl = 2.0f0 * M * rk2l * rkl / (rk2l * rk2l + a2l * z * z)
+        lq = qt + lxl * qx + lyl * qy + lzl * qz
+        flq = fl * lq
+        p_t = -qt + flq
+        px = qx + flq * lxl
+        py = qy + flq * lyl
+        pz = qz + flq * lzl
+    else
+        f = 2.0f0 * M / r
+        lq = qt + (x * qx + y * qy + z * qz) / r
+        p_t = -qt + f * lq
+        flr = f * lq / r
+        px = qx + flr * x
+        py = qy + flr * y
+        pz = qz + flr * z
+    end
 
     # Optional relativistic shading: each ray is normalised to unit frequency
     # in the camera tetrad, and the conserved p_t is the frequency at
@@ -1679,9 +1729,10 @@ fields wider than 180° render cleanly — a rectilinear pinhole caps below
 """
 function _ks_cam_params!(dest::Vector{Float32}, cam::Camera, M::Float64;
                          fisheye_deg::Real=0.0, focus_dist::Real=1.0,
-                         equirect::Bool=false)
+                         equirect::Bool=false, a::Float64=0.0)
     u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
-                                      cam.up_local, M; beta=camera_beta(cam))
+                                      cam.up_local, M; beta=camera_beta(cam),
+                                      a=a)
     fill!(dest, 0.0f0)
     @inbounds begin
         dest[1] = cam.pos[1]; dest[2] = cam.pos[2]; dest[3] = cam.pos[3]
@@ -1698,9 +1749,11 @@ function _ks_cam_params!(dest::Vector{Float32}, cam::Camera, M::Float64;
 end
 
 function _ks_cam_params(cam::Camera, M::Float64; fisheye_deg::Real=0.0,
-                        focus_dist::Real=1.0, equirect::Bool=false)
+                        focus_dist::Real=1.0, equirect::Bool=false,
+                        a::Float64=0.0)
     u4, Ef, Er, Eu = ks_camera_tetrad(cam.pos, cam.fwd, cam.right,
-                                      cam.up_local, M; beta=camera_beta(cam))
+                                      cam.up_local, M; beta=camera_beta(cam),
+                                      a=a)
     p = Float32[cam.pos[1], cam.pos[2], cam.pos[3], cam.fov_factor,
                 Ef..., Er..., Eu..., u4...,
                 equirect ? 2.0 : (fisheye_deg > 0 ? 1.0 : 0.0),
@@ -1780,7 +1833,8 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
                20_000)
 
     # Update reusable GPU parameter buffers with a single host-to-device copy.
-    _ks_cam_params!(ctx.cam_host, cam, spacetime.M; fisheye_deg=fisheye_deg)
+    _ks_cam_params!(ctx.cam_host, cam, spacetime.M; fisheye_deg=fisheye_deg,
+                    a=spin(spacetime))
     spin_a, rkill2 = _spin_horizon(spacetime)
     is_kerr = spin_a != 0
     sh = ctx.st_host
@@ -1900,7 +1954,8 @@ function render_depth_mtl(ctx::MetalPreviewContext, cam::Camera,
     cam_host = unsafe_wrap(Array, cam_params); fill!(cam_host, 0.0f0)
     st_host = unsafe_wrap(Array, spacetime_params); fill!(st_host, 0.0f0)
     copyto!(cam_params, _ks_cam_params(cam, spacetime.M;
-                                       fisheye_deg=fisheye_deg))
+                                       fisheye_deg=fisheye_deg,
+                                       a=spin(spacetime)))
     spin_a, rkill2 = _spin_horizon(spacetime)
     is_kerr = spin_a != 0
     copyto!(spacetime_params,
@@ -1986,7 +2041,8 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           per_pixel_shutter::Bool=false,
                           refine::Int=1, refine_var::Real=0.35,
                           refine_graze::Real=0.05, refine_margin::Int=8,
-                          pixel_jitter::Bool=true)
+                          pixel_jitter::Bool=true,
+                          order::Int=4, tol::Real=1.0f-4)
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
@@ -2003,7 +2059,7 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     cam_host = unsafe_wrap(Array, cam_params); fill!(cam_host, 0.0f0)
     st_host = unsafe_wrap(Array, spacetime_params); fill!(st_host, 0.0f0)
     base_params = _ks_cam_params(cam, spacetime.M; fisheye_deg=fisheye_deg,
-                                 focus_dist=focus_dist)
+                                 focus_dist=focus_dist, a=spin(spacetime))
     copyto!(cam_params, base_params)
     spin_a, rkill2 = _spin_horizon(spacetime)
     is_kerr = spin_a != 0
@@ -2075,10 +2131,12 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                 if per_pixel_shutter
                     base_params = _ks_cam_params(camera_at(m / samples^2), spacetime.M;
                                                  fisheye_deg=fisheye_deg,
-                                                 focus_dist=focus_dist)
+                                                 focus_dist=focus_dist,
+                                                 a=spin(spacetime))
                     endp = _ks_cam_params(camera_at((m + 1) / samples^2), spacetime.M;
                                           fisheye_deg=fisheye_deg,
-                                          focus_dist=focus_dist)
+                                          focus_dist=focus_dist,
+                                          a=spin(spacetime))
                     # Seed kept clear of the lens hashes (which use `pass` and
                     # `pass + 7919`), so time and aperture decorrelate per pixel.
                     base_params[29] = Float32(104729 + pass)
@@ -2087,7 +2145,8 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                     base_params = _ks_cam_params(camera_at((m + 0.5) / samples^2),
                                                  spacetime.M;
                                                  fisheye_deg=fisheye_deg,
-                                                 focus_dist=focus_dist)
+                                                 focus_dist=focus_dist,
+                                                 a=spin(spacetime))
                 end
             end
             if use_dof
@@ -2106,6 +2165,7 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                                width, height, nmax, dt32,
                                Float32(du), Float32(dv), weight, row0, rows;
                                kerr=is_kerr, col0=col_a, cols=ncols_blk,
+                               order=order, tol=tol,
                                stat=stat_blk, jw=jw,
                                jseed=15485863 + pass)
                 Metal.synchronize()
@@ -2987,7 +3047,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
     nmax = min(max(ctx.nmax,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)),
                20_000)
-    _ks_cam_params!(ctx.cam_host, cam, spacetime.M; fisheye_deg=fisheye_deg)
+    _ks_cam_params!(ctx.cam_host, cam, spacetime.M; fisheye_deg=fisheye_deg,
+                    a=spin(spacetime))
     spin_a, rkill2 = _spin_horizon(spacetime)
     is_kerr = spin_a != 0
     sh = ctx.st_host
@@ -3156,7 +3217,8 @@ function bake_warp_map(ctx::MetalPreviewContext, spacetime::AbstractSpacetime,
     dt = ctx.dt
     nmax = min(max(ctx.nmax,
                    ceil(Int, (75.0 + 6.5 * log(r_escape / M)) * M / dt)), 20_000)
-    cp = MtlArray(_ks_cam_params(cam, spacetime.M; equirect = true))
+    cp = MtlArray(_ks_cam_params(cam, spacetime.M; equirect = true,
+                                 a=spin(spacetime)))
     spin_a, rkill2 = _spin_horizon(spacetime)
     sp = MtlArray(Float32[M, Float32(2.05 * spacetime.M), r_escape, 0.0f0,
                           HSTEP_COEF[], HSTEP_CAP[], spin_a, rkill2])
