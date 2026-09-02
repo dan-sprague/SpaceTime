@@ -336,6 +336,13 @@ end
 @inline _rhs_mtl(::Val{true}, x, y, z, px, py, pz, p_t, M, a) =
     kerr_rhs_mtl(x, y, z, px, py, pz, p_t, M, a)
 
+# Six-component tuple arithmetic for the Tsit5 stages: phase-space state
+# and RHS slopes travel as (x, y, z, px, py, pz).
+@inline _axpy6(s, c, k) = (s[1] + c * k[1], s[2] + c * k[2], s[3] + c * k[3],
+                           s[4] + c * k[4], s[5] + c * k[5], s[6] + c * k[6])
+@inline _scale6(k, c) = (c * k[1], c * k[2], c * k[3],
+                         c * k[4], c * k[5], c * k[6])
+
 """
     kerr_rhs_mtl(x, y, z, px, py, pz, p_t, M, a)
 
@@ -628,7 +635,7 @@ end
 """
     trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params, cam_params,
                       spacetime_params, disc_params, width, height, nmax, dt,
-                      jitter_u, jitter_v, weight, row0, rows, ::Val{VOL})
+                      tol, jitter_u, jitter_v, weight, row0, rows, ::Val{VOL})
 
 Metal compute kernel: one thread per pixel of the current row tile, tracing
 geodesics in **Cartesian Kerr–Schild coordinates** (see `ks_rhs_mtl`) — free
@@ -652,7 +659,7 @@ several short dispatches.
 function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                            star_params, cam_params,
                            spacetime_params, disc_params, fan, sky_params,
-                           width, height, nmax, dt, jitter_u, jitter_v,
+                           width, height, nmax, dt, tol, jitter_u, jitter_v,
                            weight, row0, rows, col0, cols,
                            substride, subx, suby,
                            ring_rmin,
@@ -915,10 +922,14 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     vol_zmax = vol_params[3]
     vol_emis = vol_params[7]
     vol_opac = vol_params[8]
-    # Volume march stride: sample the gas every Nth integration step with
-    # N× path weight (default 2). Coarser strides are the quality/speed
-    # knob for cameras inside the slab — geodesics stay exact.
+    # Volume march stride: the gas is sampled every `vol_mstep * dt` of arc
+    # length (default 2), on its own schedule — NOT every Nth integration
+    # step, so the sampling density survives an adaptive integrator taking
+    # whatever steps the ODE error controller licenses. Coarser strides are
+    # the quality/speed knob for cameras inside the slab; geodesics stay
+    # exact either way.
     vol_mstep = clamp(unsafe_trunc(Int32, vol_params[9]), Int32(1), Int32(16))
+    ds_gas = Float32(vol_mstep) * dt
     vol_s_out = exp(vol_params[2])
     vol_rb2 = vol_s_out * vol_s_out + vol_zmax * vol_zmax
     disc_plane = disc_enabled && !VOL
@@ -950,6 +961,18 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     r_floor = r > 2.05f0 * M ? 2.0f0 * M : 0.3f0 * M
     r_prev = -1.0f0
     r_layer_prev = -1.0f0
+    # Adaptive-integrator state, all per-thread: the step size carried between
+    # iterations, the previous step's error for the PI controller, and the
+    # FSAL slope — Tsit5's 7th stage is evaluated at the accepted step's
+    # endpoint, i.e. it IS the next step's k1, so it is carried instead of
+    # recomputed.
+    h_carry = -1.0f0
+    err_prev = 1.0f-4
+    k1_carry = (0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0)
+    k1_valid = false
+    # Arc length travelled since the last gas sample (the volumetric march is
+    # decoupled from the integrator's step schedule — see below).
+    march_acc = 0.0f0
     for stepi in 1:nmax
         r2 = x * x + y * y + z * z
         r = sqrt(r2)
@@ -1014,79 +1037,124 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
         xp = x; yp = y; zp = z
         pxp = px; pyp = py; pzp = pz
 
-        k1 = _rhs_mtl(Val(KERR), x, y, z, px, py, pz, p_t, M, spin_a)
-        if NB > 0
-            ell += h * sqrt(k1[1] * k1[1] + k1[2] * k1[2] + k1[3] * k1[3])
-        end
-
-        # Volumetric disc: sample the density grid and accumulate
-        # Doppler-shaded emission/absorption. Sampled every 2nd step (with
-        # doubled path weight) — gas structure is much coarser than the
-        # integration step.
-        if VOL && alpha > 0.003f0 && stepi % vol_mstep == 0 && r2 < vol_rb2
-            if abs(z) < vol_zmax
-                s_cyl = sqrt(x * x + y * y)
-                if s_cyl > 1.0f-6
-                    φv = atan(y, x)
-                    ρ = sample_volume_mtl(vol, vol_params, s_cyl, φv, z)
-                    if ρ > 1.0f-4
-                        vlen = max(sqrt(k1[1] * k1[1] + k1[2] * k1[2] +
-                                        k1[3] * k1[3]), 1.0f-20)
-                        ds = Float32(vol_mstep) * h * vlen
-
-                        R = s_cyl / (2.0f0 * M)
-                        T_emit = exp(10.034259f0 - 0.375f0 * log(max(R * R, 1.0f-6)))
-                        v_mag = clamp(0.70710678f0 / sqrt(max(R - 1.0f0, 0.1f0)),
-                                      0.0f0, 0.999f0)
-                        # Keplerian flow ϕ̂ = (−y, x, 0)/s against the photon
-                        # coordinate velocity k1[1:3].
-                        vdotn = v_mag * (-y * k1[1] + x * k1[2]) / (s_cyl * vlen)
-                        gam = 1.0f0 / sqrt(1.0f0 - clamp(v_mag * v_mag, 0.0f0, 0.99f0))
-                        Rs = r / (2.0f0 * M)
-                        opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(Rs, 1.0f0), 0.01f0))
-                        opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
-                        T_obs = T_emit * scam / opz
-                        inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
-
-                        frac = (clamp(T_obs, lut_tmin, lut_tmax) - lut_tmin) /
-                               (lut_tmax - lut_tmin)
-                        li = clamp(unsafe_trunc(Int32, frac * (lut_size - 1.0f0) + 0.5f0) +
-                                   Int32(1), Int32(1), unsafe_trunc(Int32, lut_size))
-                        col_r = bb_lut[1, li]
-                        col_g = bb_lut[2, li]
-                        col_b = bb_lut[3, li]
-
-                        tau = vol_opac * ρ * ds
-                        a = 1.0f0 - exp(-tau)
-                        w = alpha * a * inten * vol_emis
-                        if NB > 0
-                            bi = ell <= 1.5f0 ? Int32(1) :
-                                 clamp(unsafe_trunc(Int32,
-                                           (log(ell) - 0.405465f0) * bscale) +
-                                       Int32(1), Int32(1), Int32(NB - 1))
-                            out[3 * (bi - 1) + 1, i, j] += weight * w * col_r
-                            out[3 * (bi - 1) + 2, i, j] += weight * w * col_g
-                            out[3 * (bi - 1) + 3, i, j] += weight * w * col_b
-                        else
-                            acc_r += w * col_r
-                            acc_g += w * col_g
-                            acc_b += w * col_b
-                        end
-                        alpha *= (1.0f0 - a)
-                        if alpha < 0.003f0
-                            break   # transmittance exhausted
-                        end
-                    end
-                end
-            end
-        end
+        k1 = ((ORD == 45 || ORD == 46) && k1_valid) ? k1_carry :
+             _rhs_mtl(Val(KERR), x, y, z, px, py, pz, p_t, M, spin_a)
 
         # `ORD` picks the integrator at compile time: 4 = classical RK4 (4 RHS
-        # evaluations per step), 2 = explicit midpoint (2), 1 = Euler (1).
-        # `k1` is already in hand above — the volumetric sampler needs the
-        # photon's coordinate velocity — so Euler adds no evaluation at all
-        # and midpoint adds exactly one.
-        if ORD == 4
+        # evaluations per step), 2 = explicit midpoint (2), 1 = Euler (1),
+        # 45/46 = adaptive Tsit5 (6 new evaluations per attempt; k1 is the
+        # carried FSAL stage). `k1` is already in hand above — the volumetric
+        # sampler needs the photon's coordinate velocity — so Euler adds no
+        # evaluation at all and midpoint adds exactly one. `h_used` is the
+        # step actually taken: the radius-adaptive h for the fixed-order
+        # paths, whatever the error controller settled on for 45/46 — the gas
+        # march below needs it.
+        h_used = h
+        if ORD == 45 || ORD == 46
+            # Adaptive Tsitouras 5(4) — the tableau that replaced
+            # Dormand-Prince as the modern default (and here replaces the
+            # Cash-Karp pair the Rust shader still carries): seven stages, an
+            # embedded fourth-order solution for the error estimate, FSAL (the
+            # 7th stage sits at the step's endpoint, so it is next step's k1),
+            # per-thread step control — SIMD lanes diverge only where
+            # neighbouring rays genuinely differ, near the photon ring.
+            #
+            # ORD 45 caps the step at the radius-adaptive h. That cap is not
+            # about accuracy — it is what the once-per-step shadow-kill tests
+            # need: a long step near the photon sphere jumps the band the
+            # tests look at and a captured ray escapes as phantom sky. ORD 46
+            # lets the step run free (up to 50·dt) and relies on the error
+            # controller tightening near the hole — the arc-length gas march
+            # below stays correct under big steps, which is what makes this
+            # mode usable at all. The thin-plane disc keeps an approach guard:
+            # its crossing is located by linear interpolation across ONE step,
+            # so that one piece still depends on the step schedule.
+            hmax = h
+            if ORD == 46
+                hmax = 50.0f0 * dt
+                if disc_plane
+                    hmax = min(hmax, max(h, 0.5f0 * (r - disc_outer)))
+                end
+            end
+            hh = min(h_carry > 0.0f0 ? h_carry : h, hmax)
+            s0 = (x, y, z, px, py, pz)
+            sn = s0
+            accepted = false
+            att = Int32(0)
+            while att < Int32(4) && !accepted
+                att += Int32(1)
+                s2 = _axpy6(s0, hh * 0.161f0, k1)
+                k2 = _rhs_mtl(Val(KERR), s2[1], s2[2], s2[3], s2[4], s2[5],
+                              s2[6], p_t, M, spin_a)
+                s3 = _axpy6(_axpy6(s0, -hh * 0.0084806555f0, k1),
+                            hh * 0.33548066f0, k2)
+                k3 = _rhs_mtl(Val(KERR), s3[1], s3[2], s3[3], s3[4], s3[5],
+                              s3[6], p_t, M, spin_a)
+                s4 = _axpy6(_axpy6(_axpy6(s0, hh * 2.8971531f0, k1),
+                            -hh * 6.3594485f0, k2), hh * 4.3622954f0, k3)
+                k4 = _rhs_mtl(Val(KERR), s4[1], s4[2], s4[3], s4[4], s4[5],
+                              s4[6], p_t, M, spin_a)
+                s5 = _axpy6(_axpy6(_axpy6(_axpy6(s0,
+                            hh * 5.3258648f0, k1), -hh * 11.748884f0, k2),
+                            hh * 7.4955393f0, k3), -hh * 0.092495066f0, k4)
+                k5 = _rhs_mtl(Val(KERR), s5[1], s5[2], s5[3], s5[4], s5[5],
+                              s5[6], p_t, M, spin_a)
+                s6 = _axpy6(_axpy6(_axpy6(_axpy6(_axpy6(s0,
+                            hh * 5.8614554f0, k1), -hh * 12.920969f0, k2),
+                            hh * 8.1593679f0, k3), -hh * 0.071584973f0, k4),
+                            -hh * 0.028269050f0, k5)
+                k6 = _rhs_mtl(Val(KERR), s6[1], s6[2], s6[3], s6[4], s6[5],
+                              s6[6], p_t, M, spin_a)
+                # The seventh stage sits at the fifth-order solution itself
+                # (c7 = 1, a7j = bj), so `s7` IS the proposed new state and
+                # `k7` is the slope there — the FSAL carry.
+                s7 = _axpy6(_axpy6(_axpy6(_axpy6(_axpy6(_axpy6(s0,
+                            hh * 0.096460767f0, k1), hh * 0.01f0, k2),
+                            hh * 0.47988965f0, k3), hh * 1.3790086f0, k4),
+                            -hh * 3.2900695f0, k5), hh * 2.3247105f0, k6)
+                k7 = _rhs_mtl(Val(KERR), s7[1], s7[2], s7[3], s7[4], s7[5],
+                              s7[6], p_t, M, spin_a)
+                sn = s7
+                h_used = hh
+                k1_carry = k7
+                k1_valid = true
+
+                # Embedded error: b − b̂ weights over all seven stages.
+                et = _axpy6(_axpy6(_axpy6(_axpy6(_axpy6(_axpy6(
+                     _scale6(k1, -0.0017800111f0), -0.00081643446f0, k2),
+                     0.007880878f0, k3), -0.14471101f0, k4),
+                     0.58235717f0, k5), -0.45808211f0, k6),
+                     0.015151515f0, k7)
+                ex = hh * sqrt(et[1] * et[1] + et[2] * et[2] + et[3] * et[3])
+                ep = hh * sqrt(et[4] * et[4] + et[5] * et[5] + et[6] * et[6])
+                # Mixed absolute/relative scaling, so a ray far from the hole
+                # is not held to the same absolute error as one at periapsis.
+                pn = sqrt(px * px + py * py + pz * pz)
+                sc = tol * (1.0f0 + max(r, pn))
+                err = max(ex, ep) / max(sc, 1.0f-30)
+
+                if err <= 1.0f0 || hh <= 1.0f-4 * dt
+                    accepted = true
+                    # PI step control (Gustafsson): the growth also looks at
+                    # the PREVIOUS accepted error, which damps the
+                    # grow-to-the-clamp-then-reject oscillation the plain
+                    # I-controller falls into at loose tolerances (measured:
+                    # tol 1e-3 ran SLOWER than 1e-4 under I-control).
+                    g = err > 1.0f-12 ?
+                        0.9f0 * exp(-0.14f0 * log(err) +
+                                    0.08f0 * log(err_prev)) : 4.0f0
+                    h_carry = min(hh * clamp(g, 0.2f0, 4.0f0), hmax)
+                    err_prev = max(err, 1.0f-4)
+                else
+                    hh = max(hh * max(0.9f0 * exp(-0.2f0 * log(err)), 0.2f0),
+                             1.0f-4 * dt)
+                end
+                # A rejected attempt is work the GPU did and threw away; the
+                # `att` bound is what keeps that bounded per step.
+            end
+            x = sn[1]; y = sn[2]; z = sn[3]
+            px = sn[4]; py = sn[5]; pz = sn[6]
+        elseif ORD == 4
             k2 = _rhs_mtl(Val(KERR), 
                 x + 0.5f0 * h * k1[1], y + 0.5f0 * h * k1[2], z + 0.5f0 * h * k1[3],
                 px + 0.5f0 * h * k1[4], py + 0.5f0 * h * k1[5], pz + 0.5f0 * h * k1[6],
@@ -1125,6 +1193,101 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
         if !(x == x) || !(z == z) || !(px == px)
             hit_horizon = true
             break
+        end
+
+        vlen = max(sqrt(k1[1] * k1[1] + k1[2] * k1[2] + k1[3] * k1[3]),
+                   1.0f-20)
+        if NB > 0
+            ell += h_used * vlen
+        end
+
+        # Volumetric gas, marched on its OWN arc-length stride: one sample per
+        # `ds_gas` of path, at positions interpolated along the accepted step.
+        # Tying the march to the integrator's step schedule instead (every Nth
+        # step, N× weight) breaks under an adaptive integrator — the error
+        # controller bounds the ODE's truncation error and has no idea the gas
+        # exists, so adaptive steps resample it at wildly uneven arc lengths
+        # (0.389 RMS against RK4 in the Rust port). Decoupled, gas quality is
+        # independent of how the geodesic was stepped. Shading uses the
+        # start-of-step velocity `k1`; within a step the bending is small.
+        # Gated on the SEGMENT's nearer endpoint, not the pre-step point: a
+        # free-running ORD-46 leg can enter the bounding sphere mid-step.
+        if VOL && alpha > 0.003f0 &&
+           min(r2, x * x + y * y + z * z) < vol_rb2
+            seg = h_used * vlen
+            t_s = ds_gas - march_acc   # arc distance to the next sample
+            if t_s > seg
+                march_acc += seg
+            else
+                while t_s <= seg && alpha > 0.003f0
+                    fseg = t_s / seg
+                    sx = xp + fseg * (x - xp)
+                    sy = yp + fseg * (y - yp)
+                    sz = zp + fseg * (z - zp)
+                    if abs(sz) < vol_zmax
+                        s_cyl = sqrt(sx * sx + sy * sy)
+                        if s_cyl > 1.0f-6
+                            φv = atan(sy, sx)
+                            ρ = sample_volume_mtl(vol, vol_params, s_cyl, φv, sz)
+                            if ρ > 1.0f-4
+                                R = s_cyl / (2.0f0 * M)
+                                T_emit = exp(10.034259f0 -
+                                             0.375f0 * log(max(R * R, 1.0f-6)))
+                                v_mag = clamp(0.70710678f0 /
+                                              sqrt(max(R - 1.0f0, 0.1f0)),
+                                              0.0f0, 0.999f0)
+                                # Keplerian flow ϕ̂ = (−y, x, 0)/s against the
+                                # photon coordinate velocity k1[1:3].
+                                vdotn = v_mag * (-sy * k1[1] + sx * k1[2]) /
+                                        (s_cyl * vlen)
+                                gam = 1.0f0 / sqrt(1.0f0 -
+                                          clamp(v_mag * v_mag, 0.0f0, 0.99f0))
+                                Rs = sqrt(sx * sx + sy * sy + sz * sz) /
+                                     (2.0f0 * M)
+                                opzg = 1.0f0 / sqrt(max(1.0f0 -
+                                           1.0f0 / max(Rs, 1.0f0), 0.01f0))
+                                opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
+                                T_obs = T_emit * scam / opz
+                                inten = 100.0f0 /
+                                        (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
+
+                                frac = (clamp(T_obs, lut_tmin, lut_tmax) - lut_tmin) /
+                                       (lut_tmax - lut_tmin)
+                                li = clamp(unsafe_trunc(Int32,
+                                               frac * (lut_size - 1.0f0) + 0.5f0) +
+                                           Int32(1), Int32(1),
+                                           unsafe_trunc(Int32, lut_size))
+                                col_r = bb_lut[1, li]
+                                col_g = bb_lut[2, li]
+                                col_b = bb_lut[3, li]
+
+                                tau = vol_opac * ρ * ds_gas
+                                a = 1.0f0 - exp(-tau)
+                                w = alpha * a * inten * vol_emis
+                                if NB > 0
+                                    bi = ell <= 1.5f0 ? Int32(1) :
+                                         clamp(unsafe_trunc(Int32,
+                                                   (log(ell) - 0.405465f0) * bscale) +
+                                               Int32(1), Int32(1), Int32(NB - 1))
+                                    out[3 * (bi - 1) + 1, i, j] += weight * w * col_r
+                                    out[3 * (bi - 1) + 2, i, j] += weight * w * col_g
+                                    out[3 * (bi - 1) + 3, i, j] += weight * w * col_b
+                                else
+                                    acc_r += w * col_r
+                                    acc_g += w * col_g
+                                    acc_b += w * col_b
+                                end
+                                alpha *= (1.0f0 - a)
+                            end
+                        end
+                    end
+                    t_s += ds_gas
+                end
+                march_acc = seg - (t_s - ds_gas)
+                if alpha < 0.003f0
+                    break   # transmittance exhausted
+                end
+            end
         end
 
         # Thin-plane disc: equatorial (z = 0) crossing, located by linear
@@ -1391,12 +1554,14 @@ allocates nothing per frame.
 """
 function render_preview_mtl(ctx::MetalPreviewContext, cam::Camera,
                             spacetime::AbstractSpacetime; fisheye_deg::Real=0.0,
-                            relativistic::Bool=false)
+                            relativistic::Bool=false,
+                            order::Int=4, tol::Real=1.0f-4)
     img = Matrix{RGBf}(undef, ctx.width, ctx.height)
     host = Array{Float32,3}(undef, 3, ctx.width, ctx.height)
     return render_preview_mtl!(img, host, ctx, cam, spacetime;
                                fisheye_deg=fisheye_deg,
-                               relativistic=relativistic)
+                               relativistic=relativistic,
+                               order=order, tol=tol)
 end
 
 function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
@@ -1404,10 +1569,12 @@ function render_preview_mtl!(img::Matrix{RGBf}, host::Array{Float32,3},
                              spacetime::AbstractSpacetime; fisheye_deg::Real=0.0,
                              relativistic::Bool=false,
                              band_rows::Int=0,
-                             on_band::Union{Nothing,Function}=nothing)
+                             on_band::Union{Nothing,Function}=nothing,
+                             order::Int=4, tol::Real=1.0f-4)
     _trace_preview_gpu!(ctx, cam, spacetime; fisheye_deg=fisheye_deg,
                         relativistic=relativistic,
-                        band_rows=band_rows, on_band=on_band)
+                        band_rows=band_rows, on_band=on_band,
+                        order=order, tol=tol)
     copyto!(host, ctx.out_gpu)
     @inbounds for j in 1:ctx.height, i in 1:ctx.width
         img[i, j] = RGBf(host[1, i, j], host[2, i, j], host[3, i, j])
@@ -1424,7 +1591,8 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
                              spacetime::AbstractSpacetime; fisheye_deg::Real=0.0,
                              relativistic::Bool=false,
                              band_rows::Int=0,
-                             on_band::Union{Nothing,Function}=nothing)
+                             on_band::Union{Nothing,Function}=nothing,
+                             order::Int=4, tol::Real=1.0f-4)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -1454,7 +1622,8 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
     if band_rows <= 0 || on_band === nothing
         _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params, ctx.spacetime_params,
                        ctx.width, ctx.height, nmax, dt,
-                       0.5f0, 0.5f0, 1.0f0, 0, ctx.height; kerr=is_kerr)
+                       0.5f0, 0.5f0, 1.0f0, 0, ctx.height; kerr=is_kerr,
+                       order=order, tol=tol)
     else
         # Banded dispatch: split the frame into row bands and call `on_band`
         # after each one, so a flight loop can slot cheap reprojection
@@ -1467,7 +1636,7 @@ function _trace_preview_gpu!(ctx::MetalPreviewContext, cam::Camera,
             _launch_trace!(ctx, ctx.out_gpu, ctx.cam_params,
                            ctx.spacetime_params, ctx.width, ctx.height,
                            nmax, dt, 0.5f0, 0.5f0, 1.0f0, row0, rows;
-                           kerr=is_kerr)
+                           kerr=is_kerr, order=order, tol=tol)
             row0 += rows
             row0 < ctx.height && on_band()
         end
@@ -1487,7 +1656,8 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         fan=nothing, sky_params=nothing, layer::Bool=false,
                         substride::Int=1, subx::Int=0, suby::Int=0,
                         ring_rmin::Real=0.0, col0::Int=0, cols::Int=-1,
-                        order::Int=4, kerr::Bool=false, bake::Bool=false)
+                        order::Int=4, tol::Real=1.0f-4,
+                        kerr::Bool=false, bake::Bool=false)
     cols < 0 && (cols = width)
     von = ctx.vol_on[]
     fan_b = fan === nothing ? _dummy_fan() : fan
@@ -1500,7 +1670,7 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
             ctx.vol_params,
             ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
             fan_b, skyp_b,
-            width, height, nmax, dt, ju, jv, weight, row0, rows,
+            width, height, nmax, dt, Float32(tol), ju, jv, weight, row0, rows,
             col0, cols, substride, subx, suby, Float32(ring_rmin),
             Val(von), Val(nb), Val(layer), Val(order), Val(kerr), Val(bake))
     end
@@ -1512,7 +1682,7 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
            ctx.vol_params,
            ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
            fan_b, skyp_b,
-           width, height, nmax, dt, ju, jv, weight, row0, rows,
+           width, height, nmax, dt, Float32(tol), ju, jv, weight, row0, rows,
            col0, cols, substride, subx, suby, Float32(ring_rmin),
            Val(von), Val(nb), Val(layer), Val(order), Val(kerr), Val(bake);
            threads=threads, groups=groups)
@@ -2522,7 +2692,8 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                              accumulate::Bool=false,
                              row0::Int=0, rows::Int=-1,
                              ring_out=nothing, ring_rmin::Real=0.0,
-                             ring_box::Bool=true, order::Int=4)
+                             ring_box::Bool=true, order::Int=4,
+                             tol::Real=1.0f-4)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
     r_escape = Float32(ctx.r_escape_factor * max(norm(cam.pos),
@@ -2562,7 +2733,7 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                        1.0f0, lrow0, lrows;
                        fan=sky.fan, sky_params=sky.sky_params, layer=true,
                        substride=substride, subx=subx, suby=suby, order=order,
-                       kerr=is_kerr)
+                       tol=tol, kerr=is_kerr)
     end
     # With trace_layer=false the caller keeps `layer_out` pre-filled with
     # α = 1 (fully transparent): the frame is the fan-driven sky alone.
@@ -2588,7 +2759,7 @@ function render_layered_gpu!(comp_out, layer_out, ctx::MetalPreviewContext,
                        1.0f0, rr0, rrn;
                        fan=sky.fan, sky_params=sky.sky_params, layer=true,
                        ring_rmin=ring_rmin, col0=rc0, cols=rcn, order=order,
-                       kerr=is_kerr)
+                       tol=tol, kerr=is_kerr)
     end
 
     acc = accumulate ? 1.0f0 : 0.0f0
