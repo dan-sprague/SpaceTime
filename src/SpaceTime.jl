@@ -69,6 +69,7 @@ include("viewfinder.jl")
 include("ship.jl")       # GR flight dynamics; uses the viewfinder integrator
 include("metal.jl")
 include("disc_sim.jl")   # live fluid disc; dispatches on MetalPreviewContext
+include("starfield.jl")  # CPU port of the kernel starfield; shares _sim_hash
 include("native_shell.jl") # Makie-free Metal window shell for the simulator
 include("postapp.jl")
 include("app.jl")        # julia_main: standalone-app entry point (create_app)
@@ -99,6 +100,9 @@ export bake_warp_map, bake_track_maps, render_baked!, BakedTrack
 export MetalPreviewContext, render_preview_mtl, render_preview_mtl!,
        render_draft_mtl, set_volume_enabled!, set_disc_enabled!,
        set_march_stride!, set_starfield!
+
+# --- Procedural sky (both renderers)
+export Starfield, starfield_color, sky_color
 
 # --- Interactive apps and flight dynamics
 export PreviewSettings, render_preview, viewfinder, postprocessor

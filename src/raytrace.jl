@@ -84,6 +84,27 @@ function init_photon(origin::SVector{3,Float64}, direction::SVector{3,Float64},
 end
 
 """
+    _escape_direction(spacetime, μ) -> SVector{3,Float64}
+
+Unit asymptotic direction of a photon in state `μ`: its coordinate velocity
+`dxⁱ/dλ`, taken from the same expression as the geodesic RHS in `gr.jl`. This
+is the direction the sky should be sampled along — the escape *position* is
+offset from it by about `b / r_escape` radians, which is a parallax shift, not
+a viewing direction.
+"""
+@inline function _escape_direction(spacetime::AbstractSpacetime,
+                                   μ::SVector{8,Float64})
+    x, y, z = μ[2], μ[3], μ[4]
+    p_t, px, py, pz = μ[5], μ[6], μ[7], μ[8]
+    inv_r = 1.0 / sqrt(x * x + y * y + z * z)
+    f = 2.0 * spacetime.M * inv_r
+    κ = (x * px + y * py + z * pz) * inv_r
+    c1 = f * (-p_t + κ) * inv_r
+    v = SVector(px - c1 * x, py - c1 * y, pz - c1 * z)
+    return v / max(norm(v), 1.0e-20)
+end
+
+"""
     camera_tetrad(cam::AbstractCamera, spacetime) -> (u, Ef, Er, Eu)
 
 The camera's own orthonormal tetrad, Lorentz-boosted by `cam.velocity`. Build
@@ -207,7 +228,8 @@ function _trace_color(integrator, meta, cam::AbstractCamera,
                       dust::Union{InterstellarDust,Nothing}=nothing,
                       lens::Union{Nothing, NTuple{2, Float64}}=nothing,
                       relativistic::Bool=false,
-                      tetrad::Union{Nothing,NTuple{4,SVector{4,Float64}}}=nothing)
+                      tetrad::Union{Nothing,NTuple{4,SVector{4,Float64}}}=nothing,
+                      starfield=nothing)
     μ0 = init_photon(cam, spacetime, u, v; rng, lens, tetrad)
 
     meta.acc_color = RGBf(0, 0, 0)
@@ -245,8 +267,15 @@ function _trace_color(integrator, meta, cam::AbstractCamera,
     μf = integrator.sol.u[end]
     xf, yf, zf = μf[2], μf[3], μf[4]
     final_r = sqrt(xf^2 + yf^2 + zf^2)
-    final_θ = acos(clamp(zf / final_r, -1.0, 1.0))
-    final_ϕ = atan(yf, xf)
+    # Sky direction is the photon's *asymptotic momentum*, not its escape
+    # position. The two differ by roughly b/r_escape for a grazing ray — a
+    # parallax shift that slides the background sideways and, once stars are
+    # point sources, puts them in visibly wrong places. The kernel has always
+    # used the momentum; the CPU used the position, so the two renderers drew
+    # different skies from the same seed.
+    d_esc = _escape_direction(spacetime, μf)
+    final_θ = acos(clamp(d_esc[3], -1.0, 1.0))
+    final_ϕ = atan(d_esc[2], d_esc[1])
 
     # Compute approximate path length for dust extinction.
     x0, y0, z0 = μ0[2], μ0[3], μ0[4]
@@ -260,8 +289,11 @@ function _trace_color(integrator, meta, cam::AbstractCamera,
     color = if final_r < 2.1 * spacetime.M
         meta.acc_color
     else
+        # Sky = map + procedural stars, both along the asymptotic direction.
+        # The stars are drawn at the output grid rather than magnified out of a
+        # texture, so they stay ~1 px wide at any resolution.
         bg_color = _relativistic_sky_tint(
-            sample_background(background, final_θ, final_ϕ), meta.gcam)
+            sky_color(background, starfield, final_θ, final_ϕ, d_esc), meta.gcam)
         meta.acc_color + (bg_color * meta.alpha)
     end
 
@@ -297,7 +329,7 @@ end
 
 """
     render(cam::AbstractCamera, spacetime::Schwarzschild, background;
-           disc=AccretionDisc(), width=400, height=200, solver=Tsit5(),
+           disc=AccretionDisc(), width=400, height=200, solver=Vern9(),
            samples=1, jittered=true, rng=Random.default_rng())
 
 Render a colour image with Doppler-shifted accretion disc and background.
@@ -309,12 +341,13 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                 dust::Union{InterstellarDust,Nothing}=nothing,
                 volume::Union{DiscVolume,Nothing}=nothing,
                 width::Int=400, height::Int=200,
-                solver=Tsit5(),
+                solver=Vern9(),
                 samples::Int=1,
                 jittered::Bool=true,
                 rng::Random.AbstractRNG=Random.default_rng(),
                 progress::Union{Function,Nothing}=nothing,
-                relativistic::Bool=false)
+                relativistic::Bool=false,
+                starfield=nothing)
     image = zeros(RGBf, width, height)
     cam_dist = norm(cam.pos)
     r_max = max(5.0 * cam_dist, 100.0)
@@ -380,7 +413,8 @@ function render(cam::AbstractCamera, spacetime::Schwarzschild, background;
                                                 rng=local_rng, dust=dust,
                                                 lens=use_lens ? lens_offs[k] : nothing,
                                                 relativistic=relativistic,
-                                                tetrad=cam_tet)
+                                                tetrad=cam_tet,
+                                                starfield=starfield)
                 end
                 image[i, j] = pixel_color * inv_samples2
             end
@@ -395,14 +429,14 @@ end
 
 """
     render_no_doppler(cam::AbstractCamera, spacetime::AbstractSpacetime;
-                      width=200, height=100, solver=Tsit5(),
+                      width=200, height=100, solver=Vern9(),
                       samples=1, jittered=true, rng=Random.default_rng())
 
 Render a grayscale image without Doppler effects.
 """
 function render_no_doppler(cam::AbstractCamera, spacetime::AbstractSpacetime;
                            width::Int=200, height::Int=100,
-                           solver=Tsit5(),
+                           solver=Vern9(),
                            samples::Int=1,
                            jittered::Bool=true,
                            rng::Random.AbstractRNG=Random.default_rng())
@@ -449,7 +483,7 @@ end
 """
     render_motion(camera_at, t0, t1, spacetime, background;
                   disc=AccretionDisc(), width=400, height=200,
-                  solver=Tsit5(), samples=1, time_samples=8,
+                  solver=Vern9(), samples=1, time_samples=8,
                   jittered=true, rng=Random.default_rng())
 
 Render with motion blur by averaging rays over the shutter interval `[t0, t1]`.
@@ -460,12 +494,13 @@ function render_motion(camera_at::Function, t0::Real, t1::Real,
                        disc::Union{AccretionDisc,Nothing}=AccretionDisc(),
                        volume::Union{DiscVolume,Nothing}=nothing,
                        width::Int=400, height::Int=200,
-                       solver=Tsit5(),
+                       solver=Vern9(),
                        samples::Int=1,
                        time_samples::Int=8,
                        jittered::Bool=true,
                        rng::Random.AbstractRNG=Random.default_rng(),
-                       relativistic::Bool=false)
+                       relativistic::Bool=false,
+                       starfield=nothing)
     image = zeros(RGBf, width, height)
     inv_total = 1.0 / (samples^2 * time_samples)
     subpixel_offsets = jittered ? jittered_grid(samples; rng=rng) :
@@ -508,7 +543,8 @@ function render_motion(camera_at::Function, t0::Real, t1::Real,
                         image[i, j] += _trace_color(integrator, meta, cam, spacetime,
                                                     background, disc, u, v; rng=local_rng,
                                                     relativistic=relativistic,
-                                                    tetrad=cam_tet)
+                                                    tetrad=cam_tet,
+                                                    starfield=starfield)
                     end
                 end
             end
@@ -535,12 +571,12 @@ struct WorldLine
 end
 
 """
-    raytrace(spacetime, photon; tspan=(0.0, 500.0), npoints=1000, solver=Tsit5())
+    raytrace(spacetime, photon; tspan=(0.0, 500.0), npoints=1000, solver=Vern9())
 
 Trace a photon through `spacetime` and return a `WorldLine`.
 """
 function raytrace(spacetime::AbstractSpacetime, photon::Photon;
-                  tspan::Tuple{Float64,Float64}=(0.0, 500.0), npoints::Int=1000, solver=Tsit5())
+                  tspan::Tuple{Float64,Float64}=(0.0, 500.0), npoints::Int=1000, solver=Vern9())
     r_max = 2.0 * sqrt(photon.μ[2]^2 + photon.μ[3]^2 + photon.μ[4]^2)
     cb = ContinuousCallback(make_boundary_condition(r_max), horizon_affect!)
     prob = ODEProblem(spacetime, photon.μ, tspan, (spacetime, nothing))
