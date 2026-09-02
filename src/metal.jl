@@ -868,6 +868,83 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     scam = spacetime_params[4] > 0.5f0 ?
            1.0f0 / clamp(abs(p_t), 0.05f0, 20.0f0) : 1.0f0
 
+    # Bardeen launch-time capture test (Kerr only). The runtime kill radius is
+    # a single sphere (the prograde photon orbit), but the unstable photon
+    # orbits of a spinning hole fill a SHELL — prograde equatorial through
+    # polar to retrograde, r ∈ [photon_orbit_min, ~4M] — and near-extremal
+    # spin makes rays grazing that shell wind more orbits than Float32 can
+    # track: they emerge with quasi-random momenta and print speckled phantom
+    # sky inside the shadow (verified against a Float64 Vern9 reference, which
+    # shows clean black where a=0.998 speckles). Whether a ray is captured is
+    # decided analytically at launch instead: E = −p_t and L_z = x·p_y − y·p_x
+    # are Killing charges, Carter's Q completes the set, and with λ = L_z/E,
+    # η = Q/E² the Boyer–Lindquist radial potential is the quartic
+    #     R(r)/E² = r⁴ + (a² − λ² − η) r² + 2M(η + (λ−a)²) r − a²η ,
+    # with (Σ dr/dλ)² = R. An ingoing ray is captured iff R has no root in
+    # (r₊, r_cam) — no turning point before the horizon. R(r₊) ≥ 0 and
+    # R(r_cam) ≥ 0 always, so it suffices to check R at the interior roots of
+    # R′ (a depressed cubic — R has no r³ term). The verdict only forces the
+    # ray's BACKGROUND to shadow; the geodesic still integrates, so gas and
+    # disc emission in front of the shadow are kept.
+    captured0 = false
+    if KERR && !LAYER && spin_a != 0.0f0
+        E0 = -p_t
+        if abs(E0) > 1.0f-6
+            a2b = spin_a * spin_a
+            awb = r * r - a2b
+            rk2b = 0.5f0 * (awb + sqrt(awb * awb + 4.0f0 * a2b * z * z))
+            rkb = sqrt(max(rk2b, 1.0f-12))
+            cthb = z / rkb
+            s2b = max(1.0f0 - cthb * cthb, 1.0f-8)
+            sthb = sqrt(s2b)
+            Lz0 = x * py - y * px
+            pthb = (cthb / sthb) * (x * px + y * py) - rkb * sthb * pz
+            Q0 = pthb * pthb + cthb * cthb * (Lz0 * Lz0 / s2b - a2b * E0 * E0)
+            lam = Lz0 / E0
+            eta = Q0 / (E0 * E0)
+            c2b = a2b - lam * lam - eta
+            c1b = 2.0f0 * M * (eta + (lam - spin_a) * (lam - spin_a))
+            c0b = -a2b * eta
+            rplus = M + sqrt(max(M * M - a2b, 0.0f0))
+            # Ingoing in KS r? dr/dλ ∝ r²(x·ẋ + y·ẏ) + (r²+a²)·z·ż.
+            vx0, vy0, vz0, _dq1, _dq2, _dq3 =
+                kerr_rhs_mtl(x, y, z, px, py, pz, p_t, M, spin_a)
+            rdot = rk2b * (x * vx0 + y * vy0) + (rk2b + a2b) * z * vz0
+            if rdot < 0.0f0
+                # Interior critical points of R: roots of r³ + pb·r + qb.
+                pb = 0.5f0 * c2b
+                qb = 0.25f0 * c1b
+                Db = 0.25f0 * qb * qb + pb * pb * pb / 27.0f0
+                cap = true
+                if Db >= 0.0f0
+                    sD = sqrt(Db)
+                    u1 = -0.5f0 * qb + sD
+                    u2 = -0.5f0 * qb - sD
+                    rc = sign(u1) * exp(log(max(abs(u1), 1.0f-30)) / 3.0f0) +
+                         sign(u2) * exp(log(max(abs(u2), 1.0f-30)) / 3.0f0)
+                    if rc > rplus && rc < rkb
+                        Rv = ((rc * rc + c2b) * rc + c1b) * rc + c0b
+                        cap = Rv > 0.0f0
+                    end
+                else
+                    mb = 2.0f0 * sqrt(-pb / 3.0f0)
+                    ac = clamp(3.0f0 * qb / (pb * mb), -1.0f0, 1.0f0)
+                    θb = acos(ac) / 3.0f0
+                    for kk in 0:2
+                        rc = mb * cos(θb - 2.0943951f0 * Float32(kk))
+                        if rc > rplus && rc < rkb
+                            Rv = ((rc * rc + c2b) * rc + c1b) * rc + c0b
+                            if Rv <= 0.0f0
+                                cap = false
+                            end
+                        end
+                    end
+                end
+                captured0 = cap
+            end
+        end
+    end
+
     # Layered mode: this pass renders only the disc/gas layer (premultiplied
     # RGB + transmittance in a 4-channel `out`; the sky is composited later
     # from the exact deflection fan). A pixel whose geodesic provably stays
@@ -1379,7 +1456,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
         # transmittance to the sky (7), escape flag (8).
         rfb = max(sqrt(x * x + y * y + z * z), 1.0f-6)
         escf = 0.0f0
-        if hit_horizon || rfb < 4.0f0 * M
+        if hit_horizon || captured0 || rfb < 4.0f0 * M
             out[1, i, j] = 0.0f0; out[2, i, j] = 0.0f0; out[3, i, j] = 0.0f0
         else
             escf = 1.0f0
@@ -1415,9 +1492,11 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     end
 
     # Rays that ran out of steps while still deep in the strong field are
-    # (near-)critical or horizon-hugging: treat them as black too.
+    # (near-)critical or horizon-hugging: treat them as black too, as are
+    # rays the Bardeen launch test proved captured regardless of where the
+    # Float32 integration wandered.
     rf = max(sqrt(x * x + y * y + z * z), 1.0f-6)
-    if hit_horizon || rf < 4.0f0 * M
+    if hit_horizon || captured0 || rf < 4.0f0 * M
         if NB == 0   # bucketed emission was already written during the march
             out[1, i, j] += weight * acc_r
             out[2, i, j] += weight * acc_g
