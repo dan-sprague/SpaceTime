@@ -885,6 +885,20 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     scam = spacetime_params[4] > 0.5f0 ?
            1.0f0 / clamp(abs(p_t), 0.05f0, 20.0f0) : 1.0f0
 
+    # Kerr disc shading: the ray's impact parameter λ = L_z/E, conserved along
+    # the geodesic (both are Killing charges), drives the exact circular-orbit
+    # Doppler factor 1/g = u^t (1 − Ω λ) in the disc/gas blocks below —
+    # replacing the Schwarzschild static-observer split (local boost ×
+    # gravitational redshift), which has no spin dependence. Invariant under
+    # the backward-ray sign flip (E and L_z negate together).
+    lam_ray = 0.0f0
+    if KERR
+        Ek0 = -p_t
+        if abs(Ek0) > 1.0f-6
+            lam_ray = (x * py - y * px) / Ek0
+        end
+    end
+
     # Bardeen launch-time capture test (Kerr only). The runtime kill radius is
     # a single sphere (the prograde photon orbit), but the unstable photon
     # orbits of a spinning hole fill a SHELL — prograde equatorial through
@@ -1338,20 +1352,39 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                                 R = s_cyl / (2.0f0 * M)
                                 T_emit = exp(10.034259f0 -
                                              0.375f0 * log(max(R * R, 1.0f-6)))
-                                v_mag = clamp(0.70710678f0 /
-                                              sqrt(max(R - 1.0f0, 0.1f0)),
-                                              0.0f0, 0.999f0)
-                                # Keplerian flow ϕ̂ = (−y, x, 0)/s against the
-                                # photon coordinate velocity k1[1:3].
-                                vdotn = v_mag * (-sy * k1[1] + sx * k1[2]) /
-                                        (s_cyl * vlen)
-                                gam = 1.0f0 / sqrt(1.0f0 -
-                                          clamp(v_mag * v_mag, 0.0f0, 0.99f0))
-                                Rs = sqrt(sx * sx + sy * sy + sz * sz) /
-                                     (2.0f0 * M)
-                                opzg = 1.0f0 / sqrt(max(1.0f0 -
-                                           1.0f0 / max(Rs, 1.0f0), 0.01f0))
-                                opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
+                                opz = 0.1f0
+                                if KERR
+                                    # Exact prograde circular-orbit shift:
+                                    # 1/g = u^t (1 − Ω λ), spin-aware — see
+                                    # the lam_ray block at ray setup.
+                                    sqM = sqrt(M)
+                                    s32 = s_cyl * sqrt(s_cyl)
+                                    Ωk = sqM / (s32 + spin_a * sqM)
+                                    den = s32 - 3.0f0 * M * sqrt(s_cyl) +
+                                          2.0f0 * spin_a * sqM
+                                    ut = (s32 + spin_a * sqM) /
+                                         (sqrt(s32) * sqrt(max(den, 1.0f-2)))
+                                    opz = clamp(ut * (1.0f0 - Ωk * lam_ray),
+                                                0.1f0, 20.0f0)
+                                else
+                                    v_mag = clamp(0.70710678f0 /
+                                                  sqrt(max(R - 1.0f0, 0.1f0)),
+                                                  0.0f0, 0.999f0)
+                                    # Keplerian flow ϕ̂ = (−y, x, 0)/s against
+                                    # the photon coordinate velocity k1[1:3].
+                                    vdotn = v_mag *
+                                            (-sy * k1[1] + sx * k1[2]) /
+                                            (s_cyl * vlen)
+                                    gam = 1.0f0 / sqrt(1.0f0 -
+                                              clamp(v_mag * v_mag,
+                                                    0.0f0, 0.99f0))
+                                    Rs = sqrt(sx * sx + sy * sy + sz * sz) /
+                                         (2.0f0 * M)
+                                    opzg = 1.0f0 / sqrt(max(1.0f0 -
+                                               1.0f0 / max(Rs, 1.0f0), 0.01f0))
+                                    opz = max(gam * (1.0f0 + vdotn) * opzg,
+                                              0.1f0)
+                                end
                                 T_obs = T_emit * scam / opz
                                 inten = 100.0f0 /
                                         (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
@@ -1418,12 +1451,27 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
 
                 R = s / (2.0f0 * M)
                 T_emit = exp(10.034259f0 - 0.375f0 * log(R * R))
-                v_mag = clamp(0.70710678f0 / sqrt(max(R - 1.0f0, 0.1f0)),
-                              0.0f0, 0.999f0)
-                vdotn = v_mag * (-yh * vx + xh * vy) / (s * plen)
-                gam = 1.0f0 / sqrt(1.0f0 - clamp(v_mag * v_mag, 0.0f0, 0.99f0))
-                opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(R, 1.0f0), 0.01f0))
-                opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
+                opz = 0.1f0
+                if KERR
+                    # Exact prograde circular-orbit shift, spin-aware — see
+                    # the lam_ray block at ray setup.
+                    sqM = sqrt(M)
+                    s32 = s * sqrt(s)
+                    Ωk = sqM / (s32 + spin_a * sqM)
+                    den = s32 - 3.0f0 * M * sqrt(s) + 2.0f0 * spin_a * sqM
+                    ut = (s32 + spin_a * sqM) /
+                         (sqrt(s32) * sqrt(max(den, 1.0f-2)))
+                    opz = clamp(ut * (1.0f0 - Ωk * lam_ray), 0.1f0, 20.0f0)
+                else
+                    v_mag = clamp(0.70710678f0 / sqrt(max(R - 1.0f0, 0.1f0)),
+                                  0.0f0, 0.999f0)
+                    vdotn = v_mag * (-yh * vx + xh * vy) / (s * plen)
+                    gam = 1.0f0 / sqrt(1.0f0 -
+                                       clamp(v_mag * v_mag, 0.0f0, 0.99f0))
+                    opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(R, 1.0f0),
+                                            0.01f0))
+                    opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
+                end
                 T_obs = T_emit * scam / opz
                 inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
 
