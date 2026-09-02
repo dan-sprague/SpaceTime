@@ -659,13 +659,17 @@ several short dispatches.
 function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                            star_params, cam_params,
                            spacetime_params, disc_params, fan, sky_params,
+                           stat,
                            width, height, nmax, dt, tol, jitter_u, jitter_v,
+                           jitter_w, jitter_seed,
                            weight, row0, rows, col0, cols,
                            substride, subx, suby,
                            ring_rmin,
                            ::Val{VOL}, ::Val{NB},
                            ::Val{LAYER}, ::Val{ORD},
-                           ::Val{KERR}, ::Val{BAKE}) where {VOL, NB, LAYER, ORD, KERR, BAKE}
+                           ::Val{KERR}, ::Val{BAKE},
+                           ::Val{STAT}) where {VOL, NB, LAYER, ORD, KERR,
+                                               BAKE, STAT}
     idx = thread_position_in_grid().x
     total = cols * rows
     if idx > total
@@ -759,9 +763,22 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
 
     # Sensor coordinate with subpixel jitter (fw/fh: full sensor size, which
     # differs from the dispatch size only in a LAYER sub-grid pass).
+    # `jitter_w > 0` decorrelates the jitter per pixel: (jitter_u, jitter_v)
+    # is then this pass's stratum ORIGIN and each pixel hashes its own point
+    # inside the stratum — same construction as the lens strata below. With a
+    # pass-wide sample point, every pixel shares one sub-pixel phase, and
+    # image content finer than a pixel (the wound-image stacks of a spinning
+    # hole) aliases into coherent moiré rings instead of averaging to noise.
+    ju_px = jitter_u
+    jv_px = jitter_v
+    if jitter_w > 0.0f0
+        sdj = unsafe_trunc(Int32, jitter_seed)
+        ju_px += _sim_hash(Int32(i), Int32(j), sdj) * jitter_w
+        jv_px += _sim_hash(Int32(i), Int32(j), sdj + Int32(271)) * jitter_w
+    end
     half_h = Float32(fh) / 2.0f0
-    u = (Float32(i) - 1.0f0 + jitter_u - Float32(fw) / 2.0f0) / half_h
-    v = (Float32(j) - 1.0f0 + jitter_v - Float32(fh) / 2.0f0) / half_h
+    u = (Float32(i) - 1.0f0 + ju_px - Float32(fw) / 2.0f0) / half_h
+    v = (Float32(j) - 1.0f0 + jv_px - Float32(fh) / 2.0f0) / half_h
 
     # Thin-lens aperture offset, per-pixel stratified: cam_params[26] is the
     # lens stratum width (0 = pinhole), [23:24] this pass's stratum origin in
@@ -887,6 +904,11 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     # ray's BACKGROUND to shadow; the geodesic still integrates, so gas and
     # disc emission in front of the shadow are kept.
     captured0 = false
+    # `graze0` marks rays whose radial potential comes CLOSE to a turning
+    # point without having one — near-critical rays that wind deeply and
+    # escape. Their image is violently compressed and chaotic, so the pixels
+    # they land in are where adaptive refinement spends its extra rays.
+    graze0 = false
     if KERR && !LAYER && spin_a != 0.0f0
         E0 = -p_t
         if abs(E0) > 1.0f-6
@@ -925,6 +947,9 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                     if rc > rplus && rc < rkb
                         Rv = ((rc * rc + c2b) * rc + c1b) * rc + c0b
                         cap = Rv > 0.0f0
+                        if abs(Rv) < 0.08f0 * max(rc * rc * rc * rc, 1.0f0)
+                            graze0 = true
+                        end
                     end
                 else
                     mb = 2.0f0 * sqrt(-pb / 3.0f0)
@@ -936,6 +961,9 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                             Rv = ((rc * rc + c2b) * rc + c1b) * rc + c0b
                             if Rv <= 0.0f0
                                 cap = false
+                            end
+                            if abs(Rv) < 0.08f0 * max(rc * rc * rc * rc, 1.0f0)
+                                graze0 = true
                             end
                         end
                     end
@@ -1501,6 +1529,16 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
             out[1, i, j] += weight * acc_r
             out[2, i, j] += weight * acc_g
             out[3, i, j] += weight * acc_b
+            if STAT
+                # Per-pass luminance moments + graze fraction, for adaptive
+                # refinement: channel 1 Σw·L, channel 2 Σw·L², channel 3
+                # Σw·graze. Weights sum to 1 over the base passes, so
+                # (ch2 − ch1²) estimates the per-RAY variance.
+                Ls = 0.2126f0 * acc_r + 0.7152f0 * acc_g + 0.0722f0 * acc_b
+                stat[1, i, j] += weight * Ls
+                stat[2, i, j] += weight * Ls * Ls
+                graze0 && (stat[3, i, j] += weight)
+            end
         end
     else
         # Escaped rays show the background sky attenuated by any disc gas
@@ -1547,6 +1585,14 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
             out[1, i, j] += weight * (acc_r + alpha * r_col)
             out[2, i, j] += weight * (acc_g + alpha * g_col)
             out[3, i, j] += weight * (acc_b + alpha * b_col)
+            if STAT
+                Ls = 0.2126f0 * (acc_r + alpha * r_col) +
+                     0.7152f0 * (acc_g + alpha * g_col) +
+                     0.0722f0 * (acc_b + alpha * b_col)
+                stat[1, i, j] += weight * Ls
+                stat[2, i, j] += weight * Ls * Ls
+                graze0 && (stat[3, i, j] += weight)
+            end
         end
     end
 
@@ -1736,22 +1782,27 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
                         substride::Int=1, subx::Int=0, suby::Int=0,
                         ring_rmin::Real=0.0, col0::Int=0, cols::Int=-1,
                         order::Int=4, tol::Real=1.0f-4,
-                        kerr::Bool=false, bake::Bool=false)
+                        kerr::Bool=false, bake::Bool=false,
+                        stat=nothing, jw::Real=0.0, jseed::Integer=0)
     cols < 0 && (cols = width)
     von = ctx.vol_on[]
     fan_b = fan === nothing ? _dummy_fan() : fan
     skyp_b = sky_params === nothing ? _dummy_skyp() : sky_params
+    stat_on = stat !== nothing
+    stat_b = stat_on ? stat : _dummy_stat()
     kernels = ctx.kernel[]::Dict{Any,Any}
-    key = (von, nb, layer, order, kerr, bake)
+    key = (von, nb, layer, order, kerr, bake, stat_on)
     if !haskey(kernels, key)
         kernels[key] = @metal launch=false trace_kernel_mtl!(
             out, ctx.bg_gpu, ctx.bb_lut, ctx.star_lut, ctx.vol_gpu,
             ctx.vol_params,
             ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
-            fan_b, skyp_b,
-            width, height, nmax, dt, Float32(tol), ju, jv, weight, row0, rows,
+            fan_b, skyp_b, stat_b,
+            width, height, nmax, dt, Float32(tol), ju, jv,
+            Float32(jw), Float32(jseed), weight, row0, rows,
             col0, cols, substride, subx, suby, Float32(ring_rmin),
-            Val(von), Val(nb), Val(layer), Val(order), Val(kerr), Val(bake))
+            Val(von), Val(nb), Val(layer), Val(order), Val(kerr), Val(bake),
+            Val(stat_on))
     end
     kernel = kernels[key]
     n = cols * rows
@@ -1760,10 +1811,12 @@ function _launch_trace!(ctx::MetalPreviewContext, out, cam_params,
     kernel(out, ctx.bg_gpu, ctx.bb_lut, ctx.star_lut, ctx.vol_gpu,
            ctx.vol_params,
            ctx.star_params, cam_params, spacetime_params, ctx.disc_params,
-           fan_b, skyp_b,
-           width, height, nmax, dt, Float32(tol), ju, jv, weight, row0, rows,
+           fan_b, skyp_b, stat_b,
+           width, height, nmax, dt, Float32(tol), ju, jv,
+           Float32(jw), Float32(jseed), weight, row0, rows,
            col0, cols, substride, subx, suby, Float32(ring_rmin),
-           Val(von), Val(nb), Val(layer), Val(order), Val(kerr), Val(bake);
+           Val(von), Val(nb), Val(layer), Val(order), Val(kerr), Val(bake),
+           Val(stat_on);
            threads=threads, groups=groups)
     return nothing
 end
@@ -1859,6 +1912,18 @@ the nominal (shutter-centre) pose.
 `camera_at` has the same signature here as in [`render_motion`](@ref), so one
 motion path drives either renderer. It used to return `(Camera, beta)` on the
 GPU and a bare `Camera` on the CPU; velocity now lives on the camera itself.
+
+Adaptive refinement: `refine=n` (n > 1) renders the base `samples²` passes
+while accumulating per-pixel luminance variance and the fraction of rays that
+graze the Kerr photon shell (from the Bardeen launch quantities), then
+re-renders the flagged region's bounding box `n−1` more times with fresh
+strata — flagged pixels get `n×` the rays. Aimed at the wound-image bands of
+a spinning hole, whose spatial frequency is unbounded and starves uniform
+sampling. `refine_var` is the relative per-ray σ threshold, `refine_graze`
+the graze-fraction threshold, `refine_margin` the box margin in pixels.
+Sub-pixel jitter is decorrelated per pixel by default (`pixel_jitter=true`),
+turning the moiré such content aliases into during uniform passes into noise
+that averages away; `false` restores the legacy pass-wide jitter point.
 """
 function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           spacetime::AbstractSpacetime;
@@ -1870,7 +1935,10 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
                           aperture_world::Real=0.0, focus_dist::Real=1.0,
                           relativistic::Bool=false,
                           camera_at::Union{Function,Nothing}=nothing,
-                          per_pixel_shutter::Bool=false)
+                          per_pixel_shutter::Bool=false,
+                          refine::Int=1, refine_var::Real=0.35,
+                          refine_graze::Real=0.05, refine_margin::Int=8,
+                          pixel_jitter::Bool=true)
     dt32 = Float32(dt)
     M = Float32(spacetime.M)
     r_band = Float32(2.05 * spacetime.M)
@@ -1908,9 +1976,29 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     ntiles = cld(height, rows_per_tile)
 
     weight = Float32(1.0 / samples^2)
-    offsets = jittered_grid(samples; rng=rng)
-    ndispatch = length(offsets) * ntiles
+    # Sub-pixel strata. With `pixel_jitter` each pass carries its stratum
+    # ORIGIN and width to the kernel and every pixel hashes its own point
+    # inside it — phase-decorrelated across pixels, so content finer than a
+    # pixel (wound-image stacks near a spinning hole) averages to noise
+    # instead of aliasing into moiré rings. `pixel_jitter=false` restores the
+    # legacy pass-wide jittered point.
+    jw = pixel_jitter ? Float32(1.0 / samples) : 0.0f0
+    offsets = pixel_jitter ?
+        Random.shuffle!(rng, vec([(Float32(a / samples), Float32(b / samples))
+                                  for a in 0:(samples - 1), b in 0:(samples - 1)])) :
+        jittered_grid(samples; rng=rng)
+    ndispatch = length(offsets) * ntiles * max(refine, 1)
     done = 0
+    # Adaptive refinement (refine > 1): the base passes also accumulate
+    # per-pixel luminance moments and the Bardeen graze fraction into `stat`;
+    # afterwards the flagged region re-renders with (refine−1) more blocks of
+    # samples² passes and the sums renormalise by 1/refine. No interpolation
+    # anywhere — flagged pixels just get refine× the rays.
+    stat = nothing
+    if refine > 1
+        stat = MtlArray{Float32,3}(undef, 3, width, height)
+        fill!(stat, 0.0f0)
+    end
     # Depth of field: each pass owns one aperture stratum (shuffled so lens
     # strata pair randomly with the pixel-jitter strata) and every pixel
     # hashes its own point inside it — see the kernel's stratified-lens block.
@@ -1922,50 +2010,118 @@ function render_draft_mtl(ctx::MetalPreviewContext, cam::Camera,
     # each pixel picks its own instant between them; see the measured trade in
     # the kernel's per-pixel-shutter block.
     time_perm = Random.randperm(rng, samples^2)
-    for (pass, (du, dv)) in enumerate(offsets)
-        if camera_at !== nothing
-            m = time_perm[pass] - 1
-            if per_pixel_shutter
-                base_params = _ks_cam_params(camera_at(m / samples^2), spacetime.M;
-                                             fisheye_deg=fisheye_deg,
-                                             focus_dist=focus_dist)
-                endp = _ks_cam_params(camera_at((m + 1) / samples^2), spacetime.M;
-                                      fisheye_deg=fisheye_deg,
-                                      focus_dist=focus_dist)
-                # Seed kept clear of the lens hashes (which use `pass` and
-                # `pass + 7919`), so time and aperture decorrelate per pixel.
-                base_params[29] = Float32(104729 + pass)
-                base_params[30:(29 + CAM_POSE_N)] .= @view endp[1:CAM_POSE_N]
-            else
-                base_params = _ks_cam_params(camera_at((m + 0.5) / samples^2),
-                                             spacetime.M;
-                                             fisheye_deg=fisheye_deg,
-                                             focus_dist=focus_dist)
+    # One block = samples² passes over a row/col rectangle. The base render is
+    # one full-frame block; each refinement block re-runs the flagged
+    # rectangle with freshly drawn pixel/lens/time strata. `pass` stays
+    # globally unique so every per-pixel hash seed differs across blocks.
+    pass_base = Ref(0)
+    run_block! = function (row_a::Int, nrows_blk::Int, col_a::Int,
+                           ncols_blk::Int, stat_blk)
+        rpt = clamp(ceil(Int, 2.0e9 / (max(ncols_blk, 1) * nmax)), 16,
+                    max(nrows_blk, 16))
+        ntiles_blk = cld(nrows_blk, rpt)
+        for (p, (du, dv)) in enumerate(offsets)
+            pass = pass_base[] + p
+            if camera_at !== nothing
+                m = time_perm[p] - 1
+                if per_pixel_shutter
+                    base_params = _ks_cam_params(camera_at(m / samples^2), spacetime.M;
+                                                 fisheye_deg=fisheye_deg,
+                                                 focus_dist=focus_dist)
+                    endp = _ks_cam_params(camera_at((m + 1) / samples^2), spacetime.M;
+                                          fisheye_deg=fisheye_deg,
+                                          focus_dist=focus_dist)
+                    # Seed kept clear of the lens hashes (which use `pass` and
+                    # `pass + 7919`), so time and aperture decorrelate per pixel.
+                    base_params[29] = Float32(104729 + pass)
+                    base_params[30:(29 + CAM_POSE_N)] .= @view endp[1:CAM_POSE_N]
+                else
+                    base_params = _ks_cam_params(camera_at((m + 0.5) / samples^2),
+                                                 spacetime.M;
+                                                 fisheye_deg=fisheye_deg,
+                                                 focus_dist=focus_dist)
+                end
+            end
+            if use_dof
+                m = lens_perm[p] - 1
+                base_params[23] = Float32((m ÷ samples) / samples)
+                base_params[24] = Float32((m % samples) / samples)
+                base_params[26] = Float32(1.0 / samples)
+                base_params[27] = Float32(aperture_world / 2.0)
+                base_params[28] = Float32(pass)
+            end
+            (use_dof || camera_at !== nothing) && copyto!(cam_params, base_params)
+            for t in 0:(ntiles_blk - 1)
+                row0 = row_a + t * rpt
+                rows = min(rpt, row_a + nrows_blk - row0)
+                _launch_trace!(ctx, out, cam_params, spacetime_params,
+                               width, height, nmax, dt32,
+                               Float32(du), Float32(dv), weight, row0, rows;
+                               kerr=is_kerr, col0=col_a, cols=ncols_blk,
+                               stat=stat_blk, jw=jw,
+                               jseed=15485863 + pass)
+                Metal.synchronize()
+                done += 1
+                isnothing(progress) || progress(min(done / ndispatch, 1.0))
             end
         end
-        if use_dof
-            m = lens_perm[pass] - 1
-            base_params[23] = Float32((m ÷ samples) / samples)
-            base_params[24] = Float32((m % samples) / samples)
-            base_params[26] = Float32(1.0 / samples)
-            base_params[27] = Float32(aperture_world / 2.0)
-            base_params[28] = Float32(pass)
+        pass_base[] += length(offsets)
+        return nothing
+    end
+
+    run_block!(0, height, 0, width, stat)
+
+    # Refinement: flag pixels by per-ray luminance variance (relative to a
+    # luminance floor) or by the Bardeen graze fraction, take the flagged
+    # bounding box with a margin, and re-render it (refine−1) more times.
+    # Every pixel in the box then holds refine× the weight and renormalises
+    # after download — more honest rays, no interpolation, no reweighting of
+    # neighbours.
+    box = nothing
+    if refine > 1 && stat !== nothing
+        s_h = Array(stat)
+        imin, imax, jmin, jmax = width + 1, 0, height + 1, 0
+        @inbounds for jj in 1:height, ii in 1:width
+            m1 = s_h[1, ii, jj]
+            σ2 = s_h[2, ii, jj] - m1 * m1
+            fl = (σ2 > 0.0f0 &&
+                  sqrt(σ2) > refine_var * (m1 + 0.01f0)) ||
+                 s_h[3, ii, jj] > refine_graze
+            if fl
+                imin = min(imin, ii); imax = max(imax, ii)
+                jmin = min(jmin, jj); jmax = max(jmax, jj)
+            end
         end
-        (use_dof || camera_at !== nothing) && copyto!(cam_params, base_params)
-        for t in 0:(ntiles - 1)
-            row0 = t * rows_per_tile
-            rows = min(rows_per_tile, height - row0)
-            _launch_trace!(ctx, out, cam_params, spacetime_params,
-                           width, height, nmax, dt32,
-                           Float32(du), Float32(dv), weight, row0, rows;
-                           kerr=is_kerr)
-            Metal.synchronize()
-            done += 1
-            isnothing(progress) || progress(done / ndispatch)
+        if imax > 0
+            c_a = max(imin - refine_margin, 1) - 1
+            ncols_r = min(imax + refine_margin, width) - c_a
+            r_a = max(jmin - refine_margin, 1) - 1
+            nrows_r = min(jmax + refine_margin, height) - r_a
+            for _ in 2:refine
+                offsets = pixel_jitter ?
+                    Random.shuffle!(rng,
+                        vec([(Float32(a / samples), Float32(b / samples))
+                             for a in 0:(samples - 1), b in 0:(samples - 1)])) :
+                    jittered_grid(samples; rng=rng)
+                lens_perm = Random.randperm(rng, samples^2)
+                time_perm = Random.randperm(rng, samples^2)
+                run_block!(r_a, nrows_r, c_a, ncols_r, nothing)
+            end
+            box = (c_a, ncols_r, r_a, nrows_r)
         end
     end
 
-    return _download_rgb(out, width, height)
+    img = _download_rgb(out, width, height)
+    if box !== nothing
+        c_a, ncols_r, r_a, nrows_r = box
+        s = 1.0f0 / Float32(refine)
+        @inbounds for jj in (r_a + 1):(r_a + nrows_r),
+                      ii in (c_a + 1):(c_a + ncols_r)
+            c = img[ii, jj]
+            img[ii, jj] = RGBf(c.r * s, c.g * s, c.b * s)
+        end
+    end
+    return img
 end
 
 function render_draft_mtl(ctx::MetalPreviewContext, cam::ThinLensCamera,
@@ -2667,10 +2823,13 @@ const _FAN_BAND_KERNEL = Ref{Any}(nothing)
 const _COMPOSITE_KERNEL = Dict{Any,Any}()
 const _DUMMY_FAN = Ref{Any}(nothing)
 const _DUMMY_SKYP = Ref{Any}(nothing)
+const _DUMMY_STAT = Ref{Any}(nothing)
 _dummy_fan() = _DUMMY_FAN[] === nothing ?
     (_DUMMY_FAN[] = MtlArray(zeros(Float32, 4, 2))) : _DUMMY_FAN[]
 _dummy_skyp() = _DUMMY_SKYP[] === nothing ?
     (_DUMMY_SKYP[] = MtlArray(zeros(Float32, 8))) : _DUMMY_SKYP[]
+_dummy_stat() = _DUMMY_STAT[] === nothing ?
+    (_DUMMY_STAT[] = MtlArray(zeros(Float32, 3, 1, 1))) : _DUMMY_STAT[]
 
 """
     SkyFanState(pos, M; n=4096)
