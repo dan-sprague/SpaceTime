@@ -71,18 +71,18 @@ constant radius.*
 
 ```julia
 using SpaceTime, StaticArrays, FileIO
+using Images: clamp01nan
 
 bh  = Schwarzschild(1.0)
 cam = Camera(SVector(0.0, -30.0, 3.0), SVector(0.0, 0.0, 0.0), SVector(0.0, 0.0, 1.0), Lens(24.0))
 sky = load("assets/starmap_g4k.jpg")     # or any equirectangular image
 disc = AccretionDisc(inner_radius = 3.0, outer_radius = 20.0)
 
-img = render(cam, bh, sky; disc = disc, width = 640, height = 360)
-save("hole.png", rotr90(img))    # images are [width, height]; rotate for display
+img = render(cam, bh, sky; disc = disc, width = 640, height = 360)   # linear HDR, [width, height]
+save("hole.png", map(clamp01nan, rotr90(img)))   # or grade it first: apply_look!(img, LOOK_FILM)
 ```
 
-(Loading a JPEG needs an image codec such as `ImageIO` or `Images` in the
-environment, which the `examples` environment below provides.)
+(`Images` supplies the JPEG/PNG codecs; the `examples` environment below has it.)
 
 The example and video scripts live in `examples/` with their own environment
 (the package itself only depends on what rendering needs):

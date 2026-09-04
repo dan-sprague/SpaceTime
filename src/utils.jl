@@ -15,6 +15,9 @@ function compare_hamiltonian_drift end
 Record an animation of traced [`WorldLine`](@ref)s (from [`raytrace`](@ref) or
 [`trace_fan`](@ref)) bending around the hole. Needs a Makie backend loaded
 (`using CairoMakie`): the method lives in the `SpaceTimeMakieExt` extension.
+
+Note that Makie also exports a `Camera`; with both packages loaded, write
+`SpaceTime.Camera` for the black-hole camera.
 """
 function visualize_solution end
 
