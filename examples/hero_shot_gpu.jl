@@ -18,9 +18,9 @@
 # direction survives the blur.
 #
 # Full-quality 4K render (~5 min on an M3-class GPU):
-#     julia -t auto,1 --project examples/hero_shot_gpu.jl
+#     julia -t auto,1 --project=examples examples/hero_shot_gpu.jl
 # Fast low-res iteration pass:
-#     HERO_LOWRES=1 julia -t auto,1 --project examples/hero_shot_gpu.jl
+#     HERO_LOWRES=1 julia -t auto,1 --project=examples examples/hero_shot_gpu.jl
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))

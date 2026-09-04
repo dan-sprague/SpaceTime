@@ -1,6 +1,6 @@
 # "Ship-cam" documentary orbit: realistic 21-degree sweep over 30 s, thin lens
 # (33mm f/5.6), OU mount jitter, lens dust, micro-streak events.
-# Run from the repo root with:  julia -t auto,1 --project examples/videos/render_documentary.jl
+# Run from the repo root with:  julia -t auto,1 --project=examples examples/videos/render_documentary.jl
 #
 # Env vars:
 #   RES=proxy|final|4k  proxy = 640x360 (default, ~40 min), final = 1920x1080

@@ -9,9 +9,9 @@
 #   focal 10mm · pinhole (no thin lens) · volumetric disc ON
 #
 # Full-quality 4K render:
-#     julia -t auto --project examples/disc_skim.jl
+#     julia -t auto --project=examples examples/disc_skim.jl
 # Fast low-res iteration pass:
-#     SKIM_LOWRES=1 julia -t auto --project examples/disc_skim.jl
+#     SKIM_LOWRES=1 julia -t auto --project=examples examples/disc_skim.jl
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))

@@ -1,5 +1,6 @@
 .*
 !.gitignore
+!.github/
 renders/
 *.mp4
 *.png
@@ -10,4 +11,6 @@ renders/
 *.tiff.toml
 !assets/starmap_g4k.jpg
 !docs/assets/*.jpg
+Manifest.toml
+examples/Manifest.toml
 build/

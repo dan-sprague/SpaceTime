@@ -13,7 +13,7 @@
 # events fire on a dozen scattered frames.
 #
 # Run from the repo root:
-#   julia -t auto,1 --project examples/videos/render_focus_pull.jl
+#   julia -t auto,1 --project=examples examples/videos/render_focus_pull.jl
 #
 # Env vars:
 #   RES=proxy|final|4k  proxy = 640x360 (default), final = 1920x1080,

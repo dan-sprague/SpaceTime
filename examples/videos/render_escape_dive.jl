@@ -3,7 +3,7 @@
 # black (website intro cut). Rendered WITH observer-frame relativity: the
 # camera tetrad is boosted by the ship's velocity along the path, giving
 # aberration, motion Doppler, and beaming for disc and sky alike.
-# Run from the repo root:  julia -t auto,1 --project examples/videos/render_escape_dive.jl
+# Run from the repo root:  julia -t auto,1 --project=examples examples/videos/render_escape_dive.jl
 #
 # Env vars: RES=proxy|final, SAVE_TIFF=1|0, SAMPLES (default 2),
 #           NFRAMES (default 900), OUT (mp4 path), T_M (video length in units

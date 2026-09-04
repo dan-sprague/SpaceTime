@@ -26,7 +26,7 @@
 # settling to hand tremor) shakes only the camera basis.
 #
 # Run from the repo root:
-#   julia -t auto,1 --project examples/videos/render_dive_escape.jl
+#   julia -t auto,1 --project=examples examples/videos/render_dive_escape.jl
 #
 # Env vars:
 #   RES=120|proxy|final|4k  214x120 (default: motion preview, ~0.5 s/frame),

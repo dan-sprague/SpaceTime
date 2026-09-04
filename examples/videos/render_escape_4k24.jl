@@ -6,7 +6,7 @@
 # rectilinear tail, static gas, and no TIFF masters — grading is approved from
 # a uniformly sampled contact sheet instead (APPROVE=20).
 # Run from the repo root with:
-#   julia -t auto,1 --project examples/videos/render_escape_4k24.jl
+#   julia -t auto,1 --project=examples examples/videos/render_escape_4k24.jl
 #
 # The lens: the porthole demands fisheye (100 deg > any rectilinear FOV), the
 # hero landing is a 33mm rectilinear prime. Between t=0.50 and the turnaround

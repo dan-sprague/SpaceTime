@@ -3,9 +3,9 @@
 # bloom and streaks.
 #
 # Full-quality 4K render (expect this to take a while):
-#     julia -t auto --project examples/hero_shot.jl
+#     julia -t auto --project=examples examples/hero_shot.jl
 # Fast low-res iteration pass:
-#     HERO_LOWRES=1 julia -t auto --project examples/hero_shot.jl
+#     HERO_LOWRES=1 julia -t auto --project=examples examples/hero_shot.jl
 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))

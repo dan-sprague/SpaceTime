@@ -1,5 +1,5 @@
 """
-    Metal GPU backend for the interactive viewfinder.
+    Metal GPU backend: the Kerr–Schild ray tracer on the Apple GPU.
 
 This file implements a pure-Metal compute kernel that runs the same fixed-step
 RK4 preview integrator as `render_preview`, but on the Apple GPU.  The kernel is

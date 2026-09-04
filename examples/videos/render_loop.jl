@@ -1,7 +1,7 @@
 # Website background loop: 8 s seamless orbit hold at the hero composition,
 # live fluid disc at 2.5x time-lapse, loop-exact sinusoidal drift/jitter, and a
 # 1 s crossfade of the tail into the head so the (non-periodic) turbulence wraps.
-# Run from the repo root with:  julia -t auto,1 --project examples/videos/render_loop.jl
+# Run from the repo root with:  julia -t auto,1 --project=examples examples/videos/render_loop.jl
 #
 # Env vars:
 #   RES=proxy|final   proxy = 640x360 (default, ~40 min), final = 1920x1080 (~1.7 h)

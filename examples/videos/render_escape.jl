@@ -1,5 +1,5 @@
 # Porthole escape: r=2.5M porthole -> fly out -> turn back through the disc.
-# Run from the repo root with:  julia -t auto,1 --project examples/videos/render_escape.jl
+# Run from the repo root with:  julia -t auto,1 --project=examples examples/videos/render_escape.jl
 #
 # Env vars:
 #   RES=proxy|final   proxy = 640x360 (default, ~8 min), final = 1920x1080 (~70 min)

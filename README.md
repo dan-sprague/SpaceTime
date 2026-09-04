@@ -9,15 +9,17 @@ sphere, or falling through the horizon — and photograph what is actually there
 SpaceTime.jl is two things at once:
 
 - **An educational resource.** Every image is the numerical solution of the
-  null geodesic equation in a Schwarzschild spacetime — no fakery, no
+  null geodesic equation in a Schwarzschild or Kerr spacetime — no fakery, no
   precomputed distortion maps. The code is written to be read alongside a GR
   textbook (Hartle's *Gravity* pairs well), and the test suite doubles as a
   set of executable physics statements: tetrad orthonormality, exact
   relativistic Doppler factors, the 3√3 M shadow.
-- **A tech demo.** A real-time GPU preview on Apple silicon (Metal), an
-  interactive viewfinder and flight simulator (GLMakie), a physical
-  camera/lens/sensor pipeline, a live fluid simulation on the disc, and
-  production-quality offline rendering with linear HDR masters for grading.
+- **A rendering library.** A GPU ray tracer on Apple silicon (Metal) and a
+  platform-independent CPU reference, a physical camera/lens/sensor pipeline,
+  a fluid simulation on the disc, and production-quality offline rendering
+  with linear HDR masters for grading. Shots are composed in the companion
+  real-time app, [SpaceTimeMetal](https://github.com/dan-sprague/SpaceTimeMetal)
+  (Rust + Metal), and rendered here.
 
 ## Gallery
 
@@ -47,8 +49,8 @@ constant radius.*
   tetrad is Lorentz-boosted: aberration crowds the sky forward, the forward
   view blueshifts and beams (g⁴), the rear view dims toward black. Every
   black-hole video you've seen is falling; this one is flying.
-- **A camera with mass** — in the flight simulator the camera rides a
-  timelike worldline integrated with the same geodesic equations as the
+- **A camera with mass** — the camera can ride a timelike worldline
+  (`ShipState`, `Track`) integrated with the same geodesic equations as the
   light: engines off is exact free fall (orbits, plunges, accelerometer at
   zero), thrust is proper acceleration in the ship's own frame, and the
   ship's velocity feeds the boosted tetrad, so aberration and Doppler build
@@ -60,33 +62,40 @@ constant radius.*
 ## Requirements
 
 - Julia ≥ 1.10.
-- **Apple silicon** for everything interactive and fast (the GPU renderer is
-  Metal). The CPU renderer (DifferentialEquations.jl, Tsit5 on the geodesic
-  Hamiltonian) is platform-independent and serves as the high-fidelity
-  reference implementation.
+- **Apple silicon** for the fast path (the GPU renderer is Metal). The CPU
+  renderer (DifferentialEquations.jl, Tsit5 on the geodesic Hamiltonian) is
+  platform-independent and serves as the high-fidelity reference
+  implementation.
 
 ## Quick start
 
-```bash
-git clone <this repo>
-cd SpaceTime
-julia --project -e 'using Pkg; Pkg.instantiate()'
+```julia
+using SpaceTime, StaticArrays, FileIO
 
-# Interactive viewfinder: compose a photograph, then render it
-julia -t auto,1 --project examples/viewfinder_demo.jl
+bh  = Schwarzschild(1.0)
+cam = Camera(SVector(0.0, -30.0, 3.0), SVector(0.0, 0.0, 0.0), SVector(0.0, 0.0, 1.0), Lens(24.0))
+sky = load("assets/starmap_g4k.jpg")     # or any equirectangular image
+disc = AccretionDisc(inner_radius = 3.0, outer_radius = 20.0)
 
-# Flight simulator: fly around (and into) the black hole in real time
-# (RES=1080|1440|2160 picks the render resolution)
-julia --project examples/fly_native_demo.jl
-
-# Offline: the 4K "hero shot" (HERO_LOWRES=1 for a fast draft)
-julia -t auto --project examples/hero_shot.jl
+img = render(cam, bh, sky; disc = disc, width = 640, height = 360)
+save("hole.png", rotr90(img))    # images are [width, height]; rotate for display
 ```
 
-The `-t auto,1` launch matters for the GLMakie apps: renders run on worker
-threads while thread 1 stays interactive for the UI. The simulator needs no
-thread flags — it is a bare Metal window with no Makie, and the traced frame
-never leaves the GPU.
+(Loading a JPEG needs an image codec such as `ImageIO` or `Images` in the
+environment, which the `examples` environment below provides.)
+
+The example and video scripts live in `examples/` with their own environment
+(the package itself only depends on what rendering needs):
+
+```bash
+git clone https://github.com/dan-sprague/SpaceTime.jl
+cd SpaceTime.jl
+julia --project=examples -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+
+# The 4K "hero shot" on the CPU (HERO_LOWRES=1 for a fast draft) and on the GPU
+julia -t auto --project=examples examples/hero_shot.jl
+julia -t auto --project=examples examples/hero_shot_gpu.jl
+```
 
 ## Rendering videos
 
@@ -104,9 +113,9 @@ conventions:
 - Everything a render produces lands under `renders/` (gitignored).
 
 ```bash
-RES=proxy julia -t auto,1 --project examples/videos/render_escape.jl
-REL=1 RES=final julia -t auto,1 --project examples/videos/render_escape.jl
-RES=4k SAVE_TIFF=0 STOP_AFTER=9 julia -t auto,1 --project examples/videos/render_documentary.jl
+RES=proxy julia -t auto --project=examples examples/videos/render_escape.jl
+REL=1 RES=final julia -t auto --project=examples examples/videos/render_escape.jl
+RES=4k SAVE_TIFF=0 STOP_AFTER=9 julia -t auto --project=examples examples/videos/render_documentary.jl
 ```
 
 ## How it works
@@ -149,8 +158,8 @@ src/
   gr.jl              metric, geodesic Hamiltonian
   raytrace.jl        CPU renderer (DiffEq, static-observer tetrad)
   metal.jl           GPU renderer (Metal kernel, Kerr–Schild, DoF, reprojection)
-  viewfinder.jl      camera tetrads + interactive photography app
-  native_shell.jl    real-time simulator (bare Metal window, layered engine)
+  preview.jl         camera tetrads, Kerr–Schild photon init, fixed-step CPU preview
+  ship.jl, track.jl  timelike worldlines: a camera with mass, racing-line tracks
   disc_volume.jl     volumetric accretion disc
   disc_sim.jl        live fluid simulation on the disc grid
   blackbody.jl       Planck emission, white balance
@@ -158,7 +167,8 @@ src/
   postprocess.jl     bloom/streaks/tonemap grading
   sensor.jl          sensor exposure and noise model
   ...
-examples/            entry-point demos and the video render scripts
+ext/                 Makie extension: ray animations, Hamiltonian-drift plots
+examples/            still-image demos and the video render scripts (own env)
 assets/              the deep-sky starmap (NASA/Goddard SVS)
 test/                unit tests + executable physics checks
 docs/assets/         README images
@@ -197,12 +207,12 @@ mutual references — same scene, two independent formulations.
 
 - Star map: NASA/Goddard Space Flight Center Scientific Visualization Studio
   deep star maps.
-- Built with DifferentialEquations.jl, Metal.jl, GLMakie, and the JuliaImages
+- Built with DifferentialEquations.jl, Metal.jl, and the JuliaImages
   ecosystem.
 
 ## Roadmap
 
-- Kerr (spinning) spacetimes via auto-differentiated metrics
+- Shot files: pose a camera in SpaceTimeMetal, save it as JSON, render it here
 - Flux-conserving star catalog rendering (point sources with real magnitudes)
 - Documenter.jl docs working through the physics chapter by chapter
-- CI, and registration in General
+- Registration in General
