@@ -11,6 +11,3 @@ renders/
 !assets/starmap_g4k.jpg
 !docs/assets/*.jpg
 build/
-
-# Rust port build artifacts
-rust/target/
