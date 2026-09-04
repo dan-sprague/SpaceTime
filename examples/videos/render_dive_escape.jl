@@ -55,6 +55,7 @@
 #   0.93-1.00  hold: breathing on hand tremor
 
 using SpaceTime, StaticArrays, LinearAlgebra, FileIO, Random, Printf
+using Statistics: quantile!
 using Images: clamp01nan, RGB
 using FFMPEG_jll
 
@@ -80,6 +81,9 @@ const NSTREAK = parse(Int, get(ENV, "STREAKS", "12"))
 const ONLY = parse(Int, get(ENV, "ONLY", "0"))
 const APPROVE = parse(Int, get(ENV, "APPROVE", "0"))
 const RESUME = get(ENV, "RESUME", "1") == "1"
+# Output filename tag: render variants of one frame without overwriting each
+# other (TAG=... ONLY=60 RESUME=0).
+const TAG = get(ENV, "TAG", "")
 
 frames = joinpath(ROOT, "renders", "dive_escape", RES)
 pngdir = joinpath(frames, APPROVE > 0 ? "approve" : "png")
@@ -201,9 +205,13 @@ roll_extra(t) = deg2rad(90.0) *
 # of the angular shake per radian) but capped at 2.8 through the whip —
 # shake sells speed against a calm background, and in the whip the frame
 # dragging IS the drama; heavier shake just smears it.
+# At rest on the 10mm wide the camera holds STILL: hand tremor on a static
+# ultra-wide shot with no parallax reads as video-game screen shake (real
+# wide lenses hide shake; our 10/focal scaling maximizes it). Jitter fades
+# in only as the dive gets moving; the 33mm hold keeps its approved tremor.
 jitter_amp(t) =
-    t < T_EST ? 0.9 :
-    t < T_TURN0 ? 0.9 + 1.9 * smoothstep((t - T_EST) / (T_TURN0 - T_EST)) :
+    t < T_EST ? 0.05 :
+    t < T_TURN0 ? 0.05 + 2.75 * smoothstep((t - T_EST) / (T_TURN0 - T_EST)) :
     t < T_TURN1 ? 2.8 :
     t < T_ARRIVE ? 1.8 + 1.5 * (1.0 - (t - T_TURN1) / (T_ARRIVE - T_TURN1))^2 :
     t < T_CALM ? 2.9 : 1.8   # 10mm units; the 10/focal scale lands these on
@@ -250,10 +258,25 @@ ctx = MetalPreviewContext(bg, 480, 270; dt=0.1, nmax=20000, disc=disc,
 # sub-pixel, and the convincing look is brightness variation at fixed size,
 # with only the bright tail spreading — via bloom in the post look, not PSF.
 const GAL_N = normalize(cross(UHAT_IN, SVector(0.0, 0.0, 1.0)))
-set_starfield!(ctx; height=H, density=1152, fill=0.85, flux=0.033,
-               psf_pixels=0.65, strength=1.6, saturation=0.35,
-               galactic=(GAL_N[1], GAL_N[2], GAL_N[3]), concentration=4.5,
-               temp_min=6500, temp_max=22000)
+# The map's diffuse Milky-Way glow is what makes deflection VISIBLE at the
+# far framings — lensing conserves surface brightness, so a uniform point
+# field lenses into another uniform point field, and only continuous
+# low-frequency structure (which "magnifies without loss") warps legibly
+# around the shadow. But near the gas the same glow shows through the
+# semi-transparent filaments as noisy blue mush, so `texture_weight` rides
+# the timeline like everything else: full for the establishing/approach,
+# zero through the wrap and dip (the swirled point field carries those
+# frames), moderate for the hero hold. Stars stay procedural throughout.
+tw_at(t) = 1.2 * (1.0 - smoothstep((t - 0.20) / 0.08)) +
+           0.6 * smoothstep((t - 0.76) / 0.10)
+function sky_at!(t)
+    set_starfield!(ctx; height=H, density=1152, fill=0.85, flux=0.033,
+                   psf_pixels=0.65, strength=1.6, saturation=0.35,
+                   texture_weight=tw_at(t),
+                   galactic=(GAL_N[1], GAL_N[2], GAL_N[3]), concentration=4.5,
+                   temp_min=6500, temp_max=22000)
+end
+sky_at!(0.0)
 
 const rot_scratch = similar(vol.density)
 function rotate_volume!(t_M::Real)
@@ -275,8 +298,20 @@ function rotate_volume!(t_M::Real)
     return nothing
 end
 
+# Grade knobs, env-overridable for single-frame look probes. The default
+# gamma=0.2 (x^5) is the hot, crushed film look; raise toward 1.0 (linear) or
+# 2.2 (sRGB) to pull midtones back out of the blacks. Exposure is NOT here —
+# it is overridden per-frame by `exp_at`; scale the whole ride with EXPOF.
+const LOOK_GAMMA = parse(Float64, get(ENV, "LOOK_GAMMA", "0.2"))
+const LOOK_CONTRAST = parse(Float64, get(ENV, "LOOK_CONTRAST", "0.0"))
+const LOOK_BLOOM = parse(Float64, get(ENV, "LOOK_BLOOM", "0.75"))
+const LOOK_STREAK = parse(Float64, get(ENV, "LOOK_STREAK", "1.6"))
+const LOOK_THRESHOLD = parse(Float64, get(ENV, "LOOK_THRESHOLD", "0.7"))
+const LOOK_HUE = parse(Float64, get(ENV, "LOOK_HUE", "0.75"))
 const LOOK = with_look(LOOK_HERO; iso=640.0, exposure=0.7,
-                       bloom_strength=0.75, streak_strength=1.6, threshold=0.7)
+                       gamma=LOOK_GAMMA, contrast=LOOK_CONTRAST,
+                       bloom_strength=LOOK_BLOOM, streak_strength=LOOK_STREAK,
+                       threshold=LOOK_THRESHOLD, tonemap_hue_preserve=LOOK_HUE)
 # Focal rack: 10mm ultra-wide from the establishing through the dip (the
 # escape cone and shadow edge only fit in frame at that width), then racking
 # up to 33mm across the escape so the settle lands exactly on the approved
@@ -465,6 +500,24 @@ function draw_panel(f::Int, cam)
     return img
 end
 
+# Auto-balance: `exp_at` is an artistic iris ride keyed against the original
+# dim sky; the star/glow boosts moved absolute scene luminance, so the keyed
+# values now blow out the bright sections. Meter each linear frame and yield
+# when the keyed exposure would clip the mids: hold the 99.5th-percentile
+# luminance to WHITE after exposure, floored at 0.35x the keyed value so the
+# dive keeps its intended punch. The disc core still clips — it should.
+const HL_WHITE = 1.25f0
+function balanced_exposure(img, e_key)
+    lum = Float32[]
+    sizehint!(lum, length(img) ÷ 9 + 1)
+    for j in 1:3:size(img, 2), i in 1:3:size(img, 1)
+        c = img[i, j]
+        push!(lum, 0.2126f0 * c.r + 0.7152f0 * c.g + 0.0722f0 * c.b)
+    end
+    p = quantile!(lum, 0.995)
+    return clamp(HL_WHITE / max(p, 1.0f-6), 0.35 * e_key, e_key)
+end
+
 const NPOST = 3
 done_count = Threads.Atomic{Int}(0)
 t0 = time()
@@ -473,7 +526,7 @@ workers = map(1:NPOST) do _
     Threads.@spawn for (f, img) in ch
         tf = frame_t(f, NFRAMES)
         ev = get(events, f, nothing)
-        look_f = with_look(LOOK; exposure=exp_at(tf))
+        look_f = with_look(LOOK; exposure=balanced_exposure(img, exp_at(tf)))
         ev === nothing ||
             (look_f = with_look(look_f;
                                 streaks=MicroStreaks(count=rand(Xoshiro(ev), 1:2),
@@ -483,7 +536,7 @@ workers = map(1:NPOST) do _
                            rng=Xoshiro(70_000 + f),
                            streak_rng=ev === nothing ? nothing : Xoshiro(ev))
         panel = draw_panel(f, cam_for(tf, jxs[f]))
-        save(joinpath(pngdir, @sprintf("f%04d.png", f)),
+        save(joinpath(pngdir, @sprintf("f%04d%s.png", f, TAG)),
              map(clamp01nan, hcat(rotr90(post), panel)))
         n = Threads.atomic_add!(done_count, 1) + 1
         if n % 48 == 0 || length(render_set) < NFRAMES
@@ -493,7 +546,7 @@ workers = map(1:NPOST) do _
     end
 end
 
-_png(f) = joinpath(pngdir, @sprintf("f%04d.png", f))
+_png(f) = joinpath(pngdir, @sprintf("f%04d%s.png", f, TAG))
 const SHUTTER = frame_span(0.5, NFRAMES)
 for f in 1:NFRAMES
     f in render_set || continue
@@ -509,6 +562,7 @@ for f in 1:NFRAMES
         # hold (the pristine texture) and the wound state at the far-away
         # establishing shot, where inner-gas detail is unresolvable.
         rotate_volume!((ts - 1.0) * T_M)
+        sky_at!(ts)
         cam_for(ts, jx)
     end
     # Adaptive Tsit5, free-running step (the Bardeen launch test owns the
