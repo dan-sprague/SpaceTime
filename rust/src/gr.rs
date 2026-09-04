@@ -80,27 +80,98 @@ const KS_FREEZE_E2: f64 = 1.0 - 2.0 / KS_FREEZE_R;
 /// **with forward first**, so the look direction is exact rather than
 /// approximately preserved.
 ///
+/// At `a = 0` the observer is the Schwarzschild static/freeze-faller. For
+/// `a != 0` it is the exact Kerr observer: static (u proportional to d_t) where
+/// f <= 0.72, smoothstep-blended to the ZAMO (zero angular momentum, corotating
+/// at omega, no radial fall) by f = 0.88. The ZAMO is the natural hovering
+/// frame inside the ergosphere and exists down to r+, where its lapse -> 0 and
+/// the sky blueshift diverges -- physically what hovering at the horizon costs.
+/// Port of `ks_camera_tetrad` in src/viewfinder.jl.
+///
 /// `beta` is the camera's 3-velocity resolved on its own (fwd, right, up)
 /// axes. When it is non-zero the whole tetrad is Lorentz-boosted, so
 /// aberration, motion Doppler and beaming all follow from the standard
 /// machinery downstream -- p_t carries the full shift, and no shading code
 /// needs to know the camera is moving.
-pub fn ks_camera_tetrad(pos: V3, fwd: V3, right: V3, up: V3, m: f64, beta: V3)
+pub fn ks_camera_tetrad(pos: V3, fwd: V3, right: V3, up: V3, m: f64, a: f64, beta: V3)
     -> (V4, V4, V4, V4)
 {
-    let r = norm3(pos);
-    let xh = scale3(pos, 1.0 / r);
-    let f = 2.0 * m / r;
+    // `lvec` is the KS null 3-direction (position-unit at a = 0), `f` the KS
+    // scalar, `u` the observer 4-velocity. Everything downstream is written in
+    // terms of the general `ldot(A) = A_t + lvec . A_xyz` and `f`.
+    let lvec: V3;
+    let f: f64;
+    let u: V4;
+    if a == 0.0 {
+        let r = norm3(pos);
+        let xh = scale3(pos, 1.0 / r);
+        f = 2.0 * m / r;
+        // Radial-geodesic observer: E^2 = max(E_freeze^2, 1 - f) gives
+        // dr/dtau = 0 exactly for r >= 2.5M, and the freeze-radius faller
+        // inside.
+        let e = KS_FREEZE_E2.max(1.0 - f).sqrt();
+        let v = -(e * e - (1.0 - f)).max(0.0).sqrt();
+        let w = (1.0 - e * (e - v)) / (e - v);
+        let lu = e + w;
+        u = [e + f * lu, (w - f * lu) * xh[0], (w - f * lu) * xh[1], (w - f * lu) * xh[2]];
+        lvec = xh;
+    } else {
+        // Kerr-Schild null direction and scalar (same convention as kerr_rhs):
+        // l_mu = (1, (rx+ay)/(r^2+a^2), (ry-ax)/(r^2+a^2), z/r), with r the KS
+        // radius from the implicit quartic; f = 2 M r^3 / (r^4 + a^2 z^2).
+        let (x, y, z) = (pos[0], pos[1], pos[2]);
+        let a2 = a * a;
+        let wq = x * x + y * y + z * z - a2;
+        let rk2 = 0.5 * (wq + (wq * wq + 4.0 * a2 * z * z).sqrt());
+        let rk = rk2.max(1.0e-12).sqrt();
+        let ira = 1.0 / (rk2 + a2);
+        lvec = [(rk * x + a * y) * ira, (rk * y - a * x) * ira, z / rk];
+        let sig = rk2 * rk2 + a2 * z * z;
+        f = 2.0 * m * rk2 * rk / sig;
+        // ZAMO from t_BL = t_KS - A(r), A'(r) = 2 M r / Delta:
+        // u_mu ~ -(dt - A' dr), raised with g^-1 = eta - f l(x)l.
+        let delta = (rk2 - 2.0 * m * rk + a2).max(1.0e-6);
+        let k = 2.0 * m * rk / delta;
+        let grad_r: V3 = [x * rk2 * rk / sig, y * rk2 * rk / sig, z * rk * (rk2 + a2) / sig];
+        let luc = 1.0 + k * dot3(lvec, grad_r);
+        let uz: V4 = [
+            1.0 + f * luc,
+            k * grad_r[0] - f * luc * lvec[0],
+            k * grad_r[1] - f * luc * lvec[1],
+            k * grad_r[2] - f * luc * lvec[2],
+        ];
+        let lu_z = uz[0] + lvec[0] * uz[1] + lvec[1] * uz[2] + lvec[2] * uz[3];
+        let nrm2 = -uz[0] * uz[0] + uz[1] * uz[1] + uz[2] * uz[2] + uz[3] * uz[3]
+                   + f * lu_z * lu_z;
+        let u_zamo: V4 = {
+            let s = 1.0 / (-nrm2).sqrt();
+            [uz[0] * s, uz[1] * s, uz[2] * s, uz[3] * s]
+        };
+        if f >= 0.88 {
+            u = u_zamo;
+        } else {
+            let u_stat: V4 = [1.0 / (1.0 - f).sqrt(), 0.0, 0.0, 0.0];
+            let mut wb = ((f - 0.72) / 0.16).clamp(0.0, 1.0);
+            wb = wb * wb * (3.0 - 2.0 * wb);
+            if wb == 0.0 {
+                u = u_stat;
+            } else {
+                let um: V4 = [
+                    (1.0 - wb) * u_stat[0] + wb * u_zamo[0],
+                    wb * u_zamo[1],
+                    wb * u_zamo[2],
+                    wb * u_zamo[3],
+                ];
+                let lu = um[0] + lvec[0] * um[1] + lvec[1] * um[2] + lvec[2] * um[3];
+                let nn = -um[0] * um[0] + um[1] * um[1] + um[2] * um[2] + um[3] * um[3]
+                         + f * lu * lu;
+                let s = 1.0 / (-nn).sqrt();
+                u = [um[0] * s, um[1] * s, um[2] * s, um[3] * s];
+            }
+        }
+    }
 
-    // Radial-geodesic observer: E^2 = max(E_freeze^2, 1 - f) gives dr/dtau = 0
-    // exactly for r >= 2.5M, and the freeze-radius faller inside.
-    let e = KS_FREEZE_E2.max(1.0 - f).sqrt();
-    let v = -(e * e - (1.0 - f)).max(0.0).sqrt();
-    let w = (1.0 - e * (e - v)) / (e - v);
-    let lu = e + w;
-    let u: V4 = [e + f * lu, (w - f * lu) * xh[0], (w - f * lu) * xh[1], (w - f * lu) * xh[2]];
-
-    let ldot = |a: V4| a[0] + xh[0] * a[1] + xh[1] * a[2] + xh[2] * a[3];
+    let ldot = |a: V4| a[0] + lvec[0] * a[1] + lvec[1] * a[2] + lvec[2] * a[3];
     let gdot = |a: V4, b: V4| {
         -a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] + f * ldot(a) * ldot(b)
     };

@@ -69,6 +69,11 @@ pub struct StarSettings {
     pub temp_min: f32,
     pub temp_max: f32,
     pub seed: i32,
+    /// Chroma scale about Rec.709 luminance in the star colour LUT. Raw
+    /// blackbody chroma (1.0) is far more saturated than any star looks;
+    /// measured star chromaticities top out at pale blue-white, so production
+    /// skies use ~0.35. Port of the `saturation` knob in src/metal.jl.
+    pub saturation: f32,
 }
 
 impl Default for StarSettings {
@@ -77,6 +82,7 @@ impl Default for StarSettings {
             strength: 1.0, texture_weight: 0.0, density: 384.0, fill: 0.5,
             flux: 0.011, psf_pixels: 0.5, galactic: [0.0, 0.0, 1.0],
             concentration: 3.0, temp_min: 3000.0, temp_max: 16000.0, seed: 12345,
+            saturation: 1.0,
         }
     }
 }
@@ -86,6 +92,7 @@ pub struct Renderer {
     queue: CommandQueue,
     trace_pipeline: ComputePipelineState,
     pack_pipeline: ComputePipelineState,
+    overlay_pipeline: ComputePipelineState,
 
     out: Buffer,
     bg: Buffer,
@@ -99,6 +106,10 @@ pub struct Renderer {
     disc_params: Buffer,
     grade: Buffer,
     palette: Buffer,
+    font_atlas: Buffer,
+    ov_cells: Buffer,
+    ov_attr: Buffer,
+    ov_glyph_count: i32,
 
     pub width: usize,
     pub height: usize,
@@ -108,7 +119,39 @@ pub struct Renderer {
     pub tol: f32,
     pub nmax_floor: u32,
     pub r_escape_factor: f32,
+    /// Distance from the origin to the second hole in the Binary scene (0 when
+    /// single). The ray escape radius keys off distance from the origin, so it
+    /// must be widened to always contain hole 2, whose neighbourhood is where
+    /// rays lens even when the camera is mid-gap and close to the origin.
+    bh2_r: f32,
     grade_host: [f32; 20],
+    /// Raw (unsaturated) star colour LUT, so `set_starfield` can re-bake the
+    /// GPU LUT at any chroma without recomputing blackbody colours.
+    star_table_raw: Vec<f32>,
+    /// MetalFX spatial upscaling. When on, `pack` writes an internal-res
+    /// texture, the scaler upsizes it to the drawable, and a blit presents it.
+    pub upscale_metalfx: bool,
+    internal_color: Option<Texture>,
+    mfx: Option<crate::metalfx::SpatialScaler>,
+    mfx_output: Option<Texture>,
+    mfx_dims: (u32, u32),
+    /// A CPU-rasterised system map (texture, width, height) blitted into the
+    /// drawable's corner each frame. `None` until the first `set_minimap`.
+    minimap: Option<(Texture, u32, u32)>,
+}
+
+/// A private-storage colour texture usable as both a compute target and a
+/// MetalFX input/output (and a blit source).
+fn make_color_texture(device: &Device, w: u32, h: u32) -> Texture {
+    let td = TextureDescriptor::new();
+    td.set_texture_type(MTLTextureType::D2);
+    td.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    td.set_width(w as u64);
+    td.set_height(h as u64);
+    td.set_storage_mode(MTLStorageMode::Private);
+    td.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+                 | MTLTextureUsage::RenderTarget);
+    device.new_texture(&td)
 }
 
 pub struct RendererDesc<'a> {
@@ -126,6 +169,13 @@ pub struct RendererDesc<'a> {
     pub order: i32,
     /// RK45 error tolerance; ignored by the fixed-order paths.
     pub tol: f32,
+    /// Arc length between volumetric gas samples, in units of M. Matches the
+    /// old every-2nd-step density at the default step size.
+    pub gas_stride: f32,
+    /// A second Schwarzschild hole `(centre, mass)`, superposed on the first
+    /// (which stays at the origin). `None` for a single hole. Schwarzschild
+    /// only -- ignored when the spacetime is Kerr.
+    pub binary: Option<([f64; 3], f64)>,
 }
 
 impl Renderer {
@@ -146,6 +196,16 @@ impl Renderer {
             &vol_on as *const bool as *const _, MTLDataType::Bool, 1);
         consts.set_constant_value_at_index(
             &desc.order as *const i32 as *const _, MTLDataType::Int, 2);
+        let is_binary = desc.binary.is_some() && !kerr;
+        consts.set_constant_value_at_index(
+            &is_binary as *const bool as *const _, MTLDataType::Bool, 3);
+        if let Some((c, m)) = desc.binary {
+            let v = [c[0] as f32, c[1] as f32, c[2] as f32, m as f32];
+            for (k, val) in v.iter().enumerate() {
+                consts.set_constant_value_at_index(
+                    val as *const f32 as *const _, MTLDataType::Float, 4 + k as u64);
+            }
+        }
 
         let trace_fn = library
             .get_function("trace", Some(consts))
@@ -157,6 +217,10 @@ impl Renderer {
         let pack_pipeline = device
             .new_compute_pipeline_state_with_function(&pack_fn)
             .expect("failed to build pack pipeline");
+        let overlay_fn = library.get_function("overlay", None).expect("missing kernel `overlay`");
+        let overlay_pipeline = device
+            .new_compute_pipeline_state_with_function(&overlay_fn)
+            .expect("failed to build overlay pipeline");
 
         let (w, h) = (desc.width, desc.height);
         let (bg_data, bg_w, bg_h) = desc.background;
@@ -165,7 +229,13 @@ impl Renderer {
         // Sharing one made star colour a function of the disc's white balance,
         // so regrading the disc re-tinted the whole sky.
         let bb = match &desc.disc {
-            Some(_) => Blackbody::new(5000.0, 1024),
+            // 6000 K white point. The disc's hottest, brightest ring (the ISCO
+            // edge, ~10000 K) sits well above this, so the bright inner disc
+            // reads blue-white; the T ~ R^-3/4 gradient only crosses neutral
+            // out past ~R=6, leaving a warm gold fringe on the dim outer disc.
+            // A 10000 K white point put the whole disc at or below neutral and
+            // it came out uniformly golden.
+            Some(_) => Blackbody::new(6000.0, 1024),
             None => Blackbody::new(6500.0, 1024),
         };
         let stars = Blackbody::new(STAR_WB_TEMPERATURE, 1024);
@@ -177,13 +247,18 @@ impl Renderer {
             None => [0.0; 6],
         };
 
+        // vol_params[9] is the disc clock (M-time), written per frame; [10] is
+        // the spin, so the sampler can apply the same differential Keplerian
+        // shear Omega(s) = 1/(s^1.5 + a) the film bakes with `rotate_volume!`
+        // -- done analytically here so a spinning disc costs nothing per frame.
         let (vol_buf, vol_host) = match desc.volume {
             Some(v) => (
                 shared_buffer(&device, &v.density),
                 [v.log_s_in, v.log_s_out, v.z_max, v.nr as f32, v.nphi as f32,
-                 v.nz as f32, v.emission_scale, v.opacity_scale, 2.0],
+                 v.nz as f32, v.emission_scale, v.opacity_scale, desc.gas_stride,
+                 0.0, desc.spacetime.a as f32],
             ),
-            None => (empty_buffer(&device, 4), [0.0f32; 9]),
+            None => (empty_buffer(&device, 4), [0.0f32; 11]),
         };
 
         // Grade defaults: the film look at a neutral exposure.
@@ -203,6 +278,7 @@ impl Renderer {
             bg: shared_buffer(&device, bg_data),
             bb_lut: shared_buffer(&device, &bb.table),
             star_lut: shared_buffer(&device, &stars.table),
+            star_table_raw: stars.table.clone(),
             vol: vol_buf,
             vol_params: shared_buffer(&device, &vol_host),
             star_params: shared_buffer(&device, &[0.0f32; 16]),
@@ -211,10 +287,24 @@ impl Renderer {
             disc_params: shared_buffer(&device, &disc_host),
             grade: shared_buffer(&device, &grade_host),
             palette: shared_buffer(&device, &[0.0f32; 3 * PALETTE_MAX]),
-            device, queue, trace_pipeline, pack_pipeline,
+            font_atlas: shared_buffer(&device, &crate::font::atlas()),
+            // Sized for a generous console; the menu grid is far smaller.
+            ov_cells: shared_buffer(&device, &[0i32; 64 * 32]),
+            ov_attr: shared_buffer(&device, &[0i32; 64 * 32]),
+            ov_glyph_count: crate::font::glyph_count() as i32,
+            upscale_metalfx: false,
+            internal_color: None,
+            mfx: None,
+            mfx_output: None,
+            mfx_dims: (0, 0),
+            minimap: None,
+            device, queue, trace_pipeline, pack_pipeline, overlay_pipeline,
             width: w, height: h, bg_w, bg_h,
             dt: desc.dt, tol: desc.tol, nmax_floor: desc.nmax,
             r_escape_factor: desc.r_escape_factor,
+            bh2_r: desc.binary
+                .map(|(c, _)| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt() as f32)
+                .unwrap_or(0.0),
             grade_host,
         }
     }
@@ -231,6 +321,23 @@ impl Renderer {
         // and setting it in the SOURCE sky means lensing stretches and
         // brightens star images near the critical curve on its own.
         let sigma = s.psf_pixels * 2.0 * fov_factor as f32 / self.height as f32;
+
+        // Bake chroma saturation into the star LUT (scale each entry about its
+        // Rec.709 luminance), matching src/metal.jl's `_star_lut_cpu`.
+        {
+            let lut = unsafe { host_slice(&self.star_lut, self.star_table_raw.len()) };
+            let sat = s.saturation;
+            for i in 0..self.star_table_raw.len() / 3 {
+                let (r, g, b) = (self.star_table_raw[3 * i],
+                                 self.star_table_raw[3 * i + 1],
+                                 self.star_table_raw[3 * i + 2]);
+                let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                lut[3 * i]     = y + sat * (r - y);
+                lut[3 * i + 1] = y + sat * (g - y);
+                lut[3 * i + 2] = y + sat * (b - y);
+            }
+        }
+
         let host = unsafe { host_slice(&self.star_params, 16) };
         host.copy_from_slice(&[
             s.strength, s.density, s.fill, sigma, s.flux,
@@ -256,18 +363,97 @@ impl Renderer {
 
     pub fn set_dither(&mut self, d: f32) { self.grade_host[17] = d; self.flush_grade(); }
     pub fn set_exposure(&mut self, e: f32) { self.grade_host[0] = e; self.flush_grade(); }
+    pub fn set_filmic(&mut self, on: bool) {
+        self.grade_host[1] = if on { 1.0 } else { 0.0 }; self.flush_grade();
+    }
+    pub fn set_saturation(&mut self, s: f32) { self.grade_host[3] = s; self.flush_grade(); }
+    /// Hue preservation in the filmic tonemap: 0 = per-channel ACES (highlights
+    /// desaturate toward white, the "film" look), 1 = tonemap luminance only
+    /// and keep chromaticity (highlights hold their true blackbody hue).
+    pub fn set_hue_preserve(&mut self, h: f32) { self.grade_host[10] = h; self.flush_grade(); }
+    /// Contrast/crush gamma applied after tonemap (1.0 = off, >1 deepens mids).
+    pub fn set_crush(&mut self, g: f32) { self.grade_host[2] = g; self.flush_grade(); }
+    pub fn set_vignette(&mut self, v: f32) { self.grade_host[4] = v; self.flush_grade(); }
+    pub fn set_grain(&mut self, g: f32) { self.grade_host[12] = g; self.flush_grade(); }
+    /// Per-channel white-balance multiplier applied to the linear scene.
+    pub fn set_white_balance(&mut self, r: f32, g: f32, b: f32) {
+        self.grade_host[5] = r; self.grade_host[6] = g; self.grade_host[7] = b;
+        self.flush_grade();
+    }
+    /// Upscale filter for the internal target: false = nearest (pixel-art),
+    /// true = bilinear (smooth).
+    pub fn set_upscale_smooth(&mut self, smooth: bool) {
+        self.grade_host[13] = if smooth { 1.0 } else { 0.0 }; self.flush_grade();
+    }
+
+    /// Advance the disc's rotation clock (in M-time). The gas sampler shears
+    /// azimuth by Omega(s) = 1/(s^1.5 + a) per unit time, so the disc spins
+    /// differentially -- inner gas faster -- exactly as in the offline film.
+    pub fn set_disc_time(&self, t_m: f32) {
+        let vp = unsafe { host_slice(&self.vol_params, 11) };
+        vp[9] = t_m;
+    }
+
+    /// Lazily build the MetalFX input texture, scaler, and output texture for
+    /// the current internal resolution and the given drawable size, rebuilding
+    /// the scaler and output when the drawable size changes.
+    fn ensure_mfx(&mut self, out_w: u32, out_h: u32) {
+        if self.internal_color.is_none() {
+            self.internal_color =
+                Some(make_color_texture(&self.device, self.width as u32, self.height as u32));
+        }
+        if self.mfx.is_none() || self.mfx_dims != (out_w, out_h) {
+            self.mfx = crate::metalfx::SpatialScaler::new(
+                &self.device, self.width as u32, self.height as u32,
+                out_w, out_h, crate::metalfx::BGRA8UNORM);
+            self.mfx_output = self.mfx.as_ref()
+                .map(|_| make_color_texture(&self.device, out_w, out_h));
+            self.mfx_dims = (out_w, out_h);
+        }
+    }
 
     fn flush_grade(&self) {
         let host = unsafe { host_slice(&self.grade, 20) };
         host.copy_from_slice(&self.grade_host);
     }
 
-    /// Trace one frame and grade it into `drawable`.
-    pub fn render(&mut self, cam: &Camera, st: &Spacetime, drawable: &TextureRef,
-                  fisheye_deg: f64, relativistic: bool) {
+    /// Upload a CPU-rasterised BGRA system map; it is blitted into the
+    /// drawable corner each `render_and_present`. The texture is (re)allocated
+    /// only when the panel size changes.
+    pub fn set_minimap(&mut self, w: u32, h: u32, bgra: &[u8]) {
+        let need = !matches!(&self.minimap, Some((_, tw, th)) if *tw == w && *th == h);
+        if need {
+            let td = TextureDescriptor::new();
+            td.set_texture_type(MTLTextureType::D2);
+            td.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            td.set_width(w as u64);
+            td.set_height(h as u64);
+            td.set_storage_mode(MTLStorageMode::Shared);
+            td.set_usage(MTLTextureUsage::ShaderRead);
+            self.minimap = Some((self.device.new_texture(&td), w, h));
+        }
+        let tex = &self.minimap.as_ref().unwrap().0;
+        tex.replace_region(
+            MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize { width: w as u64, height: h as u64, depth: 1 },
+            },
+            0, bgra.as_ptr() as *const _, (w * 4) as u64);
+    }
+
+    /// Trace one frame, grade it into the drawable, optionally blit a menu
+    /// overlay on top, and present -- all on a single command buffer. Splitting
+    /// the present onto a second buffer costs an extra commit and scheduling
+    /// round trip per frame for nothing: the queue already orders them.
+    pub fn render_and_present(&mut self, cam: &Camera, st: &Spacetime,
+                              drawable: &MetalDrawableRef,
+                              fisheye_deg: f64, relativistic: bool,
+                              overlay: Option<Overlay>) {
+        let texture = drawable.texture();
         let m = st.m as f32;
         let pos_r = (cam.pos[0].powi(2) + cam.pos[1].powi(2) + cam.pos[2].powi(2)).sqrt();
-        let r_escape = self.r_escape_factor * pos_r.max(15.0 * st.m) as f32;
+        let r_escape = self.r_escape_factor
+            * pos_r.max(15.0 * st.m).max(self.bh2_r as f64 + 25.0) as f32;
 
         // Dynamic step count. With radius-adaptive steps the travel legs are
         // logarithmic in r_escape; the constant is the strong-field winding
@@ -280,7 +466,7 @@ impl Renderer {
 
         {
             let cp = unsafe { host_slice(&self.cam_params, CAM_PARAMS_N) };
-            cam.write_params(cp, st.m, fisheye_deg);
+            cam.write_params(cp, st.m, st.a, fisheye_deg);
             let (spin_a, rkill2) = st.spin_horizon();
             let sp = unsafe { host_slice(&self.st_params, 8) };
             sp[0] = m;
@@ -292,6 +478,15 @@ impl Renderer {
             sp[6] = spin_a;
             sp[7] = rkill2;
         }
+
+        // MetalFX spatial upscaling only applies when the drawable is larger
+        // than the internal target; otherwise fall back to the pack blit.
+        // `ensure_mfx` may fail to build a scaler (older OS), so re-check after.
+        let dw = texture.width() as u32;
+        let dh = texture.height() as u32;
+        let mut use_mfx = self.upscale_metalfx
+            && dw > self.width as u32 && dh > self.height as u32;
+        if use_mfx { self.ensure_mfx(dw, dh); use_mfx = self.mfx.is_some(); }
 
         let cmd = self.queue.new_command_buffer();
 
@@ -323,34 +518,121 @@ impl Renderer {
             enc.end_encoding();
         }
 
-        // --- grade + present -------------------------------------------
+        // --- grade -----------------------------------------------------
+        // Without MetalFX, `pack` writes the drawable directly, upscaling as it
+        // goes. With MetalFX, it writes the internal-res texture 1:1 and the
+        // scaler does the upscale below.
+        let pack_tex: &TextureRef = if use_mfx {
+            self.internal_color.as_deref().unwrap()
+        } else {
+            texture
+        };
+        let (pdw, pdh) = if use_mfx { (self.width as u32, self.height as u32) } else { (dw, dh) };
         {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.pack_pipeline);
-            enc.set_texture(0, Some(drawable));
+            enc.set_texture(0, Some(pack_tex));
             enc.set_buffer(0, Some(&self.out), 0);
             enc.set_buffer(1, Some(&self.grade), 0);
             enc.set_buffer(2, Some(&self.palette), 0);
-            let dw = drawable.width() as u32;
-            let dh = drawable.height() as u32;
-            let dims = [self.width as u32, self.height as u32, dw, dh];
+            let dims = [self.width as u32, self.height as u32, pdw, pdh];
             enc.set_bytes(3, 16, dims.as_ptr() as *const _);
             let escale = 1.0f32;
             enc.set_bytes(4, 4, &escale as *const f32 as *const _);
+            enc.dispatch_threads(
+                MTLSize::new(pdw as u64, pdh as u64, 1),
+                MTLSize::new(16, 16, 1));
+            enc.end_encoding();
+        }
+
+        // --- MetalFX upscale + blit to the drawable --------------------
+        if use_mfx {
+            let scaler = self.mfx.as_ref().unwrap();
+            let internal = self.internal_color.as_ref().unwrap();
+            let out_tex = self.mfx_output.as_ref().unwrap();
+            scaler.encode(cmd, internal, out_tex);
+            let blit = cmd.new_blit_command_encoder();
+            blit.copy_from_texture(
+                out_tex, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize { width: dw as u64, height: dh as u64, depth: 1 },
+                texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 });
+            blit.end_encoding();
+        }
+
+        // --- menu overlay (optional) -----------------------------------
+        if let Some(ov) = overlay {
+            let dw = texture.width() as i32;
+            let dh = texture.height() as i32;
+            // One font pixel spans `ps` device pixels; a cell is the glyph plus
+            // one column / two rows of spacing. Scale with the drawable so the
+            // menu stays legible at any window size.
+            let ps = ((dh / 320).max(2)) as i32;
+            let gw = crate::font::GLYPH_W as i32;
+            let gh = crate::font::GLYPH_H as i32;
+            let cw = (gw + 1) * ps;
+            let ch = (gh + 2) * ps;
+            let cols = ov.cols as i32;
+            let rows = ov.rows as i32;
+            let panel_w = cols * cw;
+            let panel_h = rows * ch;
+            let ox = (dw - panel_w) / 2;
+            let oy = (dh - panel_h) / 2;
+            let pad = 3 * ps;
+
+            {
+                let cells = unsafe { host_slice_i32(&self.ov_cells, ov.cells.len()) };
+                cells.copy_from_slice(ov.cells);
+                let attr = unsafe { host_slice_i32(&self.ov_attr, ov.attr.len()) };
+                attr.copy_from_slice(ov.attr);
+            }
+            let ip: [i32; 11] = [cols, rows, ox, oy, cw, ch, ps, gw, gh, pad,
+                                 self.ov_glyph_count];
+
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.overlay_pipeline);
+            enc.set_texture(0, Some(texture));
+            enc.set_buffer(0, Some(&self.font_atlas), 0);
+            enc.set_buffer(1, Some(&self.ov_cells), 0);
+            enc.set_buffer(2, Some(&self.ov_attr), 0);
+            enc.set_bytes(3, (11 * 4) as u64, ip.as_ptr() as *const _);
             enc.dispatch_threads(
                 MTLSize::new(dw as u64, dh as u64, 1),
                 MTLSize::new(16, 16, 1));
             enc.end_encoding();
         }
 
-        cmd.commit();
-    }
+        // --- system map (optional), blitted into the top-right corner -----
+        if let Some((mm, mw, mh)) = &self.minimap {
+            let (dwid, dhei) = (texture.width(), texture.height());
+            let margin = 16u64;
+            if dwid > *mw as u64 + margin && dhei > *mh as u64 + margin {
+                let blit = cmd.new_blit_command_encoder();
+                blit.copy_from_texture(
+                    mm, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+                    MTLSize { width: *mw as u64, height: *mh as u64, depth: 1 },
+                    texture, 0, 0,
+                    MTLOrigin { x: dwid - *mw as u64 - margin, y: margin, z: 0 });
+                blit.end_encoding();
+            }
+        }
 
-    pub fn commit_present(&self, drawable: &MetalDrawableRef) {
-        let cmd = self.queue.new_command_buffer();
         cmd.present_drawable(drawable);
         cmd.commit();
     }
+}
+
+/// A character grid to blit over the presented frame. `cells` holds font-atlas
+/// slots and `attr` the per-cell colour attribute, both row-major `cols x rows`.
+pub struct Overlay<'a> {
+    pub cols: usize,
+    pub rows: usize,
+    pub cells: &'a [i32],
+    pub attr: &'a [i32],
+}
+
+/// Host view of a shared i32 buffer, for uploading the overlay grid.
+unsafe fn host_slice_i32(b: &Buffer, n: usize) -> &mut [i32] {
+    std::slice::from_raw_parts_mut(b.contents() as *mut i32, n)
 }
 
 impl Renderer {
@@ -360,14 +642,15 @@ impl Renderer {
     pub fn trace_blocking(&mut self, cam: &Camera, st: &Spacetime) -> Vec<f32> {
         let m = st.m as f32;
         let pos_r = (cam.pos[0].powi(2) + cam.pos[1].powi(2) + cam.pos[2].powi(2)).sqrt();
-        let r_escape = self.r_escape_factor * pos_r.max(15.0 * st.m) as f32;
+        let r_escape = self.r_escape_factor
+            * pos_r.max(15.0 * st.m).max(self.bh2_r as f64 + 25.0) as f32;
         let nmax = (((75.0 + 6.5 * (r_escape / m).ln() as f64) * st.m / self.dt as f64)
                     .ceil() as u32)
                    .max(self.nmax_floor)
                    .min(20_000);
         {
             let cp = unsafe { host_slice(&self.cam_params, CAM_PARAMS_N) };
-            cam.write_params(cp, st.m, 0.0);
+            cam.write_params(cp, st.m, st.a, 0.0);
             let (spin_a, rkill2) = st.spin_horizon();
             let sp = unsafe { host_slice(&self.st_params, 8) };
             sp[0] = m; sp[1] = 2.05 * m; sp[2] = r_escape; sp[3] = 0.0;

@@ -65,9 +65,9 @@ impl Camera {
     /// fisheye with that vertical half-angle at the top edge of the image, so
     /// fields wider than 180 degrees render cleanly -- a rectilinear pinhole
     /// cannot reach 180 at any focal length.
-    pub fn write_params(&self, dest: &mut [f32], m: f64, fisheye_deg: f64) {
+    pub fn write_params(&self, dest: &mut [f32], m: f64, a: f64, fisheye_deg: f64) {
         let (u4, ef, er, eu) =
-            ks_camera_tetrad(self.pos, self.fwd, self.right, self.up_local, m, self.beta());
+            ks_camera_tetrad(self.pos, self.fwd, self.right, self.up_local, m, a, self.beta());
         dest[0] = self.pos[0] as f32;
         dest[1] = self.pos[1] as f32;
         dest[2] = self.pos[2] as f32;

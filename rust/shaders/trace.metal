@@ -18,6 +18,16 @@ using namespace metal;
 // kernel never pays Kerr's register budget and the no-gas kernel stays lean.
 constant bool KERR [[function_constant(0)]];
 constant bool VOL  [[function_constant(1)]];
+// A second Schwarzschild hole, superposed. Its centre and mass ride in
+// function constants so the geodesic RHS can read them at file scope without
+// threading extra parameters through every RK stage. Referenced only inside
+// `if (BINARY)`, which is dead-code-eliminated (and the constants left unset)
+// for the single-hole pipelines.
+constant bool  BINARY [[function_constant(3)]];
+constant float BH2X   [[function_constant(4)]];
+constant float BH2Y   [[function_constant(5)]];
+constant float BH2Z   [[function_constant(6)]];
+constant float BH2M   [[function_constant(7)]];
 // Integrator: 4 = classical RK4, 2 = explicit midpoint, 45 = adaptive
 // Cash-Karp RK45 capped by the radius-adaptive step, 46 = the same controller
 // let off that leash (which is what shows why the leash is there).
@@ -43,7 +53,7 @@ constant int  ORDER [[function_constant(2)]];
 //
 // vol[0] log s_in  vol[1] log s_out  vol[2] z_max
 // vol[3] nr  vol[4] nphi  vol[5] nz
-// vol[6] emission scale  vol[7] opacity scale  vol[8] march stride
+// vol[6] emission scale  vol[7] opacity scale  vol[8] gas arc-length stride
 //
 // star[0] strength   star[1] grid N     star[2] fill      star[3] sigma
 // star[4] flux0      star[5..7] galactic normal            star[8] concentration
@@ -77,17 +87,28 @@ static inline float sim_hash(int x, int y, int z) {
 
 // Schwarzschild. H = 1/2(-p_t^2 + |p|^2 - f l^2), f = 2M/r, l = -p_t + (x.p)/r.
 // No trigonometry, no coordinate singularity. Returns (dx, dp).
-static inline void ks_rhs(float3 x, float3 p, float p_t, float M,
-                          thread float3 &dx, thread float3 &dp) {
-    float r2 = dot(x, x);
+// One hole's contribution to the Kerr-Schild Hamiltonian RHS, as the DEVIATION
+// from flat space (so a superposition of holes is just the sum of these plus
+// the single flat `+p` in dx). `xr` is the position relative to that hole.
+static inline void ks_terms(float3 xr, float3 p, float p_t, float M,
+                            thread float3 &ddx, thread float3 &ddp) {
+    float r2 = dot(xr, xr);
     float inv_r = rsqrt(r2);
     float f = 2.0f * M * inv_r;
-    float kap = dot(x, p) * inv_r;
+    float kap = dot(xr, p) * inv_r;
     float l = -p_t + kap;
     float c1 = f * l * inv_r;
     float c2 = f * l * (0.5f * l + kap) * inv_r * inv_r;
-    dx = p - c1 * x;
-    dp = c1 * p - c2 * x;
+    ddx = -c1 * xr;
+    ddp = c1 * p - c2 * xr;
+}
+
+static inline void ks_rhs(float3 x, float3 p, float p_t, float M,
+                          thread float3 &dx, thread float3 &dp) {
+    float3 ddx, ddp;
+    ks_terms(x, p, p_t, M, ddx, ddp);
+    dx = p + ddx;
+    dp = ddp;
 }
 
 // Kerr, same chart and Hamiltonian convention; reduces to ks_rhs exactly at
@@ -136,8 +157,17 @@ static inline void kerr_rhs(float3 x, float3 p, float p_t, float M, float a,
 
 static inline void rhs(float3 x, float3 p, float p_t, float M, float a,
                        thread float3 &dx, thread float3 &dp) {
-    if (KERR) kerr_rhs(x, p, p_t, M, a, dx, dp);
-    else      ks_rhs(x, p, p_t, M, dx, dp);
+    if (KERR) { kerr_rhs(x, p, p_t, M, a, dx, dp); return; }
+    float3 ddx, ddp;
+    ks_terms(x, p, p_t, M, ddx, ddp);
+    dx = p + ddx;
+    dp = ddp;
+    if (BINARY) {
+        float3 ddx2, ddp2;
+        ks_terms(x - float3(BH2X, BH2Y, BH2Z), p, p_t, BH2M, ddx2, ddp2);
+        dx += ddx2;
+        dp += ddp2;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,8 +218,28 @@ static inline float sample_volume(const device float *vol,
     int nr = (int)vp[3], nphi = (int)vp[4], nz = (int)vp[5];
     const float two_pi = 6.28318531f;
 
+    // Rotate the frozen gas pattern prograde by sampling at phi - Omega*t.
+    // Fully Keplerian shear (Omega ~ 1/s^1.5, inner ~15x the outer rate) is
+    // physically right but winds a *snapshot* texture into tight concentric
+    // streaks without bound -- fine for a short film, wrong for a viewer that
+    // holds on one frame. So rotate mostly coherently (at a reference radius)
+    // with only a fraction DIFF of the true local differential: the inner disc
+    // still visibly leads, but the shear -- and thus the winding -- is bounded
+    // to a slow drift. The relativistic beaming in disc_emission is unaffected;
+    // it reads the real Keplerian velocity independently.
+    const float DIFF = 0.4f;         // 0 = solid body, 1 = full Keplerian
+    const float S_REF = 7.0f;        // coherent-rotation reference radius
+    float t_disc = vp[9];
+    float phi_s = phi;
+    if (t_disc != 0.0f) {
+        float kep     = 1.0f / (pow(s, 1.5f) + vp[10]);
+        float kep_ref = 1.0f / (pow(S_REF, 1.5f) + vp[10]);
+        float omega = t_disc * (DIFF * kep + (1.0f - DIFF) * kep_ref);
+        phi_s = phi - omega;
+    }
+
     float fr = (ls - ls_in) / (ls_out - ls_in) * (float)(nr - 1);
-    float fp = modf_pos(phi, two_pi) / two_pi * (float)nphi;
+    float fp = modf_pos(phi_s, two_pi) / two_pi * (float)nphi;
     float fz = (z + zmax) / (2.0f * zmax) * (float)(nz - 1);
 
     int i0 = clamp((int)floor(fr), 0, nr - 2);
@@ -370,13 +420,44 @@ kernel void trace(device float          *out       [[buffer(0)]],
     // Received photon p = w(u + n); trace q = n - u, i.e. backward in time,
     // which is what lets a ray legally exit the horizon when the camera is
     // inside it. Then lower the index: p_mu = eta_mu_nu q^nu + f l_mu (l.q).
+    // In Kerr the metric is g = eta + f l(x)l with the KS null covector l_mu
+    // and KS scalar f; using the Schwarzschild f = 2M/r and l = xhat here
+    // mis-initialises every ray's energy and momentum off-equator.
     float3 x = c;
     float r = length(x);
-    float f = 2.0f * M / r;
     float4 q = cf * Ef + cr * Er + cu * Eu - ut;
-    float lq = q.x + dot(x, q.yzw) / r;
-    float p_t = -q.x + f * lq;
-    float3 p = q.yzw + (f * lq / r) * x;
+    float p_t, lq;
+    float3 p;
+    if (KERR) {
+        float a2 = spin_a * spin_a;
+        float w0 = r * r - a2;
+        float rk2 = 0.5f * (w0 + sqrt(w0 * w0 + 4.0f * a2 * x.z * x.z));
+        float rk = sqrt(max(rk2, 1.0e-12f));
+        float iRA = 1.0f / (rk2 + a2);
+        float3 L = float3((rk * x.x + spin_a * x.y) * iRA,
+                          (rk * x.y - spin_a * x.x) * iRA,
+                          x.z / rk);
+        float fk = 2.0f * M * rk2 * rk / (rk2 * rk2 + a2 * x.z * x.z);
+        lq = q.x + dot(L, q.yzw);
+        float flq = fk * lq;
+        p_t = -q.x + flq;
+        p = q.yzw + flq * L;
+    } else {
+        float f = 2.0f * M / r;
+        lq = q.x + dot(x, q.yzw) / r;
+        p_t = -q.x + f * lq;
+        p = q.yzw + (f * lq / r) * x;
+        if (BINARY) {
+            // Sum the second hole's index-lowering. The cross term with hole 1
+            // is O(f1 f2) and negligible at the camera, where both f are tiny.
+            float3 xr = x - float3(BH2X, BH2Y, BH2Z);
+            float rb = length(xr);
+            float f2 = 2.0f * BH2M / rb;
+            float lq2 = q.x + dot(xr, q.yzw) / rb;
+            p_t += f2 * lq2;
+            p += (f2 * lq2 / rb) * xr;
+        }
+    }
 
     // Relativistic shading: each ray is normalised to unit frequency in the
     // camera tetrad and p_t is conserved, so the camera/infinity shift factor
@@ -388,7 +469,13 @@ kernel void trace(device float          *out       [[buffer(0)]],
     bool disc_plane = disc_enabled && !VOL;
 
     float vol_zmax = vp[2], vol_emis = vp[6], vol_opac = vp[7];
-    int vol_mstep = clamp((int)vp[8], 1, 16);
+    // The gas is marched on its OWN arc-length stride rather than every Nth
+    // integration step. Riding the integrator's schedule was fine while that
+    // schedule was fixed, but an adaptive controller bounds the ODE's local
+    // truncation error and knows nothing about the gas -- so it resamples the
+    // volume at wildly uneven arc lengths and the alpha compositing goes wrong
+    // even though the geodesic is more accurate than before.
+    float ds_gas = max(vp[8], 1.0e-3f);
     float vol_s_out = exp(vp[1]);
     float vol_rb2 = vol_s_out * vol_s_out + vol_zmax * vol_zmax;
 
@@ -406,6 +493,8 @@ kernel void trace(device float          *out       [[buffer(0)]],
     float r_prev = -1.0f;
     // RK45 state: the step size carried between iterations.
     float h_carry = -1.0f;
+    // Arc length travelled since the last gas sample.
+    float s_accum = 0.0f;
 
     for (int stepi = 1; stepi <= nmax; ++stepi) {
         float r2 = dot(x, x);
@@ -430,6 +519,10 @@ kernel void trace(device float          *out       [[buffer(0)]],
             }
             r_prev = r;
         }
+        // Second hole's shadow: a plain radius test inside ~2.95 M2.
+        if (BINARY && length(x - float3(BH2X, BH2Y, BH2Z)) < 2.95f * BH2M) {
+            hit_horizon = true; break;
+        }
         if (r > r_escape) break;
 
         // Radius-adaptive affine step: curvature goes as M/r^3, so scaling h
@@ -438,7 +531,10 @@ kernel void trace(device float          *out       [[buffer(0)]],
         // sphere, which contains the strong field where the shadow-kill tests
         // need small steps.
         float hcap = (VOL && r2 < vol_rb2) ? 2.0f : st[5];
-        float h = dt * min(max(st[4] * r / M, 1.0f), hcap);
+        // Step adapts to the NEAREST hole so hole 2's strong field is resolved.
+        float rstep = r;
+        if (BINARY) rstep = min(rstep, length(x - float3(BH2X, BH2Y, BH2Z)));
+        float h = dt * min(max(st[4] * rstep / M, 1.0f), hcap);
         if (KERR) {
             // Capture radius and horizon converge as a -> M (1.074M against
             // 1.063M at a = 0.998) and a step floored at dt cannot resolve
@@ -470,6 +566,12 @@ kernel void trace(device float          *out       [[buffer(0)]],
             // long step near the photon sphere jumps the band the test looks
             // at and a captured ray escapes as phantom sky.
             float hmax = (ORDER == 46) ? 50.0f * dt : h;
+            // The gas does NOT constrain the step. It needs samples every
+            // ds_gas of arc length, which is not the same as steps every
+            // ds_gas -- a long step is sub-sampled below instead. Bounding the
+            // step here was measurably the wrong call: it cost the whole
+            // adaptive speedup and bought nothing, because the sampling itself
+            // is cheap (a 16x stride sweep moves the frame by ~10%).
             float hh = min(h_carry > 0.0f ? h_carry : h, hmax);
             float3 nx = x, np = p;
             bool accepted = false;
@@ -546,25 +648,43 @@ kernel void trace(device float          *out       [[buffer(0)]],
         // path weight -- the gas structure is far coarser than the integration
         // step, so this is free detail. Geodesics are unaffected. Evaluated at
         // the PRE-step position, as in the Julia kernel.
-        if (VOL && alpha > 0.003f && (stepi % vol_mstep) == 0 && r2 < vol_rb2) {
-            if (fabs(xp.z) < vol_zmax) {
-                float s_cyl = sqrt(xp.x * xp.x + xp.y * xp.y);
-                if (s_cyl > 1.0e-6f) {
-                    float rho = sample_volume(vol, vp, s_cyl, atan2(xp.y, xp.x), xp.z);
-                    if (rho > 1.0e-4f) {
-                        float vlen = max(length(k1x), 1.0e-20f);
-                        float ds = (float)vol_mstep * h_used * vlen;
-                        float inten;
-                        float3 col = disc_emission(s_cyl, r, k1x, xp.xy, M, scam,
-                                                   dp, bb_lut, inten);
-                        float tau = vol_opac * rho * ds;
-                        float a = 1.0f - exp(-tau);
-                        acc += alpha * a * inten * vol_emis * col;
-                        alpha *= (1.0f - a);
-                        if (alpha < 0.003f) break;   // transmittance exhausted
-                    }
-                }
+        if (VOL && alpha > 0.003f && r2 < vol_rb2) {
+            // Emit one gas sample per ds_gas of arc length, SUB-SAMPLING the
+            // step when it is long. The geodesic over a single step is very
+            // nearly straight -- far straighter than the gas is smooth -- so
+            // linear interpolation between the step's endpoints places the
+            // samples well, and the emission quadrature ends up independent of
+            // whatever schedule the integrator chose.
+            // Integrate along the CHORD the step actually produced, not
+            // along the tangent at its start: with long steps the two differ,
+            // and using the start tangent both mis-measures the optical depth
+            // and Doppler-shifts every sub-sample as if the photon were still
+            // travelling in its initial direction.
+            float3 dseg = x - xp;
+            float seg = max(length(dseg), 1.0e-20f);
+            s_accum += seg;
+            // Bounded: one enormous vacuum step must not spin here.
+            for (int sub = 0; sub < 32 && s_accum >= ds_gas; ++sub) {
+                s_accum -= ds_gas;
+                // Distance back from the step's end, as a fraction of it.
+                float t = clamp(1.0f - s_accum / seg, 0.0f, 1.0f);
+                float3 xs = mix(xp, x, t);
+                float rs2 = dot(xs, xs);
+                if (rs2 >= vol_rb2 || fabs(xs.z) >= vol_zmax) continue;
+                float s_cyl = sqrt(xs.x * xs.x + xs.y * xs.y);
+                if (s_cyl <= 1.0e-6f) continue;
+                float rho = sample_volume(vol, vp, s_cyl, atan2(xs.y, xs.x), xs.z);
+                if (rho <= 1.0e-4f) continue;
+                float inten;
+                float3 col = disc_emission(s_cyl, sqrt(rs2), dseg, xs.xy, M, scam,
+                                           dp, bb_lut, inten);
+                float tau = vol_opac * rho * ds_gas;
+                float a = 1.0f - exp(-tau);
+                acc += alpha * a * inten * vol_emis * col;
+                alpha *= (1.0f - a);
+                if (alpha < 0.003f) break;   // transmittance exhausted
             }
+            if (alpha < 0.003f) break;
         }
 
         // A non-finite ray can never satisfy the exit tests and would reach

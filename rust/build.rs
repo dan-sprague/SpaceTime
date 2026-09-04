@@ -7,9 +7,14 @@
 //! cost of a few hundred ms at startup.
 use std::{env, fs, path::PathBuf, process::Command};
 
-const SHADERS: [&str; 2] = ["shaders/trace.metal", "shaders/post.metal"];
+const SHADERS: [&str; 3] =
+    ["shaders/trace.metal", "shaders/post.metal", "shaders/overlay.metal"];
 
 fn main() {
+    // MetalFX is bridged by hand in src/metalfx.rs; link the framework so its
+    // classes are registered at launch.
+    println!("cargo:rustc-link-lib=framework=MetalFX");
+
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // One translation unit for both kernels, so either path yields one library.

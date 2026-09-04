@@ -3,8 +3,59 @@
 //! picture that looks plausible.
 
 use crate::camera::{lens, Camera};
-use crate::gr::Spacetime;
+use crate::gr::{ks_camera_tetrad, Spacetime, V3, V4};
 use crate::renderer::{Renderer, RendererDesc};
+
+/// g(A, B) in the Cartesian Kerr-Schild metric g = eta + f l(x)l at `pos`,
+/// spin `a` -- the same chart the tetrad and kernel use. This is the
+/// independent yardstick the tetrad's orthonormality is measured against.
+fn kerr_gdot(pos: V3, a: f64, m: f64, av: V4, bv: V4) -> f64 {
+    let (x, y, z) = (pos[0], pos[1], pos[2]);
+    let a2 = a * a;
+    let w = x * x + y * y + z * z - a2;
+    let rk2 = 0.5 * (w + (w * w + 4.0 * a2 * z * z).sqrt());
+    let rk = rk2.max(1.0e-12).sqrt();
+    let ira = 1.0 / (rk2 + a2);
+    let l: V4 = [1.0, (rk * x + a * y) * ira, (rk * y - a * x) * ira, z / rk];
+    let f = 2.0 * m * rk2 * rk / (rk2 * rk2 + a2 * z * z);
+    let la = l[0] * av[0] + l[1] * av[1] + l[2] * av[2] + l[3] * av[3];
+    let lb = l[0] * bv[0] + l[1] * bv[1] + l[2] * bv[2] + l[3] * bv[3];
+    -av[0] * bv[0] + av[1] * bv[1] + av[2] * bv[2] + av[3] * bv[3] + f * la * lb
+}
+
+/// The Kerr camera tetrad must be orthonormal under the Kerr metric -- g(u,u)
+/// = -1, the three spatial legs unit and mutually orthogonal, all cross terms
+/// zero -- at every pose, including deep inside the ergosphere where the
+/// observer has blended to the ZAMO. A slip in the frame-dragging algebra
+/// shows up here as an O(1) error long before it is visible in a frame.
+fn kerr_tetrad_check() -> u32 {
+    let (m, a) = (1.0, 0.998);
+    let poses: [(&str, V3, V3); 4] = [
+        ("hero r=30",     [30.0, 1.1, 1.6],   [0.0, 0.0, 0.0]),
+        ("periapsis 3.2", [2.2, 2.2, 0.5],    [0.85, 0.2, -0.1]),
+        ("ergo r=1.34",   [0.95, 0.95, -0.25],[0.55, -0.4, 0.1]),
+        ("skim r=1.10",   [0.78, 0.78, 0.0],  [0.0, 0.6, 0.0]),
+    ];
+    let mut fails = 0;
+    for (name, pos, beta) in poses {
+        let fwd = crate::gr::normalize3([-pos[0], -pos[1], -pos[2]]);
+        let right = crate::gr::normalize3(crate::gr::cross3(fwd, [0.0, 0.0, 1.0]));
+        let up = crate::gr::cross3(right, fwd);
+        let (u, ef, er, eu) = ks_camera_tetrad(pos, fwd, right, up, m, a, beta);
+        let g = |x: V4, y: V4| kerr_gdot(pos, a, m, x, y);
+        let errs = [
+            g(u, u) + 1.0, g(ef, ef) - 1.0, g(er, er) - 1.0, g(eu, eu) - 1.0,
+            g(u, ef), g(u, er), g(u, eu), g(ef, er), g(ef, eu), g(er, eu),
+        ];
+        let worst = errs.iter().fold(0.0f64, |m, &e| m.max(e.abs()));
+        // 1e-9 is the f64 Gram-Schmidt floor; a real algebra error is O(1).
+        let ok = worst < 1e-9;
+        println!("{} Kerr tetrad {name:<14}: max|orthonorm err| = {:.2e}",
+                 if ok { "ok  " } else { "FAIL" }, worst);
+        if !ok { fails += 1; }
+    }
+    fails
+}
 
 /// Angular radius of the shadow for a static observer at `r`:
 /// `sin(psi) = b_crit * sqrt(1 - 2M/r) / r` with the critical impact
@@ -16,6 +67,10 @@ fn shadow_angle(m: f64, r: f64) -> f64 {
 
 pub fn run() {
     let mut failures = 0;
+
+    // --- Kerr camera tetrad orthonormality -----------------------------
+    failures += kerr_tetrad_check();
+    println!();
 
     // --- Schwarzschild shadow -----------------------------------------
     // A white sky and no disc: every black pixel is a captured ray, so the
@@ -38,6 +93,8 @@ pub fn run() {
         r_escape_factor: 2.0,
         order: 4,
         tol: 1e-4,
+        gas_stride: 0.32,
+        binary: None,
     });
     let cam = Camera::look_at([r_cam, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], fov);
     let t0 = std::time::Instant::now();
@@ -89,6 +146,8 @@ pub fn run() {
         r_escape_factor: 2.0,
         order: 4,
         tol: 1e-4,
+        gas_stride: 0.32,
+        binary: None,
     });
     let img_k = rk.trace_blocking(&cam, &st_k);
     let mut worst = 0.0f32;
@@ -148,6 +207,8 @@ pub fn run() {
             r_escape_factor: 2.0,
             order,
             tol,
+        gas_stride: 0.32,
+        binary: None,
         });
         let im = ra.trace_blocking(&cam, &st);
         let mut e = w;

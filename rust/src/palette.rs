@@ -32,6 +32,39 @@ fn anchors(r: Ramp) -> &'static [[f32; 3]; 11] {
     }
 }
 
+/// A hand-built pixel-art palette: three hues, three shades each, plus a true
+/// black at entry 0 for empty sky. Ten tones total.
+///
+/// The pipeline maps scene LUMINANCE onto this ramp, so the three hues land on
+/// the three brightness zones -- shadows read **indigo**, midtones **magenta**,
+/// highlights **amber** -- each stepped dark -> light. The entries are ordered
+/// strictly by luminance (that is what the luminance index requires); the hues
+/// are chosen to stay legible while respecting that order, which is why the
+/// blue family stays dark and the amber family carries the highlights.
+///
+/// Flat (3, 10) channel-fastest, matching `arcade_palette`.
+pub fn arcade_triad() -> Vec<f32> {
+    // entry 0 is black; then indigo x3, magenta x3, amber x3 -- monotone in
+    // luminance so the LUT steps through them cleanly.
+    const TONES: [[f32; 3]; 10] = [
+        [0.000, 0.000, 0.000], // 0  void
+        [0.05, 0.04, 0.13],    // 1  indigo   dark
+        [0.10, 0.10, 0.30],    // 2  indigo   mid
+        [0.15, 0.15, 0.40],    // 3  indigo   light
+        [0.42, 0.12, 0.40],    // 4  magenta  dark
+        [0.62, 0.18, 0.50],    // 5  magenta  mid
+        [0.78, 0.22, 0.52],    // 6  magenta  light
+        [0.85, 0.45, 0.30],    // 7  amber    dark (ember)
+        [0.97, 0.65, 0.30],    // 8  amber    mid (orange)
+        [1.00, 0.90, 0.65],    // 9  amber    light (gold)
+    ];
+    let mut pal = vec![0.0f32; 3 * TONES.len()];
+    for (k, t) in TONES.iter().enumerate() {
+        pal[3 * k..3 * k + 3].copy_from_slice(t);
+    }
+    pal
+}
+
 /// `n` colours as a flat (3, n) channel-fastest array. With `black`, entry 0
 /// is pure black and the remaining n-1 span `lo..hi` of the ramp -- so empty
 /// sky bottoms out at true black rather than the ramp's darkest tone.

@@ -17,6 +17,7 @@ struct Cfg {
     dt: f32,
     order: i32,
     tol: f32,
+    gas: f32,
 }
 
 fn build(vol: &DiscVolume, disc: AccretionDisc, st: Spacetime, sky: &[f32], c: &Cfg)
@@ -33,6 +34,8 @@ fn build(vol: &DiscVolume, disc: AccretionDisc, st: Spacetime, sky: &[f32], c: &
         r_escape_factor: 2.0,
         order: c.order,
         tol: c.tol,
+        gas_stride: c.gas,
+        binary: None,
     });
     r.set_starfield(&StarSettings {
         density: 110.0, psf_pixels: 0.9, texture_weight: 0.0, ..Default::default()
@@ -67,44 +70,48 @@ pub fn run() {
     println!("Kerr a=0.9, volumetric gas, procedural stars, RK4, dt=0.1");
     println!("{:<12} {:>10} {:>9} {:>12}", "resolution", "trace ms", "fps", "Mray/s");
     for &(w, h) in &[(256usize, 144usize), (640, 360), (1280, 720), (1920, 1080), (2560, 1440)] {
-        let c = Cfg { w, h, dt: 0.1, order: 4, tol: 1e-4 };
+        let c = Cfg { w, h, dt: 0.1, order: 4, tol: 1e-4, gas: 0.32 };
         let mut r = build(&vol, disc, st, &sky, &c);
         let ms = time_ms(&mut r, &cam, &st, 20);
         println!("{:<12} {:>10.2} {:>9.0} {:>12.1}",
                  format!("{w}x{h}"), ms, 1000.0 / ms, (w * h) as f64 / (ms * 1000.0));
     }
 
-    println!("\nIntegrator, at 1280x720 (same scene, dt=0.1)");
-    println!("{:<28} {:>10} {:>9} {:>16}", "integrator", "trace ms", "fps", "vs RK4 (RMS)");
-
-    // RK4 is the reference image: a faster integrator that changes the picture
-    // has not made anything faster, it has made something else.
-    let cref = Cfg { w: 1280, h: 720, dt: 0.1, order: 4, tol: 1e-4 };
+    // Converged reference: fine step AND fine gas stride, so both the
+    // geodesic and the emission quadrature are far past what any candidate
+    // uses. Comparing candidates to each other only tells you they differ.
+    println!("\nIntegrator, at 1280x720, vs a converged reference");
+    println!("  (reference: RK4 dt=0.025, gas stride 0.08)");
+    let cref = Cfg { w: 1280, h: 720, dt: 0.025, order: 4, tol: 1e-4, gas: 0.08 };
     let mut rref = build(&vol, disc, st, &sky, &cref);
     let ref_img = rref.trace_blocking(&cam, &st);
-    let ms_ref = time_ms(&mut rref, &cam, &st, 20);
-    println!("{:<28} {:>10.2} {:>9.0} {:>16}", "RK4 (4 evals/step)", ms_ref, 1000.0 / ms_ref, "-");
+    let ms_ref = time_ms(&mut rref, &cam, &st, 5);
+    println!("{:<34} {:>10.2} {:>9.0} {:>14}", "reference", ms_ref, 1000.0 / ms_ref, "-");
+    println!("{:<34} {:>10} {:>9} {:>14}", "integrator", "trace ms", "fps", "RMS vs ref");
 
-    for (name, order, tol) in [
-        ("midpoint (2 evals/step)", 2, 1e-4f32),
-        ("adaptive RK45, tol 1e-3", 45, 1e-3),
-        ("adaptive RK45, tol 1e-4", 45, 1e-4),
-        ("adaptive RK45, tol 1e-5", 45, 1e-5),
-        ("RK45 uncapped, tol 1e-3", 46, 1e-3),
-        ("RK45 uncapped, tol 1e-5", 46, 1e-5),
-        ("RK45 uncapped, tol 1e-7", 46, 1e-7),
-    ] {
-        let c = Cfg { w: 1280, h: 720, dt: 0.1, order, tol };
-        let mut r = build(&vol, disc, st, &sky, &c);
-        let img = r.trace_blocking(&cam, &st);
-        let ms = time_ms(&mut r, &cam, &st, 20);
+    let rms_vs = |img: &[f32]| -> f64 {
         let mut se = 0.0f64;
         for k in 0..img.len() {
             let d = (img[k] - ref_img[k]) as f64;
             se += d * d;
         }
-        let rms = (se / img.len() as f64).sqrt();
-        println!("{:<28} {:>10.2} {:>9.0} {:>16.5}", name, ms, 1000.0 / ms, rms);
+        (se / img.len() as f64).sqrt()
+    };
+
+    for (name, order, tol, dt, gas) in [
+        ("RK4, dt=0.1",                 4,  1e-4f32, 0.1f32, 0.32f32),
+        ("midpoint, dt=0.1",            2,  1e-4,    0.1,    0.32),
+        ("RK45 capped, tol 1e-4",       45, 1e-4,    0.1,    0.32),
+        ("RK45 free, tol 1e-3",         46, 1e-3,    0.1,    0.32),
+        ("RK45 free, tol 1e-5",         46, 1e-5,    0.1,    0.32),
+        ("RK45 free, tol 1e-7",         46, 1e-7,    0.1,    0.32),
+        ("RK45 free, tol 1e-5, gas .16", 46, 1e-5,   0.1,    0.16),
+    ] {
+        let c = Cfg { w: 1280, h: 720, dt, order, tol, gas };
+        let mut r = build(&vol, disc, st, &sky, &c);
+        let img = r.trace_blocking(&cam, &st);
+        let ms = time_ms(&mut r, &cam, &st, 20);
+        println!("{:<34} {:>10.2} {:>9.0} {:>14.5}", name, ms, 1000.0 / ms, rms_vs(&img));
     }
 
     // Sky only -- no disc, no gas -- to separate the geodesic integration
@@ -123,6 +130,8 @@ pub fn run() {
         r_escape_factor: 2.0,
         order,
         tol,
+        gas_stride: 0.32,
+        binary: None,
     };
     let mut b4 = Renderer::new(&bare(4, 1e-4));
     b4.set_starfield(&StarSettings {
@@ -150,13 +159,26 @@ pub fn run() {
                  (se / img.len() as f64).sqrt());
     }
 
+    // The gas march sets the step count wherever the ray is inside the
+    // volume, whatever the integrator is doing, so this is the knob that
+    // actually trades speed for quality in this scene.
+    println!("\nGas march stride, at 1280x720 (RK4, dt=0.1), vs the same reference");
+    println!("{:<34} {:>10} {:>9} {:>14}", "gas stride (M)", "trace ms", "fps", "RMS vs ref");
+    for gas in [0.08f32, 0.16, 0.32, 0.64, 1.28] {
+        let c = Cfg { w: 1280, h: 720, dt: 0.1, order: 4, tol: 1e-4, gas };
+        let mut r = build(&vol, disc, st, &sky, &c);
+        let img = r.trace_blocking(&cam, &st);
+        let ms = time_ms(&mut r, &cam, &st, 20);
+        println!("{:<34} {:>10.2} {:>9.0} {:>14.5}", gas, ms, 1000.0 / ms, rms_vs(&img));
+    }
+
     println!("\nStep size, at 1280x720 (RK4)");
     println!("{:<12} {:>10} {:>9} {:>16}", "dt", "trace ms", "fps", "vs dt=0.05 (RMS)");
-    let cfine = Cfg { w: 1280, h: 720, dt: 0.05, order: 4, tol: 1e-4 };
+    let cfine = Cfg { w: 1280, h: 720, dt: 0.05, order: 4, tol: 1e-4, gas: 0.32 };
     let mut rfine = build(&vol, disc, st, &sky, &cfine);
     let fine = rfine.trace_blocking(&cam, &st);
     for dt in [0.05f32, 0.1, 0.2, 0.4] {
-        let c = Cfg { w: 1280, h: 720, dt, order: 4, tol: 1e-4 };
+        let c = Cfg { w: 1280, h: 720, dt, order: 4, tol: 1e-4, gas: 0.32 };
         let mut r = build(&vol, disc, st, &sky, &c);
         let img = r.trace_blocking(&cam, &st);
         let ms = time_ms(&mut r, &cam, &st, 20);

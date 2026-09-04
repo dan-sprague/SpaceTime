@@ -15,6 +15,7 @@ using namespace metal;
 // grade[0]  exposure      grade[1]  filmic on/off   grade[2]  crush gamma
 // grade[3]  saturation    grade[4]  vignette        grade[5..7] white balance
 // grade[10] hue preserve  grade[11] output gamma    grade[12] grain
+// grade[13] upscale (0 nearest, 1 bilinear)
 // grade[16] quant levels  grade[17] dither          grade[18] palette entries
 
 static inline float aces(float x) {
@@ -43,20 +44,42 @@ kernel void pack(texture2d<float, access::write> dst [[texture(0)]],
     int dw = (int)dims.z, dh = (int)dims.w;
     if ((int)gid.x >= dw || (int)gid.y >= dh) return;
 
-    // Nearest-neighbour downmap to the render target.
+    // Nearest-neighbour cell (also the dither/palette grid). Flip vertically:
+    // the sensor's row 0 is the top of the image.
     int x   = min((int)((long)gid.x * sw / dw), sw - 1);
     int row = min((int)((long)gid.y * sh / dh), sh - 1);
-    // Flip vertically: the sensor's row 0 is the top of the image.
     int j = sh - 1 - row;
 
     float g_exp = grade[0], g_film = grade[1], g_crush = grade[2];
     float g_sat = grade[3], g_vig = grade[4];
     float g_hue = grade[10], g_gp = grade[11], g_grain = grade[12];
+    float g_up = grade[13];
     float g_qlev = grade[16], g_dith = grade[17], g_pal = grade[18];
 
-    int o = 3 * (x + sw * j);
-    float3 c = float3(src[o + 0], src[o + 1], src[o + 2]) *
-               (g_exp * escale) * float3(grade[5], grade[6], grade[7]);
+    // Source colour: nearest for the pixel-art path (arcade), or bilinear when
+    // smoothing is on. Bilinear samples in flipped source-row space so the four
+    // taps stay adjacent.
+    float3 c;
+    if (g_up > 0.5f) {
+        float fx  = ((float)gid.x + 0.5f) * (float)sw / (float)dw - 0.5f;
+        float frw = ((float)gid.y + 0.5f) * (float)sh / (float)dh - 0.5f;
+        float fjs = (float)(sh - 1) - frw;
+        int x0 = clamp((int)floor(fx), 0, sw - 1), x1 = min(x0 + 1, sw - 1);
+        int y0 = clamp((int)floor(fjs), 0, sh - 1), y1 = min(y0 + 1, sh - 1);
+        float tx = clamp(fx - floor(fx), 0.0f, 1.0f);
+        float ty = clamp(fjs - floor(fjs), 0.0f, 1.0f);
+        int o00 = 3 * (x0 + sw * y0), o10 = 3 * (x1 + sw * y0);
+        int o01 = 3 * (x0 + sw * y1), o11 = 3 * (x1 + sw * y1);
+        float3 c00 = float3(src[o00], src[o00 + 1], src[o00 + 2]);
+        float3 c10 = float3(src[o10], src[o10 + 1], src[o10 + 2]);
+        float3 c01 = float3(src[o01], src[o01 + 1], src[o01 + 2]);
+        float3 c11 = float3(src[o11], src[o11 + 1], src[o11 + 2]);
+        c = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    } else {
+        int o = 3 * (x + sw * j);
+        c = float3(src[o + 0], src[o + 1], src[o + 2]);
+    }
+    c = c * (g_exp * escale) * float3(grade[5], grade[6], grade[7]);
     // A NaN would survive every clamp below and land in the drawable.
     c = select(c, float3(0.0f), c != c);
 
