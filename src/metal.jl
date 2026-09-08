@@ -361,6 +361,72 @@ end
 @inline _rhs_mtl(::Val{true}, x, y, z, px, py, pz, p_t, M, a) =
     kerr_rhs_mtl(x, y, z, px, py, pz, p_t, M, a)
 
+@inline _cbrt_mtl(x) = exp(log(max(x, 1.0f-12)) / 3.0f0)
+
+"""
+ISCO of the prograde equatorial orbit (Bardeen, Press & Teukolsky 1972) and
+the conserved specific energy and angular momentum of gas that plunges from
+it. Returns `(r_isco, E_isco, L_isco)`.
+"""
+@inline function isco_mtl(M, a)
+    q = a / M
+    z1 = 1.0f0 + _cbrt_mtl(1.0f0 - q * q) * (_cbrt_mtl(1.0f0 + q) + _cbrt_mtl(1.0f0 - q))
+    z2 = sqrt(3.0f0 * q * q + z1 * z1)
+    r_isco = M * (3.0f0 + z2 - sqrt(max((3.0f0 - z1) * (3.0f0 + z1 + 2.0f0 * z2), 0.0f0)))
+    E_isco = sqrt(1.0f0 - 2.0f0 * M / (3.0f0 * r_isco))
+    L_isco = (2.0f0 * M / (3.0f0 * 1.7320508f0)) *
+             (1.0f0 + 2.0f0 * sqrt(3.0f0 * r_isco / M - 2.0f0))
+    return r_isco, E_isco, L_isco
+end
+
+"""
+Emitter shift `1 + z = ν_emit / ν_∞ = −p·u / E` for disc and gas shading,
+exact in the kernel's own ingoing Kerr–Schild coordinates: `(sx, sy)` is the
+emitter's position, `(psx, psy)` the photon's covariant momentum there,
+`E = −p_t` its energy at infinity. Invariant under the backward-ray sign flip.
+
+Outside the ISCO `u` is the prograde circular orbit. Inside it the gas
+plunges on the geodesic that leaves the ISCO with `E_isco`, `L_isco`. The
+circular-orbit formula must not be used there: those orbits are unstable and
+their energy diverges at the photon sphere (γ ≈ 22 at 3M), which rendered the
+inner disc as a Doppler-beamed white beam. The plunge keeps the Doppler
+factor bounded and adds the growing gravitational redshift toward the horizon
+— GRMHD's faint inner glow rather than a hard edge at the ISCO.
+"""
+@inline function emitter_opz_mtl(sx, sy, psx, psy, E, M, a, r_isco, E_isco, L_isco)
+    a2 = a * a
+    s2 = sx * sx + sy * sy
+    r = sqrt(max(s2 - a2, 1.0f-6))        # BL radius: s² = r² + a² on the plane
+    sqM = sqrt(M)
+    sqr = sqrt(r)
+    r32 = r * sqr
+    Δ = r * r - 2.0f0 * M * r + a2
+    ut = 0.0f0; uφ = 0.0f0; ur = 0.0f0
+    if r >= r_isco
+        den = r32 - 3.0f0 * M * sqr + 2.0f0 * a * sqM
+        ut = (r32 + a * sqM) / (sqrt(r32) * sqrt(max(den, 1.0f-2)))
+        uφ = sqM / (r32 + a * sqM) * ut
+    else
+        inv_Δ = 1.0f0 / max(Δ, 1.0f-3)
+        ut = ((r * r + a2 + 2.0f0 * M * a2 / r) * E_isco -
+              2.0f0 * M * a * L_isco / r) * inv_Δ
+        uφ = (2.0f0 * M * a * E_isco / r + (1.0f0 - 2.0f0 * M / r) * L_isco) * inv_Δ
+        Rr = (E_isco * (r * r + a2) - a * L_isco)^2 -
+             Δ * (r * r + (L_isco - a * E_isco)^2)
+        ur = -sqrt(max(Rr, 0.0f0)) / (r * r)
+        # Boyer–Lindquist → ingoing Kerr–Schild.
+        ut += 2.0f0 * M * r * inv_Δ * ur
+        uφ += a * inv_Δ * ur
+    end
+    inv_s2 = 1.0f0 / max(s2, 1.0f-6)
+    cφ = (r * sx + a * sy) * inv_s2
+    sφ = (r * sy - a * sx) * inv_s2
+    ux = ur * cφ - sy * uφ
+    uy = ur * sφ + sx * uφ
+    Es = abs(E) > 1.0f-6 ? E : 1.0f-6
+    return clamp(ut - (psx * ux + psy * uy) / Es, 0.1f0, 20.0f0)
+end
+
 # Six-component tuple arithmetic for the Tsit5 stages: phase-space state
 # and RHS slopes travel as (x, y, z, px, py, pz).
 @inline _axpy6(s, c, k) = (s[1] + c * k[1], s[2] + c * k[2], s[3] + c * k[3],
@@ -935,19 +1001,9 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
     scam = spacetime_params[4] > 0.5f0 ?
            1.0f0 / clamp(abs(p_t), 0.05f0, 20.0f0) : 1.0f0
 
-    # Kerr disc shading: the ray's impact parameter λ = L_z/E, conserved along
-    # the geodesic (both are Killing charges), drives the exact circular-orbit
-    # Doppler factor 1/g = u^t (1 − Ω λ) in the disc/gas blocks below —
-    # replacing the Schwarzschild static-observer split (local boost ×
-    # gravitational redshift), which has no spin dependence. Invariant under
-    # the backward-ray sign flip (E and L_z negate together).
-    lam_ray = 0.0f0
-    if KERR
-        Ek0 = -p_t
-        if abs(Ek0) > 1.0f-6
-            lam_ray = (x * py - y * px) / Ek0
-        end
-    end
+    # Disc/gas kinematics for the shading blocks below: circular orbits down
+    # to the ISCO, the plunge from it inside — see `emitter_opz_mtl`.
+    r_isco, E_isco, L_isco = isco_mtl(M, spin_a)
 
     # Bardeen launch-time capture test (Kerr only). The runtime kill radius is
     # a single sphere (the prograde photon orbit), but the unstable photon
@@ -1204,7 +1260,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
         end
 
         xp = x; yp = y; zp = z
-        pxp = px; pyp = py; pzp = pz
+        pxp = px; pyp = py
 
         k1 = ((ORD == 45 || ORD == 46) && k1_valid) ? k1_carry :
              _rhs_mtl(Val(KERR), x, y, z, px, py, pz, p_t, M, spin_a)
@@ -1399,42 +1455,20 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                             φv = atan(sy, sx)
                             ρ = sample_volume_mtl(vol, vol_params, s_cyl, φv, sz)
                             if ρ > 1.0f-4
-                                R = s_cyl / (2.0f0 * M)
+                                # Inside the ISCO the gas stops dissipating:
+                                # its temperature holds at the ISCO value and
+                                # it thins as it accelerates inward.
+                                R = max(s_cyl, r_isco) / (2.0f0 * M)
                                 T_emit = exp(10.034259f0 -
                                              0.375f0 * log(max(R * R, 1.0f-6)))
-                                opz = 0.1f0
-                                if KERR
-                                    # Exact prograde circular-orbit shift:
-                                    # 1/g = u^t (1 − Ω λ), spin-aware — see
-                                    # the lam_ray block at ray setup.
-                                    sqM = sqrt(M)
-                                    s32 = s_cyl * sqrt(s_cyl)
-                                    Ωk = sqM / (s32 + spin_a * sqM)
-                                    den = s32 - 3.0f0 * M * sqrt(s_cyl) +
-                                          2.0f0 * spin_a * sqM
-                                    ut = (s32 + spin_a * sqM) /
-                                         (sqrt(s32) * sqrt(max(den, 1.0f-2)))
-                                    opz = clamp(ut * (1.0f0 - Ωk * lam_ray),
-                                                0.1f0, 20.0f0)
-                                else
-                                    v_mag = clamp(0.70710678f0 /
-                                                  sqrt(max(R - 1.0f0, 0.1f0)),
-                                                  0.0f0, 0.999f0)
-                                    # Keplerian flow ϕ̂ = (−y, x, 0)/s against
-                                    # the photon coordinate velocity k1[1:3].
-                                    vdotn = v_mag *
-                                            (-sy * k1[1] + sx * k1[2]) /
-                                            (s_cyl * vlen)
-                                    gam = 1.0f0 / sqrt(1.0f0 -
-                                              clamp(v_mag * v_mag,
-                                                    0.0f0, 0.99f0))
-                                    Rs = sqrt(sx * sx + sy * sy + sz * sz) /
-                                         (2.0f0 * M)
-                                    opzg = 1.0f0 / sqrt(max(1.0f0 -
-                                               1.0f0 / max(Rs, 1.0f0), 0.01f0))
-                                    opz = max(gam * (1.0f0 + vdotn) * opzg,
-                                              0.1f0)
+                                if s_cyl < r_isco
+                                    ρ *= (s_cyl / r_isco)^3
                                 end
+                                psx = pxp + fseg * (px - pxp)
+                                psy = pyp + fseg * (py - pyp)
+                                opz = emitter_opz_mtl(sx, sy, psx, psy, -p_t,
+                                                      M, spin_a, r_isco,
+                                                      E_isco, L_isco)
                                 T_obs = T_emit * scam / opz
                                 inten = 100.0f0 /
                                         (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
@@ -1488,40 +1522,15 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
             if disc_inner < s && s < disc_outer
                 pxh = pxp + cf * (px - pxp)
                 pyh = pyp + cf * (py - pyp)
-                pzh = pzp + cf * (pz - pzp)
-                # Photon coordinate velocity at the crossing (z = 0 ⇒ r = s).
-                fh = 2.0f0 * M / s
-                κh = (xh * pxh + yh * pyh) / s
-                ℓh = -p_t + κh
-                c1h = fh * ℓh / s
-                vx = pxh - c1h * xh
-                vy = pyh - c1h * yh
-                vz = pzh
-                plen = max(sqrt(vx * vx + vy * vy + vz * vz), 1.0f-20)
 
                 R = s / (2.0f0 * M)
-                T_emit = exp(10.034259f0 - 0.375f0 * log(R * R))
-                opz = 0.1f0
-                if KERR
-                    # Exact prograde circular-orbit shift, spin-aware — see
-                    # the lam_ray block at ray setup.
-                    sqM = sqrt(M)
-                    s32 = s * sqrt(s)
-                    Ωk = sqM / (s32 + spin_a * sqM)
-                    den = s32 - 3.0f0 * M * sqrt(s) + 2.0f0 * spin_a * sqM
-                    ut = (s32 + spin_a * sqM) /
-                         (sqrt(s32) * sqrt(max(den, 1.0f-2)))
-                    opz = clamp(ut * (1.0f0 - Ωk * lam_ray), 0.1f0, 20.0f0)
-                else
-                    v_mag = clamp(0.70710678f0 / sqrt(max(R - 1.0f0, 0.1f0)),
-                                  0.0f0, 0.999f0)
-                    vdotn = v_mag * (-yh * vx + xh * vy) / (s * plen)
-                    gam = 1.0f0 / sqrt(1.0f0 -
-                                       clamp(v_mag * v_mag, 0.0f0, 0.99f0))
-                    opzg = 1.0f0 / sqrt(max(1.0f0 - 1.0f0 / max(R, 1.0f0),
-                                            0.01f0))
-                    opz = max(gam * (1.0f0 + vdotn) * opzg, 0.1f0)
-                end
+                # Temperature holds at the ISCO value inside it (no further
+                # dissipation in the plunge); density fades as (s/r_isco)³.
+                R_T = max(s, r_isco) / (2.0f0 * M)
+                T_emit = exp(10.034259f0 - 0.375f0 * log(R_T * R_T))
+                plunge = s < r_isco ? (s / r_isco)^3 : 1.0f0
+                opz = emitter_opz_mtl(xh, yh, pxh, pyh, -p_t, M, spin_a,
+                                      r_isco, E_isco, L_isco)
                 T_obs = T_emit * scam / opz
                 inten = 100.0f0 / (exp(29622.4f0 / max(T_obs, 1.0f0)) - 1.0f0)
 
@@ -1541,7 +1550,7 @@ function trace_kernel_mtl!(out, bg, bb_lut, star_lut, vol, vol_params,
                 dpow = density <= 1.0f-6 ?
                     (disc_falloff > 0.0f0 ? 0.0f0 : 1.0f0) :
                     exp(disc_falloff * log(density))
-                opacity = iscotaper * outertaper * dpow
+                opacity = iscotaper * outertaper * dpow * plunge
 
                 w = alpha * opacity * inten
                 if NB > 0

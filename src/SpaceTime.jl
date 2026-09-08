@@ -113,7 +113,8 @@ export Sampling, with_sampling, STILL, MOTION, sampling_rng, shutter_span
 # --- Image pipeline
 export postprocess, airy_kernel, apply_diffraction!, generate_psf, fft_convolve, aces_tonemap,
        auto_balance!
-export apply_vignette!, apply_lens_distortion!
+export apply_vignette!, apply_lens_distortion!, apply_chromatic_aberration!
+export apply_veil!, apply_ghosts!, veil_kernel, ngon_kernel
 export SensorSettings, apply_iso_gain!, add_sensor_noise!, clip!, sensor_expose!
 export save_raw, load_raw
 

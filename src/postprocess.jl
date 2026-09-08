@@ -172,6 +172,192 @@ function generate_psf(w, h; bloom_radius=15.0, bloom_power=1.5, bloom_weight=0.7
     psf
 end
 
+# -----------------------------------------------------------------------------
+# Veiling glare and ghosts: the two glare terms that live at low resolution.
+# -----------------------------------------------------------------------------
+
+"""Box-average `ch` by an integer factor; edge remainders are dropped."""
+function _downsample_box(ch::Matrix{Float64}, f::Int)
+    f == 1 && return copy(ch)
+    w, h = size(ch)
+    ws, hs = w ÷ f, h ÷ f
+    out = zeros(Float64, ws, hs)
+    inv = 1.0 / (f * f)
+    @inbounds for j in 1:hs, i in 1:ws
+        s = 0.0
+        for dj in 0:f-1, di in 0:f-1
+            s += ch[(i - 1) * f + 1 + di, (j - 1) * f + 1 + dj]
+        end
+        out[i, j] = s * inv
+    end
+    out
+end
+
+"""Bilinear sample of `ch` at fractional (x, y); zero outside the image."""
+@inline function _bilinear(ch::Matrix{Float64}, x::Float64, y::Float64)
+    w, h = size(ch)
+    (x < 1.0 || y < 1.0 || x > w || y > h) && return 0.0
+    x0 = floor(Int, x); y0 = floor(Int, y)
+    x1 = min(x0 + 1, w); y1 = min(y0 + 1, h)
+    fx = x - x0; fy = y - y0
+    @inbounds return ch[x0, y0] * (1 - fx) * (1 - fy) + ch[x1, y0] * fx * (1 - fy) +
+                     ch[x0, y1] * (1 - fx) * fy + ch[x1, y1] * fx * fy
+end
+
+"""Bilinear upsample of a `_downsample_box` result back to `(w, h)`."""
+function _upsample_bilinear(small::Matrix{Float64}, w::Int, h::Int, f::Int)
+    f == 1 && return small
+    ws, hs = size(small)
+    out = zeros(Float64, w, h)
+    @inbounds for j in 1:h, i in 1:w
+        xs = clamp((i - 0.5) / f + 0.5, 1.0, Float64(ws))
+        ys = clamp((j - 0.5) / f + 0.5, 1.0, Float64(hs))
+        out[i, j] = _bilinear(small, xs, ys)
+    end
+    out
+end
+
+"""
+    veil_kernel(w, h; radius, power=1.0)
+
+Glare spread function for veiling glare: a wide, normalised power-law halo
+`(1 + (r / radius)²)^-power`. Power 1 is the 1/r² tail of scatter inside the
+lens body (the CIE/Stiles–Holladay glare law): equal energy in every octave of
+radius, so the veil lifts the blacks across the whole frame rather than just
+around the source. Centred, `w × h`.
+"""
+function veil_kernel(w, h; radius::Real, power::Real=1.0)
+    k = zeros(Float64, w, h)
+    cx, cy = w ÷ 2 + 1, h ÷ 2 + 1
+    for j in 1:h, i in 1:w
+        r2 = ((i - cx)^2 + (j - cy)^2) / radius^2
+        k[i, j] = (1.0 + r2)^(-power)
+    end
+    k ./= sum(k)
+    k
+end
+
+"""
+    apply_veil!(chans; strength, radius_px)
+
+Veiling glare on linear channels, in place. Following Talvala et al. (2007),
+glare is a global linear transport: the recorded image is the direct image plus
+the *whole scene* (not a bright pass) spread by a low-frequency glare spread
+function. `strength` is the veil's energy as a fraction of the scene's, added
+like bloom is. The ISO 9358 veiling-glare index of a real lens is a few
+percent, but under a hard grade (`LOOK_FILM`'s x⁵ display gamma) a veil that
+size is crushed to black; the values that read on screen are of order 1.
+
+The veil is computed at reduced resolution, since it has no detail, and on a
+zero-padded field so the plume's veil does not wrap round to the far edge.
+"""
+function apply_veil!(chans::NTuple{3,Matrix{Float64}}; strength::Real,
+                     radius_px::Real, power::Real=1.0)
+    w, h = size(chans[1])
+    f = max(1, ceil(Int, h / 540))
+    ws, hs = w ÷ f, h ÷ f
+    kern = ifftshift(veil_kernel(2ws, 2hs; radius=radius_px / f, power=power))
+    K = fft(kern)
+    for ch in chans
+        small = _downsample_box(ch, f)
+        padded = zeros(Float64, 2ws, 2hs)
+        padded[1:ws, 1:hs] .= small
+        veil = real.(ifft(fft(padded) .* K))[1:ws, 1:hs]
+        ch .+= strength .* _upsample_bilinear(veil, w, h, f)
+    end
+    chans
+end
+
+"""
+    ngon_kernel(radius_px, n; rotation=0.0)
+
+The image of an `n`-blade iris: a regular polygon of circumradius `radius_px`
+with a one-pixel antialiased edge, normalised to unit sum. This is what a
+defocused point — or a ghost, which is a defocused image of the aperture —
+looks like through the lens.
+"""
+function ngon_kernel(radius_px::Real, n::Int; rotation::Real=0.0)
+    R = max(ceil(Int, radius_px) + 1, 1)
+    apothem = radius_px * cos(π / n)
+    k = zeros(Float64, 2R + 1, 2R + 1)
+    for j in -R:R, i in -R:R
+        d = -Inf
+        for m in 0:n-1
+            θ = rotation + 2π * m / n
+            d = max(d, i * cos(θ) + j * sin(θ) - apothem)
+        end
+        k[i + R + 1, j + R + 1] = clamp(0.5 - d, 0.0, 1.0)
+    end
+    k ./= sum(k)
+    k
+end
+
+# The ghost train: each entry is one pair of reflecting surfaces. `m` is the
+# magnification about frame centre (negative = flipped to the far side of
+# centre, as most two-bounce ghosts are; |m| > 1 lands beyond the source),
+# `size` the defocus of that ghost relative to `ghost_size`, `tint` the colour
+# the anti-reflective coatings leave on it (coatings are tuned for green, so
+# the residual reflection is cyan/magenta/amber), `energy` its relative
+# brightness.
+const GHOST_TRAIN = (
+    (m = -0.55, size = 1.0, tint = (0.55, 0.85, 1.00), energy = 1.0),
+    (m = -0.30, size = 0.6, tint = (1.00, 0.60, 0.85), energy = 0.7),
+    (m = -0.15, size = 0.35, tint = (1.00, 0.85, 0.50), energy = 0.5),
+    (m =  0.20, size = 0.45, tint = (0.60, 1.00, 0.70), energy = 0.5),
+    (m =  0.45, size = 0.8, tint = (0.70, 0.80, 1.00), energy = 0.8),
+    (m = -1.35, size = 1.8, tint = (0.50, 0.70, 1.00), energy = 1.2),
+    (m =  1.60, size = 2.2, tint = (1.00, 0.65, 0.50), energy = 1.0),
+)
+
+# Per-channel magnification error of the ghosts: red is bent less than blue,
+# so each ghost carries a red-outside / blue-inside fringe.
+const GHOST_DISPERSION = (0.015, 0.0, -0.015)
+
+"""
+    apply_ghosts!(chans; strength, threshold, size_px, blades=7)
+
+Lens-flare ghosts on linear channels, in place: the screen-space method of
+Chapman (2017) / Froyok (2021), with the ghost shape from the physical model of
+Hullin et al. (2011). Light above `threshold` is the source; each entry of
+[`GHOST_TRAIN`](@ref) reflects it about frame centre with its own
+magnification, blurs it with the [`ngon_kernel`](@ref) image of the iris,
+tints it with its coating colour and fades it toward the frame edge. Energy is
+conserved through the magnification (`1/m²`), so a small ghost is bright and a
+large one is faint. Computed at reduced resolution, as the ghosts have no
+detail finer than the iris image.
+"""
+function apply_ghosts!(chans::NTuple{3,Matrix{Float64}}; strength::Real,
+                       threshold::Real, size_px::Real, blades::Int=7)
+    w, h = size(chans[1])
+    f = max(1, ceil(Int, h / 540))
+    ws, hs = w ÷ f, h ÷ f
+    cx, cy = (ws + 1) / 2.0, (hs + 1) / 2.0
+    ρmax = hs / 2.0
+    bright = ntuple(c -> _downsample_box(max.(chans[c] .- threshold, 0.0), f), 3)
+    acc = ntuple(_ -> zeros(Float64, ws, hs), 3)
+    for g in GHOST_TRAIN
+        kern = centered(ngon_kernel(g.size * size_px / f, blades; rotation=0.3))
+        for c in 1:3
+            m = g.m * (1.0 + GHOST_DISPERSION[c])
+            amp = strength * g.energy * g.tint[c] / (m * m)
+            ghost = zeros(Float64, ws, hs)
+            @inbounds for j in 1:hs, i in 1:ws
+                xs = cx + (i - cx) / m
+                ys = cy + (j - cy) / m
+                ρ = sqrt((i - cx)^2 + (j - cy)^2) / ρmax
+                t = clamp(ρ / 1.4, 0.0, 1.0)
+                fade = 1.0 - t * t * (3.0 - 2.0 * t)
+                ghost[i, j] = amp * fade * _bilinear(bright[c], xs, ys)
+            end
+            acc[c] .+= imfilter(ghost, kern, Fill(0.0))
+        end
+    end
+    for c in 1:3
+        chans[c] .+= _upsample_bilinear(acc[c], w, h, f)
+    end
+    chans
+end
+
 """
     ifftshift(kernel::Matrix{Float64})
 
@@ -224,7 +410,12 @@ function postprocess(image::Matrix{RGBf};
                      angles=nothing,
                      tonemap=:aces,
                      tonemap_hue_preserve=0.75,
-                     contrast=0.0)
+                     contrast=0.0,
+                     veil=0.0,
+                     veil_radius=0.1 * size(image, 2),
+                     ghosts=0.0,
+                     ghost_size=0.02 * size(image, 2),
+                     blades=7)
     w, h = size(image)
 
     # `bloom_radius` and `streak_width` are in raw pixels here, so the same
@@ -262,10 +453,15 @@ function postprocess(image::Matrix{RGBf};
     bloom_g = fft_convolve(g_bright, psf_g)
     bloom_b = fft_convolve(b_bright, psf_b)
 
-    # 5. Combine: original HDR + bloom result
+    # 5. Combine: original HDR + bloom result, then the low-frequency glare
+    # terms — ghosts from the bright pass, veil from the whole scene.
     final_r = r_ch .+ bloom_r
     final_g = g_ch .+ bloom_g
     final_b = b_ch .+ bloom_b
+    chans = (final_r, final_g, final_b)
+    ghosts > 0 && apply_ghosts!(chans; strength=ghosts, threshold=threshold,
+                                size_px=ghost_size, blades=blades)
+    veil > 0 && apply_veil!(chans; strength=veil, radius_px=veil_radius)
 
     # 6. Tonemap. Per-channel filmic curves desaturate highlights (all three
     # channels converge to 1), so blend with a hue-preserving variant that
@@ -449,6 +645,36 @@ function apply_lens_distortion!(image::Matrix{T}; k1::Real=-0.05, k2::Real=0.0) 
     image .= out
     return image
 end
+
+"""
+    apply_chromatic_aberration!(image; strength=0.001)
+
+Lateral (transverse) chromatic aberration in-place: the lens magnifies each
+wavelength differently, so with green as the reference the red image is
+scaled by `1 + strength` and the blue by `1 - strength` about frame centre.
+The R/B mis-registration therefore grows linearly with radius — zero on axis,
+`strength × half-diagonal` pixels in the corners — the red-outside /
+blue-inside fringing of every wide lens. `strength` is unitless, so the look
+is the same at every resolution.
+"""
+function apply_chromatic_aberration!(image::Matrix{RGBf}; strength::Real=0.001)
+    w, h = size(image)
+    cx, cy = (w + 1) / 2.0, (h + 1) / 2.0
+    r_ch = Float64.(getfield.(image, :r))
+    b_ch = Float64.(getfield.(image, :b))
+    inv_r = 1.0 / (1.0 + strength)
+    inv_b = 1.0 / (1.0 - strength)
+    @inbounds for j in 1:h, i in 1:w
+        xr = clamp(cx + (i - cx) * inv_r, 1.0, Float64(w))
+        yr = clamp(cy + (j - cy) * inv_r, 1.0, Float64(h))
+        xb = clamp(cx + (i - cx) * inv_b, 1.0, Float64(w))
+        yb = clamp(cy + (j - cy) * inv_b, 1.0, Float64(h))
+        c = image[i, j]
+        image[i, j] = RGBf(_bilinear(r_ch, xr, yr), c.g, _bilinear(b_ch, xb, yb))
+    end
+    return image
+end
+
 """
     lens_post(buckets; f_number, focus, fov_factor=0.55, fisheye_deg=0.0)
 

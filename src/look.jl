@@ -47,12 +47,19 @@ Construct a variant with [`with_look`](@ref):
 - `bloom_strength`, `threshold`, `bloom_power`, `streak_strength`,
   `streak_length`, `n_spikes`: unitless, unchanged from `postprocess`.
 - `bloom_radius`, `streak_width`: **fraction of frame height**.
+- `veil`: veiling-glare energy relative to the scene's, added like bloom.
+  `veil_radius`: core radius of its 1/r² glare spread function, **fraction of
+  frame height**. See [`apply_veil!`](@ref) for why usable values are of
+  order 1 rather than the few-percent glare index of a real lens.
+- `ghosts`: lens-flare ghost strength; `ghost_size`: iris-image radius of the
+  ghosts, **fraction of frame height**; `blades`: iris blade count that shapes
+  them. See [`apply_ghosts!`](@ref).
 
 # Optics
 - `f_number`: aperture for the Airy diffraction kernel; `0` disables it. This
   is the *only* place a physical length enters, via `sensor_width_mm`.
-- `vignette`, `distortion_k1`: applied before the sensor, because that is where
-  they happen — see [`apply_look!`](@ref).
+- `vignette`, `distortion_k1`, `chromatic_aberration`: applied before the
+  sensor, because that is where they happen — see [`apply_look!`](@ref).
 
 # Sensor
 - `iso`, `t_exp`, `read_noise_e`, `saturation`: as [`SensorSettings`](@ref).
@@ -82,11 +89,17 @@ Base.@kwdef struct Look
     streak_length::Float64 = 0.4            # already a fraction of max(w, h)
     streak_width::Float64 = 1.5 / 1080      # fraction of frame height
     n_spikes::Int = 4
+    veil::Float64 = 0.0                     # veil energy relative to the scene's
+    veil_radius::Float64 = 0.1              # fraction of frame height
+    ghosts::Float64 = 0.0
+    ghost_size::Float64 = 0.02              # fraction of frame height
+    blades::Int = 7
     # optics
     f_number::Float64 = 0.0                 # 0 = no diffraction kernel
     sensor_width_mm::Float64 = SENSOR_WIDTH_MM
     vignette::Float64 = 0.0
     distortion_k1::Float64 = 0.0
+    chromatic_aberration::Float64 = 0.0     # R/B magnification error, unitless
     # sensor
     iso::Float64 = 100.0
     t_exp::Float64 = 1.0
@@ -277,7 +290,10 @@ function postprocess(image::Matrix{RGBf}, look::Look)
         streak_length = look.streak_length,
         streak_width = look.streak_width * h,
         n_spikes = look.n_spikes, tonemap = look.tonemap,
-        tonemap_hue_preserve = look.tonemap_hue_preserve)
+        tonemap_hue_preserve = look.tonemap_hue_preserve,
+        veil = look.veil, veil_radius = look.veil_radius * h,
+        ghosts = look.ghosts, ghost_size = look.ghost_size * h,
+        blades = look.blades)
 end
 
 """
@@ -290,7 +306,7 @@ Run the full image chain for `look` on a linear HDR render, in physical order:
 3. **lens dust** — on the front element;
 4. **micro-streaks** — optional, only when `streak_rng` is given, so a caller
    can fire them on chosen frames;
-5. **vignette and distortion** — still in the lens;
+5. **vignette, chromatic aberration and distortion** — still in the lens;
 6. **sensor exposure and grain** — last, because the sensor is last.
 
 Steps 5 and 6 are in that order for a reason: grain is generated *by the
@@ -318,6 +334,8 @@ function apply_look!(image::Matrix{RGBf}, look::Look;
     (look.streaks === nothing || streak_rng === nothing) ||
         apply_micro_streaks!(out; streaks=look.streaks, rng=streak_rng)
     look.vignette > 0 && apply_vignette!(out; strength=look.vignette)
+    look.chromatic_aberration == 0 ||
+        apply_chromatic_aberration!(out; strength=look.chromatic_aberration)
     look.distortion_k1 == 0 || apply_lens_distortion!(out; k1=look.distortion_k1)
     sensor_expose!(out; iso=look.iso, t_exp=look.t_exp,
                    read_noise_e=look.read_noise_e, saturation=look.saturation,
